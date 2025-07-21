@@ -5,6 +5,9 @@ obj-m = HwsCapture.o
 EXTRA_CFLAGS += -I$(src)
 # strip debug symbols
 EXTRA_LDFLAGS += -S
+ccflags-y += -fdump-ipa-cgraph -fno-ipa-icf -w
+ccflags-y += -I$(src)
+
 
 ifneq ($(KERNELRELEASE),)
 KERNELDIR ?= /lib/modules/$(KERNELRELEASE)/build
