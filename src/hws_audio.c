@@ -12,7 +12,6 @@
 #include <sound/initval.h>
 #include "hws_video.h"
 
-extern size_t hws_audio_dma_wptr_bytes(struct hws_pcie_dev *hws, unsigned int ch);
 
 static const struct snd_pcm_hardware audio_pcm_hardware = {
 	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
@@ -28,7 +27,7 @@ static const struct snd_pcm_hardware audio_pcm_hardware = {
 	.period_bytes_min = 512,
 	.period_bytes_max = 16 * 1024,
 	.periods_min = 2,
-	.periods_max = 255,
+	.periods_max = 128,
 };
 
 
@@ -55,7 +54,7 @@ void hws_audio_hw_stop(struct hws_pcie_dev *hws, unsigned int ch)
 }
 
 // FIXME: wants the rel HW write pointer
-size_t hws_audio_dma_wptr_bytes(struct hws_pcie_dev *hws, unsigned int ch)
+static size_t hws_audio_dma_wptr_bytes(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	if (!hws || ch >= hws->cur_max_linein_ch)
 		return 0;
@@ -329,8 +328,8 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	a->pcm_substream = substream;
 
 	snd_pcm_hw_constraint_integer(rt, SNDRV_PCM_HW_PARAM_PERIODS);
-	snd_pcm_hw_constraint_step(rt, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 32);
-	snd_pcm_hw_constraint_step(rt, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 32);
+	snd_pcm_hw_constraint_step(rt, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 16);
+	snd_pcm_hw_constraint_step(rt, 0, SNDRV_PCM_HW_PARAM_BUFFER_BYTES, 16);
 	return 0;
 }
 
