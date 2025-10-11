@@ -983,17 +983,21 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 		alloc_devs[0] = &hws->pdev->dev; /* vb2-dma-contig device */
 
 	/* Make sure we have a reasonable minimum queue depth. */
+	if (*num_buffers == 0)
+		return 0;
+
 	if (*num_buffers < 1)
 		*num_buffers = 1;
 
-    unsigned int have = vb2_get_num_buffers(q);   /* instead of q->num_buffers */
-    unsigned int room = (HWS_MAX_BUFS > have) ? (HWS_MAX_BUFS - have) : 0;
-    if (*num_buffers > room)
-        *num_buffers = room;
-    if (*num_buffers == 0) {
-        pr_debug("queue_setup: reject, no room (have=%u, max=%u)\n", have, HWS_MAX_BUFS);
-        return -ENOBUFS;   /* or -ENOMEM; either is fine for CREATE_BUFS clamp */
-    }
+	unsigned int have = vb2_get_num_buffers(q);   /* instead of q->num_buffers */
+	unsigned int room = (HWS_MAX_BUFS > have) ? (HWS_MAX_BUFS - have) : 0;
+	if (*num_buffers > room)
+		*num_buffers = room;
+	if (*num_buffers == 0) {
+		pr_debug("queue_setup: rejecting, no room (have=%u, max=%u)\n",
+			 have, HWS_MAX_BUFS);
+		return -ENOBUFS;   /* or -ENOMEM; either is fine for CREATE_BUFS clamp */
+	}
 	return 0;
 }
 

@@ -195,7 +195,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	new_h = bt->height;
 	interlaced = !!bt->interlaced;
 
-    lockdep_assert_held(&vid->qlock);
+    lockdep_assert_held(&vid->state_lock);
 
 	/* If vb2 has active buffers and size would change, reject. */
 	was_busy = vb2_is_busy(&vid->buffer_queue);
@@ -219,8 +219,11 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	/* Recompute stride/sizeimage/half_size using your helper */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
 	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
+	vid->pix.half_size    = vid->pix.sizeimage / 2;
+
 	if (!was_busy)
-		vid->alloc_sizeimage = vid->pix.sizeimage;
+		vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
+
 	return ret;
 }
 
