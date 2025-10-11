@@ -5,6 +5,7 @@
 #include <linux/overflow.h>
 #include <linux/delay.h>
 #include <linux/bits.h>
+#include <linux/timer.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -44,7 +45,7 @@ static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 /* DMA timeout handler */
 static void hws_dma_timeout_handler(struct timer_list *t)
 {
-	struct hws_video *vid = from_timer(vid, t, dma_timeout_timer);
+        struct hws_video *vid = container_of(t, struct hws_video, dma_timeout_timer);
 	struct hws_pcie_dev *hws = vid->parent;
 	unsigned long flags;
 	
@@ -1292,7 +1293,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
     mutex_unlock(&v->state_lock);
 
     /* Cancel any pending timeout */
-    del_timer_sync(&v->dma_timeout_timer);
+    timer_delete_sync(&v->dma_timeout_timer);
 
     hws_enable_video_capture(v->parent, v->channel_index, false);
 
@@ -1548,4 +1549,3 @@ void hws_video_pm_resume(struct hws_pcie_dev *hws)
 	 * If you track per-channel 'auto-restart' policy, re-arm it here.
 	 */
 }
-
