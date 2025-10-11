@@ -66,7 +66,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
     /* Also program the DMA address register directly */
     {
         dma_addr_t dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-        iowrite32(lower_32_bits(dma_addr), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+        hws_set_dma_doorbell(hws, ch, dma_addr, "arm_next");
         /* Ensure DMA is ready for device access */
         dma_sync_single_for_device(&hws->pdev->dev, dma_addr, 
                                   vb2_plane_size(&buf->vb.vb2_buf, 0), 
@@ -184,9 +184,13 @@ irqreturn_t hws_irq_handler(int irq, void *info)
                        !READ_ONCE(pdx->video[ch].stop_requested))) {
                 /* Optional: snapshot toggle for debug visibility */
                 u32 toggle = readl(pdx->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+                u32 dma_reg = readl(pdx->bar0_base + HWS_REG_DMA_ADDR(ch));
                 dma_rmb(); /* ensure DMA writes visible before we inspect */
                 WRITE_ONCE(pdx->video[ch].half_seen, true);
                 WRITE_ONCE(pdx->video[ch].last_buf_half_toggle, toggle);
+                dev_info(dev,
+                         "irq: VDONE ch%u toggle=%u dma_reg=0x%08x int_state=0x%08x\n",
+                         ch, toggle, dma_reg, int_state);
                 dev_dbg(dev,
                         "irq: VDONE ch=%u toggle=%u scheduling BH (cap=%d)\n",
                         ch, toggle, pdx->video[ch].cap_active);
