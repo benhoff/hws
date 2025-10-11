@@ -20,19 +20,21 @@
 static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 {
     struct hws_video *v = &hws->video[ch];
+    struct device *dev = &hws->pdev->dev;
     unsigned long flags;
     struct hwsvideo_buffer *buf;
-    pr_info("arm_next(ch=%u): stop=%d cap=%d queued=%d\n",
-             ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active), !list_empty(&v->capture_queue));
+    dev_dbg(dev, "arm_next(ch=%u): stop=%d cap=%d queued=%d\n",
+            ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
+            !list_empty(&v->capture_queue));
 
     if (unlikely(READ_ONCE(hws->suspended))) {
-        pr_info("arm_next(ch=%u): suspended\n", ch);
+        dev_dbg(dev, "arm_next(ch=%u): suspended\n", ch);
         return -EBUSY;
     }
 
     if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))) {
-        pr_info("arm_next(ch=%u): stop=%d cap=%d -> cancel\n",
-                   ch, v->stop_requested, v->cap_active);
+        dev_dbg(dev, "arm_next(ch=%u): stop=%d cap=%d -> cancel\n",
+                ch, v->stop_requested, v->cap_active);
         return -ECANCELED;
     }
 
@@ -40,7 +42,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
     spin_lock_irqsave(&v->irq_lock, flags);
     if (list_empty(&v->capture_queue)) {
         spin_unlock_irqrestore(&v->irq_lock, flags);
-        pr_info("arm_next(ch=%u): queue empty\n", ch);
+        dev_dbg(dev, "arm_next(ch=%u): queue empty\n", ch);
         return -EAGAIN;
     }
 
@@ -48,14 +50,14 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
     list_del(&buf->list);
     v->active = buf;
     spin_unlock_irqrestore(&v->irq_lock, flags);
-    pr_info("arm_next(ch=%u): picked buffer %p\n", ch, buf);
+    dev_dbg(dev, "arm_next(ch=%u): picked buffer %pK\n", ch, buf);
 
     /* Publish descriptor(s) before doorbell/MMIO kicks. */
     wmb();
 
     /* Avoid MMIO during suspend */
     if (unlikely(READ_ONCE(hws->suspended))) {
-        pr_info("arm_next(ch=%u): suspended after pick\n", ch);
+        dev_dbg(dev, "arm_next(ch=%u): suspended after pick\n", ch);
         return -EBUSY;
     }
 
@@ -71,7 +73,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
                                   DMA_FROM_DEVICE);
     }
     
-    pr_info("arm_next(ch=%u): programmed buffer %p\n", ch, buf);
+    dev_dbg(dev, "arm_next(ch=%u): programmed buffer %pK\n", ch, buf);
     return 0;
 }
 
@@ -79,14 +81,16 @@ void hws_bh_video(struct tasklet_struct *t)
 {
     struct hws_video *v = from_tasklet(v, t, bh_tasklet);
     struct hws_pcie_dev *hws = v->parent;
+    struct device *dev = &hws->pdev->dev;
     unsigned int ch = v->channel_index;
     struct hwsvideo_buffer *done;
 
-    pr_info("bh_video(ch=%u): stop=%d cap=%d active=%p\n",
-             ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active), v->active);
+    dev_dbg(dev, "bh_video(ch=%u): stop=%d cap=%d active=%pK\n",
+            ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active), v->active);
 
     int ret;
-    pr_info("bh_video(ch=%u): entry stop=%d cap=%d\n", ch, v->stop_requested, v->cap_active);
+    dev_dbg(dev, "bh_video(ch=%u): entry stop=%d cap=%d\n", ch,
+            v->stop_requested, v->cap_active);
     if (unlikely(READ_ONCE(hws->suspended)))
         return;
 
@@ -105,9 +109,10 @@ void hws_bh_video(struct tasklet_struct *t)
         dma_rmb(); /* device writes visible before userspace sees it */
 
         vb2v->sequence = ++v->sequence_number;          /* BH-only increment */
-        vb2v->vb2_buf.timestamp = ktime_get_ns();
-        pr_info("bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
-                 ch, done, vb2v->sequence, v->half_seen, v->last_buf_half_toggle);
+       vb2v->vb2_buf.timestamp = ktime_get_ns();
+        dev_dbg(dev,
+                "bh_video(ch=%u): DONE buf=%pK seq=%u half_seen=%d toggle=%u\n",
+                ch, done, vb2v->sequence, v->half_seen, v->last_buf_half_toggle);
 
 
         v->active = NULL; /* channel no longer owns this buffer */
@@ -120,7 +125,7 @@ void hws_bh_video(struct tasklet_struct *t)
     /* 2) Immediately arm the next queued buffer (if present) */
     ret = hws_arm_next(hws, ch);
     if (ret == -EAGAIN) {
-        pr_info("bh_video(ch=%u): no queued buffer to arm\n", ch);
+        dev_dbg(dev, "bh_video(ch=%u): no queued buffer to arm\n", ch);
         return;
     }
     
@@ -129,7 +134,8 @@ void hws_bh_video(struct tasklet_struct *t)
         mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000)); /* 2 second timeout */
     }
     
-    pr_info("bh_video(ch=%u): armed next buffer, active=%p\n", ch, v->active);
+    dev_dbg(dev, "bh_video(ch=%u): armed next buffer, active=%pK\n",
+            ch, v->active);
     /* On success the engine now points at v->active’s DMA address */
 }
 
@@ -137,11 +143,13 @@ void hws_bh_video(struct tasklet_struct *t)
 irqreturn_t hws_irq_handler(int irq, void *info)
 {
     struct hws_pcie_dev *pdx = info;
+    struct device *dev = &pdx->pdev->dev;
     u32 int_state, ack_mask = 0;
-    pr_info("irq: entry\n");
+    dev_dbg(dev, "irq: entry\n");
     if (likely(pdx->bar0_base)) {
-        pr_info("irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
-                 readl(pdx->bar0_base + INT_EN_REG_BASE), readl(pdx->bar0_base + HWS_REG_INT_STATUS));
+        dev_dbg(dev, "irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
+                readl(pdx->bar0_base + INT_EN_REG_BASE),
+                readl(pdx->bar0_base + HWS_REG_INT_STATUS));
     }
 
     /* Fast path: if suspended, quietly ack and exit */
@@ -156,10 +164,11 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
     int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
     if (!int_state || int_state == 0xFFFFFFFF) {
-        pr_info("irq: spurious or device-gone int_state=0x%08x\n", int_state);
+        dev_dbg(dev, "irq: spurious or device-gone int_state=0x%08x\n",
+                int_state);
         return IRQ_NONE;
     }
-    pr_info("irq: entry INT_STATUS=0x%08x\n", int_state);
+    dev_dbg(dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
 
     /* Loop until all pending bits are serviced (max 100 iterations) */
     for (u32 cnt = 0; int_state && cnt < MAX_INT_LOOPS; ++cnt) {
@@ -178,12 +187,14 @@ irqreturn_t hws_irq_handler(int irq, void *info)
                 dma_rmb(); /* ensure DMA writes visible before we inspect */
                 WRITE_ONCE(pdx->video[ch].half_seen, true);
                 WRITE_ONCE(pdx->video[ch].last_buf_half_toggle, toggle);
-                pr_info("irq: VDONE ch=%u toggle=%u scheduling BH (cap=%d)\n",
-                         ch, toggle, pdx->video[ch].cap_active);
+                dev_dbg(dev,
+                        "irq: VDONE ch=%u toggle=%u scheduling BH (cap=%d)\n",
+                        ch, toggle, pdx->video[ch].cap_active);
                 tasklet_schedule(&pdx->video[ch].bh_tasklet);
             } else {
-                pr_info("irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
-                         ch, pdx->video[ch].cap_active, pdx->video[ch].stop_requested);
+                dev_dbg(dev, "irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
+                        ch, pdx->video[ch].cap_active,
+                        pdx->video[ch].stop_requested);
             }
         }
 
@@ -238,14 +249,15 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
         /* Acknowledge (clear) all bits we just handled */
         writel(ack_mask, pdx->bar0_base + HWS_REG_INT_ACK);
-        pr_info("irq: ACK mask=0x%08x\n", ack_mask);
+        dev_dbg(dev, "irq: ACK mask=0x%08x\n", ack_mask);
 
         /* Immediately clear ack_mask to avoid re-acknowledging stale bits */
         ack_mask = 0;
 
         /* Re‐read in case new interrupt bits popped while processing */
         int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
-        pr_info("irq: loop cnt=%u new INT_STATUS=0x%08x\n", cnt, int_state);
+        dev_dbg(dev, "irq: loop cnt=%u new INT_STATUS=0x%08x\n",
+                cnt, int_state);
         if (cnt + 1 == MAX_INT_LOOPS)
             dev_warn_ratelimited(&pdx->pdev->dev,
                                  "IRQ storm? status=0x%08x\n", int_state);
