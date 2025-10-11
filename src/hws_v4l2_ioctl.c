@@ -396,13 +396,16 @@ static inline void hws_set_colorimetry_fmt(struct v4l2_pix_format *p)
 
 int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *f)
 {
-    struct v4l2_pix_format *pix = &f->fmt.pix;
-    u32 req_w = pix->width, req_h = pix->height;
-    u32 w, h, min_bpl, bpl;
-    size_t size; /* wider than u32 for overflow check */
+	struct hws_video *vid = file ? video_drvdata(file) : NULL;
+	struct hws_pcie_dev *pdev = vid ? vid->parent : NULL;
+	struct v4l2_pix_format *pix = &f->fmt.pix;
+	u32 req_w = pix->width, req_h = pix->height;
+	u32 w, h, min_bpl, bpl;
+	size_t size; /* wider than u32 for overflow check */
+	size_t max_frame = pdev ? pdev->max_hw_video_buf_sz : MAX_MM_VIDEO_SIZE;
 
-    if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-        return -EINVAL;
+	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
 
     /* Only YUYV */
     pix->pixelformat = V4L2_PIX_FMT_YUYV;
@@ -425,22 +428,43 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
     bpl = pix->bytesperline;
     if (bpl < min_bpl)
         bpl = min_bpl;
-    else {
-        /* Cap at 16x width to avoid silly values that overflow sizeimage */
-        u32 max_bpl = ALIGN(w * 2 * 16, 64);
-        if (bpl > max_bpl)
-            bpl = max_bpl;
-        bpl = ALIGN(bpl, 64);
-    }
+	else {
+		/* Cap at 16x width to avoid silly values that overflow sizeimage */
+		u32 max_bpl = ALIGN(w * 2 * 16, 64);
+		if (bpl > max_bpl)
+			bpl = max_bpl;
+		bpl = ALIGN(bpl, 64);
+	}
 
-    /* Overflow-safe sizeimage = bpl * h */
-    if (__builtin_mul_overflow((size_t)bpl, (size_t)h, &size) || size == 0)
-        return -ERANGE; /* compliance-friendly: reject impossible requests */
+	if (h && max_frame) {
+		size_t max_bpl_hw = max_frame / h;
 
-    pix->width        = w;
-    pix->height       = h;
-    pix->bytesperline = bpl;
-    pix->sizeimage    = (u32)size; /* logical size, not page-aligned */
+		if (max_bpl_hw < min_bpl)
+			return -ERANGE;
+
+		max_bpl_hw = rounddown(max_bpl_hw, 64);
+
+		if (!max_bpl_hw)
+			return -ERANGE;
+
+		if (bpl > max_bpl_hw) {
+			pr_debug("try_fmt: clamp bpl %u -> %zu due to hw buf cap %zu\n",
+				 bpl, max_bpl_hw, max_frame);
+			bpl = (u32)max_bpl_hw;
+		}
+	}
+
+	/* Overflow-safe sizeimage = bpl * h */
+	if (__builtin_mul_overflow((size_t)bpl, (size_t)h, &size) || size == 0)
+		return -ERANGE; /* compliance-friendly: reject impossible requests */
+
+	if (size > max_frame)
+		return -ERANGE;
+
+	pix->width        = w;
+	pix->height       = h;
+	pix->bytesperline = bpl;
+	pix->sizeimage    = (u32)size; /* logical size, not page-aligned */
 
     hws_set_colorimetry_fmt(pix);
     pr_debug("try_fmt: w=%u h=%u bpl=%u size=%u field=%u\n",
