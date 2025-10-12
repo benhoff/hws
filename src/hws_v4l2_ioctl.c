@@ -218,8 +218,16 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 
 	/* Recompute stride/sizeimage/half_size using your helper */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
-	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
-	vid->pix.half_size    = vid->pix.sizeimage / 2;
+	{
+		size_t sz = hws_calc_size_yuyv(new_w, new_h);
+		sz = rounddown(sz, HWS_HALF_ALIGN_BYTES);
+		if (!sz)
+			sz = HWS_HALF_ALIGN_BYTES;
+		if (sz > U32_MAX)
+			sz = U32_MAX;
+		vid->pix.sizeimage = (u32)sz;
+	}
+	vid->pix.half_size    = vid->pix.sizeimage;
 
 	if (!was_busy)
 		vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
@@ -461,6 +469,10 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	if (__builtin_mul_overflow((size_t)bpl, (size_t)h, &size) || size == 0)
 		return -ERANGE; /* compliance-friendly: reject impossible requests */
 
+	size = rounddown(size, HWS_HALF_ALIGN_BYTES);
+	if (!size)
+		size = HWS_HALF_ALIGN_BYTES;
+
 	if (size > max_frame)
 		return -ERANGE;
 
@@ -511,8 +523,8 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 
 	/* Update sizes (use helper if you prefer strict alignment math) */
     vid->pix.bytesperline = f->fmt.pix.bytesperline;          /* aligned */
-    vid->pix.sizeimage    = f->fmt.pix.sizeimage;             /* logical */
-	vid->pix.half_size    = vid->pix.sizeimage / 2;
+    vid->pix.sizeimage    = f->fmt.pix.sizeimage;
+	vid->pix.half_size    = vid->pix.sizeimage;
 	vid->pix.interlaced   = false;
 	/* Or:
 	 * hws_calc_sizeimage(vid, vid->pix.width, vid->pix.height, false);

@@ -323,88 +323,15 @@ static void hws_stop_kthread_action(void *data)
 
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
-	int ch;
-	/* 64 KiB is plenty for a safe dummy; align to 64 for your HW */
-	const size_t need = ALIGN(64 * 1024, 64);
-
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
-#if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
-		void *cpu = dma_alloc_coherent(&hws->pdev->dev, need,
-					       &hws->scratch_vid[ch].dma,
-					       GFP_KERNEL);
-#else
-		void *cpu = NULL;
-#endif
-		if (!cpu) {
-			dev_warn(&hws->pdev->dev,
-				 "scratch: dma_alloc_coherent failed ch=%d\n", ch);
-			/* not fatal: free earlier ones and continue without seeding */
-			while (--ch >= 0) {
-				if (hws->scratch_vid[ch].cpu)
-					dma_free_coherent(&hws->pdev->dev,
-							  hws->scratch_vid[ch].size,
-							  hws->scratch_vid[ch].cpu,
-							  hws->scratch_vid[ch].dma);
-				hws->scratch_vid[ch].cpu = NULL;
-				hws->scratch_vid[ch].size = 0;
-			}
-			return -ENOMEM;
-		}
-		hws->scratch_vid[ch].cpu  = cpu;
-		hws->scratch_vid[ch].size = need;
-	}
 	return 0;
 }
 
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 {
-	int ch;
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
-		if (hws->scratch_vid[ch].cpu) {
-			dma_free_coherent(&hws->pdev->dev, hws->scratch_vid[ch].size,
-			                  hws->scratch_vid[ch].cpu, hws->scratch_vid[ch].dma);
-			hws->scratch_vid[ch].cpu = NULL;
-			hws->scratch_vid[ch].size = 0;
-		}
-	}
-}
-
-static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
-{
-	dma_addr_t paddr = hws->scratch_vid[ch].dma;
-	u32 lo = lower_32_bits(paddr);
-	u32 hi = upper_32_bits(paddr);
-	u32 pci_addr = lo & PCI_E_BAR_ADD_LOWMASK;
-
-	lo &= PCI_E_BAR_ADD_MASK;
-
-	/* Program 64-bit BAR remap entry for this channel (table @ 0x208 + ch*8) */
-	writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + ch*8);
-	writel_relaxed(lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + ch*8 + PCIE_BARADDROFSIZE);
-
-	/* Program capture engine per-channel base/half */
-	writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-	               hws->bar0_base + CVBS_IN_BUF_BASE + ch * PCIE_BARADDROFSIZE);
-
-	/* half size: use either the current format’s half or half of scratch */
-	{
-		u32 half = hws->video[ch].pix.half_size ?
-		           hws->video[ch].pix.half_size :
-		           (u32)(hws->scratch_vid[ch].size / 2);
-		writel_relaxed(half / 16,
-		               hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-	}
-
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush posted writes */
 }
 
 static void hws_seed_all_channels(struct hws_pcie_dev *hws)
 {
-	int ch;
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
-		if (hws->scratch_vid[ch].cpu)
-			hws_seed_channel(hws, ch);
-	}
 }
 
 static void hws_irq_mask_gate(struct hws_pcie_dev *hws)

@@ -6,6 +6,11 @@
 #include <linux/delay.h>
 #include <linux/bits.h>
 #include <linux/timer.h>
+#include <linux/dma-mapping.h>
+#include <linux/slab.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+#include <linux/string.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -33,7 +38,25 @@
 #define HWS_REMAP_SLOT_OFF(ch)   (0x208 + (ch) * 8)     /* one 64-bit slot per ch */
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
 #define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
-#define HWS_HALF_ALIGN_BYTES     (16 * 128) /* legacy hardware granularity (2 KiB) */
+enum hws_zcopy_mode {
+	HWS_ZC_ALWAYS = 0,
+	HWS_ZC_AUTO   = 1,
+	HWS_ZC_NEVER  = 2,
+};
+
+static int zero_copy_mode = HWS_ZC_AUTO;
+module_param(zero_copy_mode, int, 0644);
+MODULE_PARM_DESC(zero_copy_mode,
+		 "0=always zero copy (two buffers), 1=auto fallback (default), 2=never zero copy (always copy-out)");
+
+struct hws_ring_buf {
+    struct hws_video *vid;
+    unsigned int      slot;
+    void             *cpu;
+    dma_addr_t        dma;
+    size_t            size;
+    bool              external;
+};
 
 static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch);
 static bool hws_update_active_interlace(struct hws_pcie_dev *pdx,
@@ -42,6 +65,13 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch);
 static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch);
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced);
+static u32 hws_frame_bytes(struct hws_video *vid);
+static void hws_ring_release(struct hws_video *vid);
+static int hws_ring_setup(struct hws_video *vid);
+static int hws_program_video_ring(struct hws_pcie_dev *hws,
+                                  struct hws_video *vid);
+void hws_queue_assign_locked(struct hws_video *vid);
+static void hws_video_drain_queue_locked(struct hws_video *vid);
 
 /* DMA timeout handler */
 static void hws_dma_timeout_handler(struct timer_list *t)
@@ -50,8 +80,11 @@ static void hws_dma_timeout_handler(struct timer_list *t)
 	struct hws_pcie_dev *hws = vid->parent;
 	unsigned long flags;
 	
-	dev_warn(&hws->pdev->dev, "DMA timeout on channel %d, active buffer: %pK\n",
-	         vid->channel_index, vid->active);
+	dev_warn(&hws->pdev->dev,
+		 "DMA timeout on channel %d (slot0=%pK slot1=%pK)\n",
+		 vid->channel_index,
+		 vid->half_owner[0] ? &vid->half_owner[0]->vb : NULL,
+		 vid->half_owner[1] ? &vid->half_owner[1]->vb : NULL);
 	{
 		u32 ch = vid->channel_index;
 		u32 dma_reg = readl(hws->bar0_base + HWS_REG_DMA_ADDR(ch));
@@ -70,12 +103,9 @@ static void hws_dma_timeout_handler(struct timer_list *t)
 
 	vid->timeout_count++;
 	
-	/* Reset the channel and complete current buffer with error */
+	/* Reset the channel and complete current buffers with error */
 	spin_lock_irqsave(&vid->irq_lock, flags);
-	if (vid->active) {
-		vb2_buffer_done(&vid->active->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-		vid->active = NULL;
-	}
+	hws_video_drain_queue_locked(vid);
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 	
 	/* Try to restart capture if we have queued buffers */
@@ -103,6 +133,261 @@ static bool hws_wait_dma_idle(struct hws_pcie_dev *hws, unsigned int ch,
 		usleep_range(500, 1000);
 	}
 }
+
+static void hws_ring_release(struct hws_video *vid)
+{
+	struct hws_pcie_dev *hws = vid->parent;
+
+	if (vid->ring_cpu) {
+		dma_free_coherent(&hws->pdev->dev, vid->ring_bytes,
+				  vid->ring_cpu, vid->ring_dma);
+		vid->ring_cpu = NULL;
+	}
+	vid->ring_dma = 0;
+	vid->ring_bytes = 0;
+	vid->half_bytes = 0;
+	vid->half_cpu[0] = vid->half_cpu[1] = NULL;
+	vid->half_dma[0] = vid->half_dma[1] = 0;
+	vid->half_owner[0] = vid->half_owner[1] = NULL;
+	vid->alloc_slots = 0;
+	vid->queued_slots = 0;
+	vid->ring_ready = false;
+}
+
+static int hws_ring_setup(struct hws_video *vid)
+{
+	struct hws_pcie_dev *hws = vid->parent;
+	void *cpu;
+	dma_addr_t dma;
+	u32 half = hws_frame_bytes(vid);
+	u32 need;
+
+	need = half * 2;
+	if (vid->ring_ready && vid->half_bytes == half)
+		return 0;
+
+	hws_ring_release(vid);
+
+	cpu = dma_alloc_coherent(&hws->pdev->dev, need, &dma, GFP_KERNEL);
+	if (!cpu)
+		return -ENOMEM;
+
+	vid->ring_cpu = cpu;
+	vid->ring_dma = dma;
+	vid->ring_bytes = need;
+	vid->half_bytes = half;
+	vid->half_cpu[0] = cpu;
+	vid->half_cpu[1] = (u8 *)cpu + half;
+	vid->half_dma[0] = dma;
+	vid->half_dma[1] = dma + half;
+	vid->half_owner[0] = vid->half_owner[1] = NULL;
+	vid->alloc_slots = 0;
+	vid->queued_slots = 0;
+	vid->dma_slot = 0;
+	vid->ring_ready = true;
+	return 0;
+}
+
+static int hws_program_video_ring(struct hws_pcie_dev *hws,
+				       struct hws_video *vid)
+{
+	const u32 addr_mask     = PCI_E_BAR_ADD_MASK;
+	const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;
+	const u32 table_off     = HWS_REMAP_SLOT_OFF(vid->channel_index);
+	dma_addr_t paddr;
+	u32 lo, hi, pci_addr;
+
+	if (!vid->ring_ready)
+		return -EINVAL;
+
+	paddr = vid->ring_dma;
+	lo = lower_32_bits(paddr);
+	hi = upper_32_bits(paddr);
+	pci_addr = lo & addr_low_mask;
+
+	writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
+	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
+	writel(lo & addr_mask,
+	       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
+	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
+
+	writel((vid->channel_index + 1) * PCIEBAR_AXI_BASE + pci_addr,
+	       hws->bar0_base + CVBS_IN_BUF_BASE + vid->channel_index * PCIE_BARADDROFSIZE);
+	(void)readl(hws->bar0_base + CVBS_IN_BUF_BASE + vid->channel_index * PCIE_BARADDROFSIZE);
+
+	writel(vid->half_bytes / 16,
+	       hws->bar0_base + CVBS_IN_BUF_BASE2 + vid->channel_index * PCIE_BARADDROFSIZE);
+	(void)readl(hws->bar0_base + CVBS_IN_BUF_BASE2 + vid->channel_index * PCIE_BARADDROFSIZE);
+
+	hws_set_dma_doorbell(hws, vid->channel_index, vid->ring_dma, "ring_program");
+	return 0;
+}
+
+void hws_queue_assign_locked(struct hws_video *vid)
+{
+	struct hwsvideo_buffer *buf, *tmp;
+
+	list_for_each_entry_safe(buf, tmp, &vid->capture_queue, list) {
+		struct hws_ring_buf *rb = buf->vb.vb2_buf.planes[0].mem_priv;
+		unsigned int slot = rb->slot;
+
+		if (!vid->ring_mode) {
+			if (slot >= 2 || vid->half_owner[slot]) {
+				slot = vid->half_owner[0] ? (vid->half_owner[1] ? 2 : 1) : 0;
+				rb->slot = slot;
+			}
+		} else {
+			if (slot >= 2)
+				continue;
+		}
+
+		if (slot >= 2)
+			continue;
+		if (vid->half_owner[slot])
+			continue;
+		list_del_init(&buf->list);
+		vid->half_owner[slot] = buf;
+		vid->queued_slots |= BIT(slot);
+	}
+}
+
+void hws_prepare_vb(struct hws_video *vid, struct hwsvideo_buffer *buf,
+		       unsigned int slot)
+{
+	struct hws_ring_buf *rb;
+	size_t payload = vid->half_bytes;
+
+	if (!buf)
+		return;
+
+	rb = buf->vb.vb2_buf.planes[0].mem_priv;
+	if (!vid->ring_mode && rb) {
+		size_t copy = min(payload, rb->size);
+		memcpy(rb->cpu, vid->half_cpu[slot], copy);
+		dma_sync_single_for_device(&vid->parent->pdev->dev, rb->dma, copy,
+					 DMA_TO_DEVICE);
+		rb->slot = 2;
+	}
+
+	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, payload);
+}
+
+static void *hws_ring_alloc(struct vb2_buffer *vb, struct device *dev,
+			    unsigned long size)
+{
+	struct hws_video *vid = vb->vb2_queue->drv_priv;
+	struct hws_ring_buf *rb;
+	unsigned int slot;
+	int ret;
+	struct hws_pcie_dev *hws = vid->parent;
+	size_t need;
+
+	ret = hws_ring_setup(vid);
+	if (ret)
+		return ERR_PTR(ret);
+
+	rb = kzalloc(sizeof(*rb), GFP_KERNEL);
+	if (!rb)
+		return ERR_PTR(-ENOMEM);
+
+	rb->vid = vid;
+
+	if (vid->ring_mode) {
+	if (size && size > vid->half_bytes)
+		goto err_inval;
+		for (slot = 0; slot < 2; slot++) {
+			if (!(vid->alloc_slots & BIT(slot)))
+				break;
+		}
+	if (slot >= 2)
+		goto err_busy;
+
+		vid->alloc_slots |= BIT(slot);
+		rb->slot = slot;
+		rb->cpu = vid->half_cpu[slot];
+		rb->dma = vid->half_dma[slot];
+		rb->size = vid->half_bytes;
+		rb->external = false;
+		return rb;
+	}
+
+	/* fallback copy-out: allocate dedicated buffer */
+	need = vid->pix.sizeimage ? vid->pix.sizeimage : vid->half_bytes;
+	if (!need)
+		need = size ? size : PAGE_SIZE;
+	need = ALIGN(need, 64);
+	rb->cpu = dma_alloc_coherent(&hws->pdev->dev, need, &rb->dma, GFP_KERNEL);
+	if (!rb->cpu)
+		goto err_nomem;
+
+	rb->slot = 2; /* assigned when queued */
+	rb->size = need;
+	rb->external = true;
+	return rb;
+
+err_busy:
+	kfree(rb);
+	return ERR_PTR(-ENOSPC);
+
+err_inval:
+	kfree(rb);
+	return ERR_PTR(-EINVAL);
+
+err_nomem:
+	kfree(rb);
+	return ERR_PTR(-ENOMEM);
+}
+
+static void hws_ring_put(void *buf_priv)
+{
+	struct hws_ring_buf *rb = buf_priv;
+	struct hws_video *vid = rb->vid;
+	struct hws_pcie_dev *hws = vid->parent;
+
+	if (vid->ring_mode && rb->slot < 2)
+		vid->alloc_slots &= ~BIT(rb->slot);
+	if (rb->external && rb->cpu)
+		dma_free_coherent(&hws->pdev->dev, rb->size, rb->cpu, rb->dma);
+	kfree(rb);
+}
+
+static void *hws_ring_vaddr(struct vb2_buffer *vb, void *buf_priv)
+{
+	struct hws_ring_buf *rb = buf_priv;
+
+	return rb->cpu;
+}
+
+static void *hws_ring_cookie(struct vb2_buffer *vb, void *buf_priv)
+{
+	struct hws_ring_buf *rb = buf_priv;
+
+	return &rb->dma;
+}
+
+static unsigned int hws_ring_num_users(void *buf_priv)
+{
+	return 1;
+}
+
+static int hws_ring_mmap(void *buf_priv, struct vm_area_struct *vma)
+{
+	struct hws_ring_buf *rb = buf_priv;
+	struct hws_video *vid = rb->vid;
+	struct hws_pcie_dev *hws = vid->parent;
+
+	return dma_mmap_coherent(&hws->pdev->dev, vma,
+				  rb->cpu, rb->dma, rb->size);
+}
+
+static const struct vb2_mem_ops hws_ring_memops = {
+	.alloc      = hws_ring_alloc,
+	.put        = hws_ring_put,
+	.vaddr      = hws_ring_vaddr,
+	.cookie     = hws_ring_cookie,
+	.num_users  = hws_ring_num_users,
+	.mmap       = hws_ring_mmap,
+};
 
 static int hws_ctrls_init(struct hws_video *vid)
 {
@@ -183,7 +468,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	spin_lock_init(&vid->irq_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
 	vid->sequence_number = 0;
-	vid->active = NULL;
 
 	/* typed tasklet: bind handler once */
 	tasklet_setup(&vid->bh_tasklet, hws_bh_video);
@@ -199,14 +483,14 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->pix.height = 1080;
 	vid->pix.fourcc = V4L2_PIX_FMT_YUYV;
 	vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
-	vid->pix.sizeimage = vid->pix.bytesperline * vid->pix.height;
-	vid->pix.field = V4L2_FIELD_NONE;
 	vid->pix.colorspace = V4L2_COLORSPACE_REC709;
 	vid->pix.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
 	vid->pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
 	vid->pix.xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	vid->pix.field = V4L2_FIELD_NONE;
 	vid->pix.interlaced = false;
-	vid->pix.half_size = vid->pix.sizeimage / 2; /* if HW uses halves */
+	vid->pix.sizeimage = hws_calc_sizeimage(vid, vid->pix.width,
+						     vid->pix.height, false);
 	vid->alloc_sizeimage = vid->pix.sizeimage;
 
 	/* color controls default (mid-scale) */
@@ -221,6 +505,18 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->last_buf_half_toggle = 0;
 	vid->half_seen = false;
 	vid->signal_loss_cnt = 0;
+	vid->ring_cpu = NULL;
+	vid->ring_dma = 0;
+	vid->ring_bytes = 0;
+	vid->half_bytes = 0;
+	vid->half_cpu[0] = vid->half_cpu[1] = NULL;
+	vid->half_dma[0] = vid->half_dma[1] = 0;
+	vid->half_owner[0] = vid->half_owner[1] = NULL;
+	vid->alloc_slots = 0;
+	vid->queued_slots = 0;
+	vid->ring_ready = false;
+	vid->dma_slot = 0;
+	vid->ring_mode = (zero_copy_mode != HWS_ZC_NEVER);
 
 	/* Create BCHS + DV power-present as modern controls */
 	{
@@ -238,20 +534,32 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 static void hws_video_drain_queue_locked(struct hws_video *vid)
 {
-	/* Return in-flight first */
-	if (vid->active) {
-		vb2_buffer_done(&vid->active->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-		vid->active = NULL;
+	for (int slot = 0; slot < 2; slot++) {
+		if (vid->half_owner[slot]) {
+			vb2_buffer_done(&vid->half_owner[slot]->vb.vb2_buf,
+				       VB2_BUF_STATE_ERROR);
+			if (!vid->ring_mode) {
+				struct hws_ring_buf *rb = vid->half_owner[slot]->vb.vb2_buf.planes[0].mem_priv;
+				if (rb)
+					rb->slot = 2;
+			}
+			vid->half_owner[slot] = NULL;
+		}
 	}
 
-	/* Then everything queued */
 	while (!list_empty(&vid->capture_queue)) {
 		struct hwsvideo_buffer *b = list_first_entry(&vid->capture_queue,
-							     struct hwsvideo_buffer,
-							     list);
+						     struct hwsvideo_buffer,
+						     list);
 		list_del_init(&b->list);
 		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+		if (!vid->ring_mode) {
+			struct hws_ring_buf *rb = b->vb.vb2_buf.planes[0].mem_priv;
+			if (rb)
+				rb->slot = 2;
+		}
 	}
+	vid->queued_slots = 0;
 }
 
 void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
@@ -298,11 +606,11 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	mutex_destroy(&vid->state_lock);
 	mutex_destroy(&vid->qlock);
 	INIT_LIST_HEAD(&vid->capture_queue);
-	vid->active = NULL;
 	vid->stop_requested = false;
 	vid->last_buf_half_toggle = 0;
 	vid->half_seen = false;
 	vid->signal_loss_cnt = 0;
+	hws_ring_release(vid);
 }
 
 /* Convenience cast */
@@ -320,14 +628,15 @@ static int hws_buf_init(struct vb2_buffer *vb)
 
 static void hws_buf_finish(struct vb2_buffer *vb)
 {
-    struct hws_video *vid = vb->vb2_queue->drv_priv;
-    struct hws_pcie_dev *hws = vid->parent;
-    
-    /* Ensure DMA is complete and visible to CPU */
-    dma_sync_single_for_cpu(&hws->pdev->dev, 
-                           vb2_dma_contig_plane_dma_addr(vb, 0),
-                           vb2_plane_size(vb, 0), 
-                           DMA_FROM_DEVICE);
+	struct hws_video *vid = vb->vb2_queue->drv_priv;
+	struct hws_ring_buf *rb = vb->planes[0].mem_priv;
+	struct hws_pcie_dev *hws = vid->parent;
+
+	if (!rb)
+		return;
+
+	dma_sync_single_for_cpu(&hws->pdev->dev, rb->dma,
+				  rb->size, DMA_FROM_DEVICE);
 }
 
 static void hws_buf_cleanup(struct vb2_buffer *vb)
@@ -341,42 +650,9 @@ static void hws_buf_cleanup(struct vb2_buffer *vb)
 void hws_program_video_from_vb2(struct hws_pcie_dev *hws, unsigned int ch,
                                 struct vb2_buffer *vb)
 {
-    const u32 addr_mask     = PCI_E_BAR_ADD_MASK;     // 0xE0000000
-    const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;  // 0x1FFFFFFF
-    const u32 table_off     = 0x208 + ch * 8;         // same as legacy
+	struct hws_video *vid = &hws->video[ch];
 
-    dma_addr_t paddr = vb2_dma_contig_plane_dma_addr(vb, 0);
-    u32 lo = lower_32_bits(paddr);
-    u32 hi = upper_32_bits(paddr);
-    u32 pci_addr = lo & addr_low_mask;   // low 29 bits inside 512MB window
-    u32 page_lo  = lo & addr_mask;       // bits 31..29 only (page bits)
-
-    hws_wait_dma_idle(hws, ch, 20);
-
-    /* Remap entry: HI then page_LO (legacy order) */
-    writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
-    (void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
-    writel(page_lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
-    (void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
-
-    /* Program per-channel base and half-size */
-    writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-           hws->bar0_base + CVBS_IN_BUF_BASE + ch * PCIE_BARADDROFSIZE);
-    (void)readl(hws->bar0_base + CVBS_IN_BUF_BASE + ch * PCIE_BARADDROFSIZE);
-
-    writel(hws->video[ch].pix.half_size / 16,
-           hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-    (void)readl(hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-
-    /* Optional: verify and log */
-    {
-        u32 r_hi  = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
-        u32 r_lo  = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
-        u32 r_base= readl(hws->bar0_base + CVBS_IN_BUF_BASE  + ch * PCIE_BARADDROFSIZE);
-        u32 r_half= readl(hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-        pr_info("ch%u remap: hi=0x%08x(lo exp 0x%08x got 0x%08x) base=0x%08x exp=0x%08x half16B=0x%08x\n",
-                ch, r_hi, page_lo, r_lo, r_base, (ch+1)*PCIEBAR_AXI_BASE + pci_addr, r_half);
-    }
+	hws_program_video_ring(hws, vid);
 }
 
 void hws_set_dma_doorbell(struct hws_pcie_dev *hws,
@@ -473,67 +749,6 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 		on ? "ON" : "OFF", chan, status);
 }
 
-static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
-{
-    const u32 addr_mask     = PCI_E_BAR_ADD_MASK;
-    const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;
-    u32 table = 0x208; /* one 64-bit entry per channel */
-    unsigned int ch;
-
-    if (!hws || !hws->bar0_base)
-        return;
-
-    /* If cur_max_video_ch isn’t set yet, default to max_channels */
-    if (!hws->cur_max_video_ch || hws->cur_max_video_ch > hws->max_channels)
-        hws->cur_max_video_ch = hws->max_channels;
-
-    for (ch = 0; ch < hws->cur_max_video_ch; ch++, table += 8) {
-        /* 1) Ensure a tiny, valid DMA buf exists (1 page is plenty) */
-        if (!hws->scratch_vid[ch].cpu) {
-            hws->scratch_vid[ch].size = PAGE_SIZE;
-            hws->scratch_vid[ch].cpu =
-                dma_alloc_coherent(&hws->pdev->dev,
-                                   hws->scratch_vid[ch].size,
-                                   &hws->scratch_vid[ch].dma,
-                                   GFP_KERNEL);
-            if (!hws->scratch_vid[ch].cpu) {
-                dev_warn(&hws->pdev->dev,
-                         "ch%u: scratch DMA alloc failed, skipping seed\n", ch);
-                continue;
-            }
-        }
-
-        /* 2) Program 64-bit BAR remap entry for this channel */
-        {
-            dma_addr_t p = hws->scratch_vid[ch].dma;
-            u32 lo = lower_32_bits(p) & addr_mask;
-            u32 hi = upper_32_bits(p);
-            u32 pci_addr_low = lower_32_bits(p) & addr_low_mask;
-
-            writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table);
-            writel_relaxed(lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + table + PCIE_BARADDROFSIZE);
-
-            /* 3) Per-channel AXI base + PCI low */
-            writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE + pci_addr_low,
-                           hws->bar0_base + CVBS_IN_BUF_BASE + ch * PCIE_BARADDROFSIZE);
-
-            /* 4) Half-frame length in /16 units.
-             * Prefer the current channel’s computed half_size if available.
-             * Fall back to PAGE_SIZE/2.
-             */
-            {
-                u32 half_bytes = hws->video[ch].pix.half_size ?
-                                 hws->video[ch].pix.half_size :
-                                 (PAGE_SIZE / 2);
-                writel_relaxed(half_bytes / 16,
-                               hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-            }
-        }
-    }
-
-    /* Post writes so device sees them before we move on */
-    (void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
-}
 
 #define LOG_DEC(tag) dev_info(&hws->pdev->dev, "DEC_MODE %s = 0x%08x\n", tag, readl(hws->bar0_base + HWS_REG_DEC_MODE))
 
@@ -570,7 +785,6 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 
 	/* 1) reset the decoder mode register to 0 */
     writel(0x00000000, hws->bar0_base + HWS_REG_DEC_MODE); LOG_DEC("after reset");
-    hws_seed_dma_windows(hws);
 
 	/* 3) on a full reset, clear all per-channel status and indices */
 	if (!enable) {
@@ -818,23 +1032,27 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	 */
 	smp_wmb();
 
-	hws_enable_video_capture(pdx, ch, false);
-	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+hws_enable_video_capture(pdx, ch, false);
+readl(pdx->bar0_base + HWS_REG_INT_STATUS);
 
-	tasklet_kill(&v->bh_tasklet);
+tasklet_kill(&v->bh_tasklet);
 
-	spin_lock_irqsave(&v->irq_lock, flags);
-	if (v->active) {
-		vb2_buffer_done(&v->active->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-		v->active = NULL;
+spin_lock_irqsave(&v->irq_lock, flags);
+for (int slot = 0; slot < 2; slot++) {
+	if (v->half_owner[slot]) {
+		vb2_buffer_done(&v->half_owner[slot]->vb.vb2_buf,
+			       VB2_BUF_STATE_ERROR);
+		v->half_owner[slot] = NULL;
 	}
-	while (!list_empty(&v->capture_queue)) {
-		struct hwsvideo_buffer *b = list_first_entry(&v->capture_queue,
-							     struct hwsvideo_buffer, list);
+}
+while (!list_empty(&v->capture_queue)) {
+	struct hwsvideo_buffer *b = list_first_entry(&v->capture_queue,
+				struct hwsvideo_buffer, list);
 		list_del_init(&b->list);
 		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-	}
-	spin_unlock_irqrestore(&v->irq_lock, flags);
+}
+v->queued_slots = 0;
+spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	/* Update software pixel state */
 	v->pix.width = w;
@@ -868,28 +1086,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
 	v->sequence_number = 0;
 
-	/* Re-prime first VB2 buffer if present */
-	spin_lock_irqsave(&v->irq_lock, flags);
-	if (!list_empty(&v->capture_queue)) {
-		v->active = list_first_entry(&v->capture_queue,
-					     struct hwsvideo_buffer, list);
-		list_del_init(&v->active->list);
-		hws_program_video_from_vb2(pdx, ch, &v->active->vb.vb2_buf);
-		reenable = true;
-	}
-	spin_unlock_irqrestore(&v->irq_lock, flags);
-
-	if (!reenable)
-		return;
-
-	WRITE_ONCE(v->stop_requested, false);
-	WRITE_ONCE(v->cap_active, true);
-	/* Publish stop_requested/cap_active before HW disable; pairs with
-	 * BH/ISR reads in hws_bh_video/hws_arm_next.
-	 */
-	smp_wmb();
-	hws_enable_video_capture(pdx, ch, true);
-	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+	hws_ring_release(v);
 }
 
 static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch)
@@ -1003,25 +1200,45 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced)
 {
-	/* example for packed 16bpp (YUYV); replace with your real math/align */
-	u32 lines = h; /* full frame lines for sizeimage */
 	u32 bytesperline = ALIGN(w * 2, 64);
-	u32 sizeimage;
-	u32 half;
+	size_t size;
 
-	/* publish into pix, since we now carry these in-state */
+	if (!bytesperline)
+		bytesperline = ALIGN(2U, 64);
+
+	size = (size_t)bytesperline * (size_t)max_t(u16, h, 1);
+	size = rounddown(size, HWS_HALF_ALIGN_BYTES);
+	if (!size)
+		size = HWS_HALF_ALIGN_BYTES;
+	if (size > U32_MAX)
+		size = U32_MAX;
+
 	v->pix.bytesperline = bytesperline;
-	sizeimage = bytesperline * lines;
-	half = sizeimage / 2;
-	half = round_down(half, HWS_HALF_ALIGN_BYTES);
-	if (!half)
-		half = HWS_HALF_ALIGN_BYTES;
-	sizeimage = half * 2;
-	v->pix.sizeimage = sizeimage;
-	v->pix.half_size = half; /* if HW uses halves */
+	v->pix.sizeimage = (u32)size;
+	v->pix.half_size = v->pix.sizeimage;
 	v->pix.field = interlaced ? V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
 
 	return v->pix.sizeimage;
+}
+
+static u32 hws_frame_bytes(struct hws_video *vid)
+{
+	u32 size = vid->pix.sizeimage;
+
+	if (!size) {
+		bool interlaced = vid->pix.field == V4L2_FIELD_INTERLACED;
+		size = hws_calc_sizeimage(vid, vid->pix.width, vid->pix.height,
+					  interlaced);
+	}
+
+	if (!size) {
+		size = HWS_HALF_ALIGN_BYTES;
+		vid->pix.sizeimage = size;
+	}
+	if (!vid->pix.half_size)
+		vid->pix.half_size = size;
+
+	return size;
 }
 
 static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
@@ -1030,87 +1247,79 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 {
 	struct hws_video *vid = q->drv_priv;
 	struct hws_pcie_dev *hws = vid->parent;
-    size_t need_min   = vid->pix.sizeimage;
-    size_t need_alloc = PAGE_ALIGN(vid->pix.sizeimage);
+	unsigned int have = vb2_get_num_buffers(q);
+	unsigned int requested = *num_buffers ? *num_buffers : 1;
+	u32 frame_bytes = hws_frame_bytes(vid);
 
-    if (!need_min) {
-        vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
-        vid->pix.sizeimage    = vid->pix.bytesperline * vid->pix.height;
-        need_min   = vid->pix.sizeimage;
-        need_alloc = PAGE_ALIGN(vid->pix.sizeimage);
-    } 
+	if (have == 0) {
+		switch (zero_copy_mode) {
+		case HWS_ZC_ALWAYS:
+			vid->ring_mode = true;
+			break;
+		case HWS_ZC_NEVER:
+			vid->ring_mode = false;
+			break;
+		case HWS_ZC_AUTO:
+			vid->ring_mode = (requested <= 2);
+			break;
+		}
+	} else {
+		/* keep existing mode once buffers are allocated */
+	}
 
-    if (*nplanes) {
-        if (*nplanes != 1)
-            return -EINVAL;
-        if (!sizes[0])
-            sizes[0] = need_min;            // publish minimal, not page-aligned
-        if (sizes[0] < need_min)
-            return -EINVAL;
-        vid->alloc_sizeimage = need_alloc;  // keep internal aligned size
-    } else {
-        *nplanes = 1;
-        sizes[0] = need_min;                // report minimal requirement
-        vid->alloc_sizeimage = need_alloc;
-    }
+	if (vid->ring_mode && zero_copy_mode == HWS_ZC_AUTO && requested > 2)
+		vid->ring_mode = false;
+
+	if (!frame_bytes)
+		return -EINVAL;
+
+	if (*nplanes) {
+		if (*nplanes != 1)
+			return -EINVAL;
+		if (sizes[0] < frame_bytes)
+			sizes[0] = frame_bytes;
+	} else {
+		*nplanes = 1;
+		sizes[0] = frame_bytes;
+	}
 
 	if (alloc_devs)
-		alloc_devs[0] = &hws->pdev->dev; /* vb2-dma-contig device */
+		alloc_devs[0] = &hws->pdev->dev;
 
-	/* Make sure we have a reasonable minimum queue depth. */
-	if (*num_buffers == 0)
-		return 0;
-
-	if (*num_buffers < 1)
-		*num_buffers = 1;
-
-	unsigned int have = vb2_get_num_buffers(q);   /* instead of q->num_buffers */
-	unsigned int room = (HWS_MAX_BUFS > have) ? (HWS_MAX_BUFS - have) : 0;
-	if (*num_buffers > room)
-		*num_buffers = room;
 	if (*num_buffers == 0) {
-		pr_debug("queue_setup: rejecting, no room (have=%u, max=%u)\n",
-			 have, HWS_MAX_BUFS);
-		return -ENOBUFS;   /* or -ENOMEM; either is fine for CREATE_BUFS clamp */
+		vid->alloc_sizeimage = frame_bytes;
+		return 0;
 	}
+
+	if (vid->ring_mode) {
+		if (*num_buffers > 2)
+			*num_buffers = 2;
+		if (have >= 2)
+			*num_buffers = 0;
+		else if (have + *num_buffers > 2)
+			*num_buffers = 2 - have;
+		if (*num_buffers == 0)
+			return have >= 2 ? 0 : -ENOBUFS;
+	} else {
+		if (*num_buffers > HWS_MAX_BUFS)
+			*num_buffers = HWS_MAX_BUFS;
+		if (*num_buffers == 0)
+			*num_buffers = 1;
+	}
+
+	vid->alloc_sizeimage = frame_bytes;
 	return 0;
 }
 
 static int hws_buffer_prepare(struct vb2_buffer *vb)
 {
 	struct hws_video *vid = vb->vb2_queue->drv_priv;
-	struct hws_pcie_dev *hws = vid->parent;
-	size_t need = vid->pix.sizeimage;
-	dma_addr_t dma_addr;
+	struct hws_ring_buf *rb = vb->planes[0].mem_priv;
 
-	if (vb2_plane_size(vb, 0) < need)
+	if (!rb)
 		return -EINVAL;
 
-	/* Validate DMA address alignment */
-	dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
-	if (dma_addr & 0x3F) { /* 64-byte alignment required */
-		dev_err(&hws->pdev->dev, "Buffer DMA address 0x%llx not 64-byte aligned\n", 
-		        (unsigned long long)dma_addr);
-		return -EINVAL;
-	}
-
-	/* Check if buffer is in valid DMA range */
-	if (need) {
-		u64 dma_last = (u64)dma_addr + (u64)need - 1;
-
-		if (dma_last > DMA_BIT_MASK(32)) {
-			dev_err(&hws->pdev->dev,
-				"Buffer DMA range 0x%llx-0x%llx exceeds 32-bit window\n",
-				(unsigned long long)dma_addr,
-				(unsigned long long)dma_last);
-			return -EINVAL;
-		}
-	} else {
-		dev_err(&hws->pdev->dev, "Unexpected zero-sized video buffer\n");
-		return -EINVAL;
-	}
-
-	vb2_set_plane_payload(vb, 0, need);
+	vb2_set_plane_payload(vb, 0, vid->half_bytes);
 	return 0;
 }
 
@@ -1118,33 +1327,17 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 {
 	struct hws_video *vid = vb->vb2_queue->drv_priv;
 	struct hwsvideo_buffer *buf = to_hwsbuf(vb);
-	struct hws_pcie_dev *hws = vid->parent;
+	struct hws_ring_buf *rb = vb->planes[0].mem_priv;
 	unsigned long flags;
-	dma_addr_t dma_addr;
-    pr_debug("buffer_queue(ch=%u): vb=%pK sizeimage=%u q_active=%d\n",
-             vid->channel_index, vb, vid->pix.sizeimage, READ_ONCE(vid->cap_active));
+
+	if (!vid->ring_mode && rb)
+		rb->slot = 2;
 
 	spin_lock_irqsave(&vid->irq_lock, flags);
+	if (!list_empty(&buf->list))
+		list_del_init(&buf->list);
 	list_add_tail(&buf->list, &vid->capture_queue);
-
-	/* If streaming and no in-flight buffer, prime HW immediately */
-	if (READ_ONCE(vid->cap_active) && !vid->active) {
-        pr_debug("buffer_queue(ch=%u): priming first vb=%pK\n",
-                 vid->channel_index, &buf->vb.vb2_buf);
-        list_del_init(&buf->list);
-		vid->active = buf;
-		
-		/* Program MMIO window first so doorbell sees fresh registers. */
-		dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		hws_program_video_from_vb2(vid->parent, vid->channel_index,
-					   &buf->vb.vb2_buf);
-		hws_set_dma_doorbell(hws, vid->channel_index, dma_addr, "buffer_queue");
-        if (check_video_capture(vid->parent, vid->channel_index) == 0) {
-            pr_debug("buffer_queue(ch=%u): enabling capture now\n",
-                     vid->channel_index);
-            hws_enable_video_capture(vid->parent, vid->channel_index, true);
-        }
-	}
+	hws_queue_assign_locked(vid);
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 }
 
@@ -1264,8 +1457,8 @@ void hws_video_dump_all_regs(struct hws_pcie_dev *hws, const char *tag)
 		struct hws_video *v = &hws->video[ch];
 		u32 dma_addr_reg = hws_r32(hws->bar0_base, HWS_REG_DMA_ADDR(ch));
 		dev_dbg(dev,
-			"  CH%u: cap_active=%d stop_req=%d active=%pK seq=%u timeout_cnt=%u err_cnt=%u\n",
-			ch, v->cap_active, v->stop_requested, v->active,
+			"  CH%u: cap_active=%d stop_req=%d queued_mask=0x%lx seq=%u timeout_cnt=%u err_cnt=%u\n",
+			ch, v->cap_active, v->stop_requested, v->queued_slots,
 			v->sequence_number, v->timeout_count, v->error_count);
 		dev_dbg(dev, "       DMA_ADDR_REG=0x%08x queue_len=%d\n",
 			dma_addr_reg, !list_empty(&v->capture_queue));
@@ -1286,87 +1479,47 @@ void hws_video_dump_all_regs(struct hws_pcie_dev *hws, const char *tag)
 
 static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 {
-    struct hws_video *v = q->drv_priv;
-    struct hws_pcie_dev *hws = v->parent;
-    struct device *dev = &hws->pdev->dev;
-    struct hwsvideo_buffer *to_program = NULL;   // local copy
-    unsigned long flags;
-    int en, ret;
-    dev_dbg(dev, "start_streaming(ch=%u): entry, count=%u\n", v->channel_index, count);
-    hws_dump_irq_regs(hws, "start_streaming:before");
-    hws_video_dump_all_regs(hws, "start streaming:before");
-    // FIXME: half way buffer is broken, when we're writing the half way buffer size, it's not checking the buffer size currently
+	struct hws_video *v = q->drv_priv;
+	struct hws_pcie_dev *hws = v->parent;
+	struct device *dev = &hws->pdev->dev;
+	unsigned long flags;
+	int ret;
 
-    ret = hws_check_card_status(hws);
-    if (ret)
-        return ret;
-    (void)hws_update_active_interlace(hws, v->channel_index);
+	dev_dbg(dev, "start_streaming(ch=%u): entry, count=%u\n",
+		v->channel_index, count);
 
+	ret = hws_check_card_status(hws);
+	if (ret)
+		return ret;
 
-    mutex_lock(&v->state_lock);
-    /* init per-stream state */
-    WRITE_ONCE(v->stop_requested, false);
-    WRITE_ONCE(v->cap_active, true);
-    WRITE_ONCE(v->half_seen, false);
-    WRITE_ONCE(v->last_buf_half_toggle, 0);
-    dev_dbg(dev, "start_streaming(ch=%u): state init stop=%d cap=%d\n",
-             v->channel_index, v->stop_requested, v->cap_active);
-    mutex_unlock(&v->state_lock);
+	ret = hws_ring_setup(v);
+	if (ret)
+		return ret;
 
-    /* Try to prime a buffer, but it's OK if none are queued yet */
-    spin_lock_irqsave(&v->irq_lock, flags);
-    if (!v->active && !list_empty(&v->capture_queue)) {
-        to_program = list_first_entry(&v->capture_queue,
-                                      struct hwsvideo_buffer, list);
-        list_del(&to_program->list);
-        v->active = to_program;
-        dev_dbg(dev, "start_streaming(ch=%u): took first queued buffer %pK\n",
-                v->channel_index, to_program);
-    }
-    spin_unlock_irqrestore(&v->irq_lock, flags);
+	spin_lock_irqsave(&v->irq_lock, flags);
+	hws_queue_assign_locked(v);
+	if (!v->half_owner[0] || !v->half_owner[1]) {
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		dev_warn(dev, "start_streaming(ch=%u): insufficient buffers queued\n",
+			 v->channel_index);
+		return -ENOBUFS;
+	}
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 
-    /* Only program/enable HW if we actually have a buffer */
-    if (to_program) {
-        dma_addr_t dma_addr;
-        
-        dev_info(dev, "start_streaming geometry ch%u: width=%u height=%u bytesperline=%u sizeimage=%u half=%u half16B=%u alloc=%u\n",
-                 v->channel_index, v->pix.width, v->pix.height,
-                 v->pix.bytesperline, v->pix.sizeimage,
-                 v->pix.half_size, v->pix.half_size / 16,
-                 v->alloc_sizeimage);
+	ret = hws_program_video_ring(hws, v);
+	if (ret)
+		return ret;
 
-        /* Program BAR/half registers first, matching legacy flow */
-        dma_addr = vb2_dma_contig_plane_dma_addr(&to_program->vb.vb2_buf, 0);
-        hws_program_video_from_vb2(hws, v->channel_index,
-                                   &to_program->vb.vb2_buf);
-        wmb();
-        hws_set_dma_doorbell(hws, v->channel_index, dma_addr, "start_streaming");
+	mutex_lock(&v->state_lock);
+	WRITE_ONCE(v->stop_requested, false);
+	WRITE_ONCE(v->cap_active, true);
+	WRITE_ONCE(v->half_seen, false);
+	WRITE_ONCE(v->last_buf_half_toggle, 0);
+	mutex_unlock(&v->state_lock);
 
-        dev_dbg(dev, "start_streaming(ch=%u): programmed first buffer %pK with DMA addr 0x%08x\n",
-                v->channel_index, to_program, lower_32_bits(dma_addr));
-        (void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush posted writes */
-
-        en = check_video_capture(hws, v->channel_index);
-        hws_dump_irq_regs(hws, "start_streaming:after-program");
-        if (en < 0)
-            return en;
-
-        /* Only start hardware streaming after DMA address is programmed */
-        if (en == 0) {
-            hws_enable_video_capture(hws, v->channel_index, true);
-            /* Start timeout timer for first buffer */
-            mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000));
-            dev_dbg(dev, "start_streaming(ch=%u): capture enabled after DMA programming\n",
-                    v->channel_index);
-        }
-    } else {
-        dev_dbg(dev, "start_streaming(ch=%u): no buffer to program yet (will arm on QBUF)\n",
-                v->channel_index);
-    }
-    hws_dump_irq_regs(hws, "start_streaming:exit");
-    hws_video_dump_all_regs(hws, "start streaming:exit");
-
-    return 0;
+	hws_enable_video_capture(hws, v->channel_index, true);
+	mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000));
+	return 0;
 }
 
 static inline bool list_node_unlinked(const struct list_head *n)
@@ -1395,25 +1548,13 @@ static void hws_stop_streaming(struct vb2_queue *q)
     /* 2) Collect in-flight + queued under the IRQ lock */
     spin_lock_irqsave(&v->irq_lock, flags);
 
-    if (v->active) {
-        /*
-         * v->active may not be on any list (only referenced by v->active).
-         * Only move it if its list node is still linked somewhere.
-         */
-        if (!list_node_unlinked(&v->active->list)) {
-            /* Move directly to 'done' in one safe op */
-            list_move_tail(&v->active->list, &done);
-        } else {
-            /* Not on a list: put list node into a known state for later reuse */
-            INIT_LIST_HEAD(&v->active->list);
-            /*
-             * We'll complete it below without relying on list pointers.
-             * To unify flow, push it via a temporary single-element list.
-             */
-            list_add_tail(&v->active->list, &done);
+    for (int slot = 0; slot < 2; slot++) {
+        if (v->half_owner[slot]) {
+            list_add_tail(&v->half_owner[slot]->list, &done);
+            v->half_owner[slot] = NULL;
         }
-        v->active = NULL;
     }
+    v->queued_slots = 0;
 
     while (!list_empty(&v->capture_queue)) {
         b = list_first_entry(&v->capture_queue, struct hwsvideo_buffer, list);
@@ -1429,6 +1570,8 @@ static void hws_stop_streaming(struct vb2_queue *q)
         list_del_init(&b->list);
         vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
     }
+
+    hws_ring_release(v);
 }
 
 static const struct vb2_ops hwspcie_video_qops = {
@@ -1498,11 +1641,11 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q = &ch->buffer_queue;
 		memset(q, 0, sizeof(*q));
 		q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		q->io_modes = VB2_MMAP | VB2_DMABUF;
+		q->io_modes = VB2_MMAP;
 		q->drv_priv = ch;
 		q->buf_struct_size = sizeof(struct hwsvideo_buffer);
 		q->ops = &hwspcie_video_qops; /* your vb2_ops */
-		q->mem_ops = &vb2_dma_contig_memops;
+		q->mem_ops = &hws_ring_memops;
 		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 		q->lock = &ch->qlock;
         q->max_num_buffers = HWS_MAX_BUFS;
@@ -1575,20 +1718,7 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 
 		/* 2) Drain SW queue + complete in-flight buffer as ERROR. */
 		spin_lock_irqsave(&ch->irq_lock, flags);
-
-		if (ch->active) {
-			vb2_buffer_done(&ch->active->vb.vb2_buf,
-					VB2_BUF_STATE_ERROR);
-			ch->active = NULL;
-		}
-		while (!list_empty(&ch->capture_queue)) {
-			struct hwsvideo_buffer *b =
-				list_first_entry(&ch->capture_queue,
-						 struct hwsvideo_buffer, list);
-			list_del(&b->list);
-			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-		}
-
+		hws_video_drain_queue_locked(ch);
 		spin_unlock_irqrestore(&ch->irq_lock, flags);
 
 		/* 3) Release vb2 queue (safe to call once if it was inited). */
