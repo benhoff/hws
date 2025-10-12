@@ -414,8 +414,8 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
     pix->pixelformat = V4L2_PIX_FMT_YUYV;
 
     /* Defaults then clamp */
-    w = (req_w ? req_w : 640);
-    h = (req_h ? req_h : 480);
+    w = req_w ? req_w : (vid ? vid->pix.width : 640);
+    h = req_h ? req_h : (vid ? vid->pix.height : 480);
     if (w > MAX_VIDEO_HW_W) w = MAX_VIDEO_HW_W;
     if (h > MAX_VIDEO_HW_H) h = MAX_VIDEO_HW_H;
     if (!w) w = 640;  /* hard fallback in case macros are odd */
