@@ -20,9 +20,9 @@ void hws_program_video_from_vb2(struct hws_pcie_dev *hws,
 				unsigned int ch,
 				struct vb2_buffer *vb);
 void hws_set_dma_doorbell(struct hws_pcie_dev *hws,
- 		  unsigned int ch,
- 		  dma_addr_t dma_addr,
- 		  const char *tag);
+			  unsigned int ch,
+			  dma_addr_t dma_addr,
+			  const char *tag);
 void hws_queue_assign_locked(struct hws_video *vid);
 void hws_prepare_vb(struct hws_video *vid, struct hwsvideo_buffer *buf,
 		       unsigned int slot);

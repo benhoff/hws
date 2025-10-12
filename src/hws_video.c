@@ -5,7 +5,6 @@
 #include <linux/overflow.h>
 #include <linux/delay.h>
 #include <linux/bits.h>
-#include <linux/timer.h>
 #include <linux/dma-mapping.h>
 #include <linux/slab.h>
 #include <linux/module.h>
@@ -72,67 +71,6 @@ static int hws_program_video_ring(struct hws_pcie_dev *hws,
                                   struct hws_video *vid);
 void hws_queue_assign_locked(struct hws_video *vid);
 static void hws_video_drain_queue_locked(struct hws_video *vid);
-
-/* DMA timeout handler */
-static void hws_dma_timeout_handler(struct timer_list *t)
-{
-        struct hws_video *vid = container_of(t, struct hws_video, dma_timeout_timer);
-	struct hws_pcie_dev *hws = vid->parent;
-	unsigned long flags;
-	
-	dev_warn(&hws->pdev->dev,
-		 "DMA timeout on channel %d (slot0=%pK slot1=%pK)\n",
-		 vid->channel_index,
-		 vid->half_owner[0] ? &vid->half_owner[0]->vb : NULL,
-		 vid->half_owner[1] ? &vid->half_owner[1]->vb : NULL);
-	{
-		u32 ch = vid->channel_index;
-		u32 dma_reg = readl(hws->bar0_base + HWS_REG_DMA_ADDR(ch));
-		u32 int_status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-		u32 vcap = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
-		u32 sys = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
-		u32 toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-		u32 table_off = HWS_REMAP_SLOT_OFF(ch);
-		u32 remap_hi = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-		u32 remap_lo = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
-		u32 buf_base = readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
-		dev_info(&hws->pdev->dev,
-			 "timeout diag ch%u: DMA_REG=0x%08x VBUF_TOGGLE=%u INT_STATUS=0x%08x VCAP=0x%08x SYS_STATUS=0x%08x remap_hi=0x%08x remap_lo=0x%08x buf_base=0x%08x\n",
-			 ch, dma_reg, toggle, int_status, vcap, sys, remap_hi, remap_lo, buf_base);
-	}
-
-	vid->timeout_count++;
-	
-	/* Reset the channel and complete current buffers with error */
-	spin_lock_irqsave(&vid->irq_lock, flags);
-	hws_video_drain_queue_locked(vid);
-	spin_unlock_irqrestore(&vid->irq_lock, flags);
-	
-	/* Try to restart capture if we have queued buffers */
-	tasklet_schedule(&vid->bh_tasklet);
-}
-
-static bool hws_wait_dma_idle(struct hws_pcie_dev *hws, unsigned int ch,
-			      unsigned long timeout_ms)
-{
-	unsigned long timeout = jiffies + msecs_to_jiffies(timeout_ms);
-
-	if (!hws || !hws->bar0_base)
-		return true;
-
-	for (;;) {
-		u32 sys = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
-		if (!(sys & HWS_SYS_DMA_BUSY_BIT))
-			return true;
-		if (time_after(jiffies, timeout)) {
-			dev_warn(&hws->pdev->dev,
-				 "wait_dma_idle timeout ch%u SYS_STATUS=0x%08x\n",
-				 ch, sys);
-			return false;
-		}
-		usleep_range(500, 1000);
-	}
-}
 
 static void hws_ring_release(struct hws_video *vid)
 {
@@ -472,10 +410,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	/* typed tasklet: bind handler once */
 	tasklet_setup(&vid->bh_tasklet, hws_bh_video);
 
-	/* DMA timeout timer setup */
-	timer_setup(&vid->dma_timeout_timer, hws_dma_timeout_handler, 0);
 	vid->last_frame_jiffies = jiffies;
-	vid->timeout_count = 0;
 	vid->error_count = 0;
 
 	/* default format (adjust to your HW) */
@@ -1267,21 +1202,27 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 		/* keep existing mode once buffers are allocated */
 	}
 
-	if (vid->ring_mode && zero_copy_mode == HWS_ZC_AUTO && requested > 2)
-		vid->ring_mode = false;
+	if (vid->ring_mode) {
+		unsigned int target = *num_buffers ? *num_buffers : requested;
+
+		if (target < 2) {
+			if (zero_copy_mode == HWS_ZC_ALWAYS) {
+				if (*num_buffers && *num_buffers < 2)
+					*num_buffers = 2;
+				requested = 2;
+			} else {
+				vid->ring_mode = false;
+			}
+		} else if (zero_copy_mode == HWS_ZC_AUTO && target > 2) {
+			vid->ring_mode = false;
+		}
+	}
 
 	if (!frame_bytes)
 		return -EINVAL;
 
-	if (*nplanes) {
-		if (*nplanes != 1)
-			return -EINVAL;
-		if (sizes[0] < frame_bytes)
-			sizes[0] = frame_bytes;
-	} else {
-		*nplanes = 1;
-		sizes[0] = frame_bytes;
-	}
+	*nplanes = 1;
+	sizes[0] = frame_bytes;
 
 	if (alloc_devs)
 		alloc_devs[0] = &hws->pdev->dev;
@@ -1457,9 +1398,9 @@ void hws_video_dump_all_regs(struct hws_pcie_dev *hws, const char *tag)
 		struct hws_video *v = &hws->video[ch];
 		u32 dma_addr_reg = hws_r32(hws->bar0_base, HWS_REG_DMA_ADDR(ch));
 		dev_dbg(dev,
-			"  CH%u: cap_active=%d stop_req=%d queued_mask=0x%lx seq=%u timeout_cnt=%u err_cnt=%u\n",
+			"  CH%u: cap_active=%d stop_req=%d queued_mask=0x%lx seq=%u err_cnt=%u\n",
 			ch, v->cap_active, v->stop_requested, v->queued_slots,
-			v->sequence_number, v->timeout_count, v->error_count);
+			v->sequence_number, v->error_count);
 		dev_dbg(dev, "       DMA_ADDR_REG=0x%08x queue_len=%d\n",
 			dma_addr_reg, !list_empty(&v->capture_queue));
 	}
@@ -1498,9 +1439,16 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	hws_queue_assign_locked(v);
-	if (!v->half_owner[0] || !v->half_owner[1]) {
+	if (v->ring_mode) {
+		if (!v->half_owner[0] || !v->half_owner[1]) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			dev_warn(dev, "start_streaming(ch=%u): need two buffers for zero-copy\n",
+				 v->channel_index);
+			return -ENOBUFS;
+		}
+	} else if (!v->half_owner[0] && !v->half_owner[1]) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
-		dev_warn(dev, "start_streaming(ch=%u): insufficient buffers queued\n",
+		dev_warn(dev, "start_streaming(ch=%u): no buffers queued\n",
 			 v->channel_index);
 		return -ENOBUFS;
 	}
@@ -1518,7 +1466,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	mutex_unlock(&v->state_lock);
 
 	hws_enable_video_capture(hws, v->channel_index, true);
-	mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000));
 	return 0;
 }
 
@@ -1539,9 +1486,6 @@ static void hws_stop_streaming(struct vb2_queue *q)
     WRITE_ONCE(v->cap_active, false);
     WRITE_ONCE(v->stop_requested, true);
     mutex_unlock(&v->state_lock);
-
-    /* Cancel any pending timeout */
-    timer_delete_sync(&v->dma_timeout_timer);
 
     hws_enable_video_capture(v->parent, v->channel_index, false);
 

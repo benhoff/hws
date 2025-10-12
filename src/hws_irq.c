@@ -3,7 +3,6 @@
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
-#include <linux/timer.h>
 
 #include <sound/pcm.h>
 #include <media/videobuf2-dma-contig.h>
@@ -59,7 +58,6 @@ void hws_bh_video(struct tasklet_struct *t)
     if (done) {
         struct vb2_v4l2_buffer *vb2v = &done->vb;
 
-        timer_delete(&v->dma_timeout_timer);
         v->last_frame_jiffies = jiffies;
 
         dma_rmb();
@@ -70,8 +68,6 @@ void hws_bh_video(struct tasklet_struct *t)
         vb2v->vb2_buf.timestamp = ktime_get_ns();
         vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
     }
-
-    mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000));
 
     hws_arm_next(hws, ch);
 }

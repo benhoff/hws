@@ -98,9 +98,7 @@ struct hws_video {
 	u32  sequence_number;
 
 	/* ───── timeout and error handling ───── */
-	struct timer_list        dma_timeout_timer;
 	unsigned long            last_frame_jiffies;
-	u32                      timeout_count;
 	u32                      error_count;
 
 	/* ───── misc counters ───── */
