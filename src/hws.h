@@ -117,6 +117,7 @@ struct hws_video {
 	dma_addr_t               half_dma[2];
 	u32                      dma_slot;
 	bool                     ring_ready;
+	bool                     zero_copy;
 };
 
 struct hws_audio {

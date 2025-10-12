@@ -65,31 +65,37 @@ void hws_bh_video(struct tasklet_struct *t)
     spin_unlock_irqrestore(&v->irq_lock, flags);
 
     if (buf && (buf->slot & BIT(completed_slot))) {
-        void *dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+        if (v->zero_copy) {
+            finished = ((buf->slot & 0x3) == 0x3);
+        } else {
+            void *dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
 
-        if (dst)
-            memcpy(dst + (size_t)completed_slot * half,
-                   v->half_cpu[completed_slot], half);
-        else
-            dev_warn_ratelimited(dev,
-                                 "ch%u: no CPU mapping for buffer, dropping half %u\n",
-                                 ch, completed_slot);
+            if (dst)
+                memcpy(dst + (size_t)completed_slot * half,
+                       v->half_cpu[completed_slot], half);
+            else
+                dev_warn_ratelimited(dev,
+                                     "ch%u: no CPU mapping for buffer, dropping half %u\n",
+                                     ch, completed_slot);
 
-        if ((buf->slot & 0x3) == 0x3)
-            finished = true;
+            if ((buf->slot & 0x3) == 0x3)
+                finished = true;
+        }
     }
 
     if (finished && buf) {
         struct vb2_v4l2_buffer *vb2v = &buf->vb;
         bool have_active_after = false;
+        struct hwsvideo_buffer *next = NULL;
 
         spin_lock_irqsave(&v->irq_lock, flags);
         if (v->active == buf) {
             if (!list_empty(&v->capture_queue)) {
-                v->active = list_first_entry(&v->capture_queue,
-                                             struct hwsvideo_buffer, list);
-                list_del_init(&v->active->list);
-                v->active->slot = 0;
+                next = list_first_entry(&v->capture_queue,
+                                        struct hwsvideo_buffer, list);
+                list_del_init(&next->list);
+                next->slot = 0;
+                v->active = next;
             } else {
                 v->active = NULL;
             }
@@ -102,10 +108,28 @@ void hws_bh_video(struct tasklet_struct *t)
         vb2v->vb2_buf.timestamp = ktime_get_ns();
         vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 
-        if (have_active_after)
-            mod_timer(&v->dma_timeout_timer,
-                      jiffies + msecs_to_jiffies(2000));
-    } else if (buf) {
+        if (!v->zero_copy) {
+            if (have_active_after)
+                mod_timer(&v->dma_timeout_timer,
+                          jiffies + msecs_to_jiffies(2000));
+        } else {
+            if (next) {
+                dma_addr_t dma = vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
+
+                hws_program_video_from_vb2(hws, v, &next->vb.vb2_buf);
+                wmb();
+                hws_set_dma_doorbell(hws, v->channel_index, dma, "bh_next_zero");
+                mod_timer(&v->dma_timeout_timer,
+                          jiffies + msecs_to_jiffies(2000));
+            } else {
+                hws_enable_video_capture(hws, v->channel_index, false);
+                WRITE_ONCE(v->cap_active, false);
+            }
+        }
+    } else if (buf && !v->zero_copy) {
+        mod_timer(&v->dma_timeout_timer,
+                  jiffies + msecs_to_jiffies(2000));
+    } else if (buf && v->zero_copy) {
         mod_timer(&v->dma_timeout_timer,
                   jiffies + msecs_to_jiffies(2000));
     }
