@@ -3,6 +3,7 @@
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/timer.h>
 
 #include <sound/pcm.h>
 #include <media/videobuf2-dma-contig.h>
@@ -22,7 +23,12 @@ static void hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
     unsigned long flags;
 
     spin_lock_irqsave(&v->irq_lock, flags);
-    hws_queue_assign_locked(v);
+    if (!v->active && !list_empty(&v->capture_queue)) {
+        v->active = list_first_entry(&v->capture_queue,
+                                     struct hwsvideo_buffer, list);
+        list_del_init(&v->active->list);
+        v->active->slot = 0;
+    }
     spin_unlock_irqrestore(&v->irq_lock, flags);
 }
 
@@ -32,9 +38,11 @@ void hws_bh_video(struct tasklet_struct *t)
     struct hws_pcie_dev *hws = v->parent;
     struct device *dev = &hws->pdev->dev;
     unsigned int ch = v->channel_index;
-    struct hwsvideo_buffer *done = NULL;
     unsigned long flags;
     unsigned int toggle, completed_slot;
+    struct hwsvideo_buffer *buf;
+    bool finished = false;
+    size_t half;
 
     if (unlikely(READ_ONCE(hws->suspended)))
         return;
@@ -45,28 +53,61 @@ void hws_bh_video(struct tasklet_struct *t)
     toggle = READ_ONCE(v->last_buf_half_toggle) & 0x1;
     completed_slot = toggle ^ 1;
 
+    half = v->half_bytes ? v->half_bytes : v->pix.half_size;
+    if (!half)
+        half = HWS_HALF_ALIGN_BYTES;
+
     spin_lock_irqsave(&v->irq_lock, flags);
     v->dma_slot = toggle;
-    if (v->half_owner[completed_slot]) {
-        done = v->half_owner[completed_slot];
-        v->half_owner[completed_slot] = NULL;
-        v->queued_slots &= ~BIT(completed_slot);
-    }
-    hws_queue_assign_locked(v);
+    buf = v->active;
+    if (buf && !(buf->slot & BIT(completed_slot)))
+        buf->slot |= BIT(completed_slot);
     spin_unlock_irqrestore(&v->irq_lock, flags);
 
-    if (done) {
-        struct vb2_v4l2_buffer *vb2v = &done->vb;
+    if (buf && (buf->slot & BIT(completed_slot))) {
+        void *dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
 
-        v->last_frame_jiffies = jiffies;
+        if (dst)
+            memcpy(dst + (size_t)completed_slot * half,
+                   v->half_cpu[completed_slot], half);
+        else
+            dev_warn_ratelimited(dev,
+                                 "ch%u: no CPU mapping for buffer, dropping half %u\n",
+                                 ch, completed_slot);
 
-        dma_rmb();
+        if ((buf->slot & 0x3) == 0x3)
+            finished = true;
+    }
 
-        hws_prepare_vb(v, done, completed_slot);
+    if (finished && buf) {
+        struct vb2_v4l2_buffer *vb2v = &buf->vb;
+        bool have_active_after = false;
 
+        spin_lock_irqsave(&v->irq_lock, flags);
+        if (v->active == buf) {
+            if (!list_empty(&v->capture_queue)) {
+                v->active = list_first_entry(&v->capture_queue,
+                                             struct hwsvideo_buffer, list);
+                list_del_init(&v->active->list);
+                v->active->slot = 0;
+            } else {
+                v->active = NULL;
+            }
+        }
+        have_active_after = v->active != NULL;
+        spin_unlock_irqrestore(&v->irq_lock, flags);
+
+        vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
         vb2v->sequence = ++v->sequence_number;
         vb2v->vb2_buf.timestamp = ktime_get_ns();
         vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
+
+        if (have_active_after)
+            mod_timer(&v->dma_timeout_timer,
+                      jiffies + msecs_to_jiffies(2000));
+    } else if (buf) {
+        mod_timer(&v->dma_timeout_timer,
+                  jiffies + msecs_to_jiffies(2000));
     }
 
     hws_arm_next(hws, ch);

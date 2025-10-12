@@ -50,6 +50,7 @@ struct hws_adapter;
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head       list;
+	unsigned int           slot;
 };
 
 struct hws_video {
@@ -106,6 +107,16 @@ struct hws_video {
 
 	/* ───── misc counters ───── */
 	int signal_loss_cnt;
+
+	/* ───── scratch ring DMA (copy-out) ───── */
+	void                    *ring_cpu;
+	dma_addr_t               ring_dma;
+	u32                      ring_bytes;
+	u32                      half_bytes;
+	void                    *half_cpu[2];
+	dma_addr_t               half_dma[2];
+	u32                      dma_slot;
+	bool                     ring_ready;
 };
 
 struct hws_audio {
