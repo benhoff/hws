@@ -39,7 +39,7 @@ struct hws_pix_state {
 	enum v4l2_quantization quantization;/* V4L2_QUANTIZATION_LIM_RANGE */
 	enum v4l2_xfer_func   xfer_func;    /* V4L2_XFER_FUNC_DEFAULT */
 	bool                  interlaced;   /* cached hardware state */
-	u32                   half_size;    /* optional: if your HW needs it */
+	u32                   half_size;
 };
 
 #define	UNSET	(-1U)
@@ -59,6 +59,7 @@ struct hws_video {
 
 	struct vb2_queue			 buffer_queue;
 	struct list_head			 capture_queue;
+	struct hwsvideo_buffer *active;
 
 	/* ───── locking ───── */
 	struct mutex			 state_lock;		  /* primary state */
@@ -86,7 +87,7 @@ struct hws_video {
 	struct v4l2_ctrl           *ctrl_saturation;
 	struct v4l2_ctrl           *ctrl_hue;
 	/* ───── capture queue status ───── */
-	// FIXME: https://chatgpt.com/s/t_68aaabb351b48191b791152813d52e9a
+
 	struct hws_pix_state         pix;
 	u32 alloc_sizeimage;
 
@@ -98,25 +99,13 @@ struct hws_video {
 	u32  sequence_number;
 
 	/* ───── timeout and error handling ───── */
+	struct timer_list        dma_timeout_timer;
 	unsigned long            last_frame_jiffies;
+	u32                      timeout_count;
 	u32                      error_count;
 
 	/* ───── misc counters ───── */
 	int signal_loss_cnt;
-
-	/* ───── zero-copy ring dma info ───── */
-	void                    *ring_cpu;
-	dma_addr_t               ring_dma;
-	u32                      ring_bytes;      /* total size (two halves) */
-	u32                      half_bytes;      /* aligned half */
-	void                    *half_cpu[2];
-	dma_addr_t               half_dma[2];
-	struct hwsvideo_buffer  *half_owner[2];
-	unsigned long            alloc_slots;     /* slots allocated to vb2 */
-	unsigned long            queued_slots;    /* slots currently queued */
-	unsigned int             dma_slot;        /* last hardware toggle */
-	bool                     ring_ready;
-	bool                     ring_mode;       /* zero-copy ring in use */
 };
 
 struct hws_audio {
@@ -144,6 +133,13 @@ struct hws_audio {
 	u16                        channel_count;
 	u16                        bits_per_sample;
 };
+
+struct hws_scratch_dma {
+	void       *cpu;
+	dma_addr_t  dma;
+	size_t      size;
+};
+
 
 struct hws_pcie_dev {
 	/* ───── core objects ───── */
@@ -179,6 +175,7 @@ struct hws_pcie_dev {
 
 	/* ───── kernel thread ───── */
 	struct task_struct        *main_task;
+    struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int  irq;
