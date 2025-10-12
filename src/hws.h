@@ -61,6 +61,7 @@ struct hws_video {
 	struct vb2_queue			 buffer_queue;
 	struct list_head			 capture_queue;
 	struct hwsvideo_buffer *active;
+	u32                          queued_count;
 
 	/* ───── locking ───── */
 	struct mutex			 state_lock;		  /* primary state */
@@ -98,6 +99,11 @@ struct hws_video {
 	u8                      last_buf_half_toggle;
 	bool half_seen;
 	u32  sequence_number;
+	u8   ring_toggle_hw;
+	u8   ring_toggle_prev;
+	bool ring_first_half_copied;
+	u32  ring_frame_bytes;
+	unsigned long ring_last_toggle_jiffies;
 
 	/* ───── timeout and error handling ───── */
 	struct timer_list        dma_timeout_timer;

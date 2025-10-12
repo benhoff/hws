@@ -43,6 +43,11 @@
 	  .driver_data = (unsigned long)(__configptr) }
 
 #define CH_SHIFT 2 /* need 2 bits for 0-3            */
+
+static bool hws_disable_audio = true;
+module_param_named(disable_audio, hws_disable_audio, bool, 0644);
+MODULE_PARM_DESC(disable_audio, "Disable ALSA capture support (default: true)");
+
 #define LOG_DEC(tag) dev_info(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n", tag, readl(hdev->bar0_base + HWS_REG_DEC_MODE))
 
 static const struct pci_device_id hws_pci_table[] = {
@@ -208,6 +213,11 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 		hdev->cur_max_video_ch = 4;
 		hdev->cur_max_linein_ch = 0;
 		break;
+	}
+
+	if (hws_disable_audio) {
+		pr_info("HwsCapture: audio capture disabled by module parameter\n");
+		hdev->cur_max_linein_ch = 0;
 	}
 
 	/* universal buffer capacity */
