@@ -164,6 +164,9 @@ static void hws_dma_timeout_handler(struct timer_list *t)
 	unsigned long now;
 	bool ring_mode;
 	bool have_next;
+	u32 expected_half = 0;
+	u32 half_reg = 0;
+	bool half_mismatch = false;
 
 	if (!READ_ONCE(vid->cap_active))
 		return;
@@ -178,6 +181,8 @@ static void hws_dma_timeout_handler(struct timer_list *t)
 		return;
 	}
 
+	ring_mode = hws_use_ring(vid);
+
 	dev_warn(&hws->pdev->dev, "DMA timeout on channel %d, active buffer: %pK\n",
 	         vid->channel_index, vid->active);
 	{
@@ -191,16 +196,29 @@ static void hws_dma_timeout_handler(struct timer_list *t)
 		u32 remap_hi = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
 		u32 remap_lo = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
 		u32 buf_base = readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
-		u32 half_reg = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
-		u32 expected_half = vid->pix.half_size ? vid->pix.half_size / 16 : 0;
+		u32 hpd = readl(hws->bar0_base + HWS_REG_HPD(ch));
+		u32 active = readl(hws->bar0_base + HWS_REG_ACTIVE_STATUS);
+		u32 in_res = readl(hws->bar0_base + HWS_REG_IN_RES(ch));
+		u32 frame_rate = readl(hws->bar0_base + HWS_REG_FRAME_RATE(ch));
+		u16 live_w = in_res & 0xFFFF;
+		u16 live_h = (in_res >> 16) & 0xFFFF;
+		bool signal_present = !!(active & BIT(ch));
+		bool interlace_flag = !!(active & BIT(8 + ch));
+
+		half_reg = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+		expected_half = vid->pix.half_size ? vid->pix.half_size / 16 : 0;
+		half_mismatch = expected_half && expected_half != half_reg;
+
 		dev_info(&hws->pdev->dev,
 			 "timeout diag ch%u: DMA_REG=0x%08x VBUF_TOGGLE=%u INT_STATUS=0x%08x VCAP=0x%08x SYS_STATUS=0x%08x remap_hi=0x%08x remap_lo=0x%08x buf_base=0x%08x\n",
 			 ch, dma_reg, toggle, int_status, vcap, sys, remap_hi, remap_lo, buf_base);
-		if (expected_half && expected_half != half_reg) {
-			dev_err(&hws->pdev->dev,
-				"timeout diag ch%u: half-size mismatch expected=%u(16B) programmed=%u(16B)\n",
-				ch, expected_half, half_reg);
-		}
+		dev_info(&hws->pdev->dev,
+			 "timeout diag ch%u: HPD=0x%08x(+5V=%d HPD=%d) ACTIVE_STATUS=0x%08x(sig=%d interlace=%d) FRAME_RATE=%u live_res=%ux%u\n",
+			 ch, hpd, !!(hpd & HWS_5V_BIT), !!(hpd & HWS_HPD_BIT),
+			 active, signal_present, interlace_flag, frame_rate, live_w, live_h);
+		dev_info(&hws->pdev->dev,
+			 "timeout diag ch%u: half expected=%u(16B) half_reg=%u(16B)\n",
+			 ch, expected_half, half_reg);
 		if (vid->active) {
 			size_t plane0 = vb2_plane_size(&vid->active->vb.vb2_buf, 0);
 			if (vid->pix.sizeimage > plane0) {
@@ -212,7 +230,40 @@ static void hws_dma_timeout_handler(struct timer_list *t)
 	}
 
 	vid->timeout_count++;
-	
+
+	if (half_mismatch) {
+		dev_err(&hws->pdev->dev,
+			"timeout diag ch%u: half-size mismatch expected=%u(16B) programmed=%u(16B)\n",
+			vid->channel_index, expected_half, half_reg);
+
+		if (ring_mode && vid->ring_ready) {
+			int ret = hws_program_video_ring(hws, vid);
+
+			if (ret) {
+				dev_err(&hws->pdev->dev,
+					"timeout diag ch%u: ring reprogram failed during half-size recovery: %d\n",
+					vid->channel_index, ret);
+			} else {
+				u32 hw_toggle = readl(hws->bar0_base +
+						      HWS_REG_VBUF_TOGGLE(vid->channel_index)) & 0x1;
+				WRITE_ONCE(vid->ring_toggle_prev, hw_toggle);
+				WRITE_ONCE(vid->ring_toggle_hw, hw_toggle);
+				WRITE_ONCE(vid->ring_last_toggle_jiffies, jiffies);
+				mod_timer(&vid->dma_timeout_timer, jiffies + timeout_j);
+				return;
+			}
+		} else if (!ring_mode && vid->active) {
+			hws_program_video_from_vb2(hws, vid, &vid->active->vb.vb2_buf);
+			wmb();
+			hws_set_dma_doorbell(hws, vid->channel_index,
+					     vb2_dma_contig_plane_dma_addr(&vid->active->vb.vb2_buf, 0),
+					     "timeout_half_recover");
+			WRITE_ONCE(vid->ring_last_toggle_jiffies, jiffies);
+			mod_timer(&vid->dma_timeout_timer, jiffies + timeout_j);
+			return;
+		}
+	}
+
 	/* Reset the channel and complete current buffer with error */
 	spin_lock_irqsave(&vid->irq_lock, flags);
 	if (vid->active) {
@@ -239,7 +290,6 @@ static void hws_dma_timeout_handler(struct timer_list *t)
 		vb2_buffer_done(&timed_out->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 	}
 
-	ring_mode = hws_use_ring(vid);
 	have_next = next != NULL;
 
 	/* Try to restart capture if we have queued buffers */
@@ -1715,128 +1765,171 @@ void hws_video_dump_all_regs(struct hws_pcie_dev *hws, const char *tag)
 	dev_dbg(dev, "============== END HWS REG DUMP (%s) ==============\n", tag ? tag : "");
 }
 
-
-
 static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 {
-    struct hws_video *v = q->drv_priv;
-    struct hws_pcie_dev *hws = v->parent;
-    struct device *dev = &hws->pdev->dev;
-    struct hwsvideo_buffer *first = NULL;
-    unsigned long flags;
-    int ret;
+	struct hws_video *v = q->drv_priv;
+	struct hws_pcie_dev *hws = v->parent;
+	struct device *dev = &hws->pdev->dev;
+	struct hwsvideo_buffer *first = NULL;
+	unsigned long flags;
+	int ret;
 
-    dev_dbg(dev, "start_streaming(ch=%u): entry, count=%u\n",
-            v->channel_index, count);
+	dev_dbg(dev, "start_streaming(ch=%u): entry, count=%u\n",
+		v->channel_index, count);
 
-    ret = hws_check_card_status(hws);
-    if (ret)
-        return ret;
+	/* 0) Make sure the core is alive and the fabric isn’t stuck */
+	ret = hws_check_card_status(hws);
+	if (ret)
+		return ret;
 
-    (void)hws_update_active_interlace(hws, v->channel_index);
+	/* Clear any stale pending bits using the ACK register (W1C). */
+	{
+		u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		if (st) {
+			writel(st, hws->bar0_base + HWS_REG_INT_ACK);
+			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		}
+	}
 
-    spin_lock_irqsave(&v->irq_lock, flags);
-    if (!v->active && !list_empty(&v->capture_queue)) {
-        v->active = list_first_entry(&v->capture_queue,
-                                     struct hwsvideo_buffer, list);
-        list_del_init(&v->active->list);
-        if (v->queued_count)
-            v->queued_count--;
+	/* 1) Ensure we have an active input (prevents guaranteed timeouts) */
+	(void)hws_update_active_interlace(hws, v->channel_index);
+	if (!READ_ONCE(v->pix.width) || !READ_ONCE(v->pix.height)) {
+		dev_warn(dev, "STREAMON ch%u: unknown format (w/h=0)\n", v->channel_index);
+	}
+	if (!readl(hws->bar0_base + HWS_REG_ACTIVE_STATUS) & BIT(v->channel_index)) {
+		dev_warn(dev, "STREAMON ch%u: no active video; deferring\n", v->channel_index);
+		return -EAGAIN;
+	}
+
+	/* 2) Adopt the first queued buffer as active (if any) */
+	spin_lock_irqsave(&v->irq_lock, flags);
+	if (!v->active && !list_empty(&v->capture_queue)) {
+		v->active = list_first_entry(&v->capture_queue,
+					     struct hwsvideo_buffer, list);
+		list_del_init(&v->active->list);
+		if (v->queued_count)
+			v->queued_count--;
 		v->active->slot = 0;
-        v->ring_first_half_copied = false;
+		v->ring_first_half_copied = false;
 	}
 	first = v->active;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
-    if (first)
-        first->slot = 0;
+	if (!first) {
+		dev_warn(dev, "start_streaming(ch=%u): need at least one queued buffer\n",
+			 v->channel_index);
+		return -ENOBUFS;
+	}
+	first->slot = 0;
 
-    ret = hws_sync_live_format(hws, v, first);
-    if (ret < 0) {
-        mutex_lock(&v->state_lock);
-        WRITE_ONCE(v->cap_active, false);
-        WRITE_ONCE(v->stop_requested, true);
-        mutex_unlock(&v->state_lock);
+	/* 3) Sync live format to buffers before arming DMA */
+	ret = hws_sync_live_format(hws, v, first);
+	if (ret < 0) {
+		mutex_lock(&v->state_lock);
+		WRITE_ONCE(v->cap_active, false);
+		WRITE_ONCE(v->stop_requested, true);
+		mutex_unlock(&v->state_lock);
 
-        spin_lock_irqsave(&v->irq_lock, flags);
-        if (v->active == first)
-            v->active = NULL;
-        if (first) {
-            list_add(&first->list, &v->capture_queue);
-            v->queued_count++;
-        }
-        spin_unlock_irqrestore(&v->irq_lock, flags);
+		spin_lock_irqsave(&v->irq_lock, flags);
+		if (v->active == first)
+			v->active = NULL;
+		list_add(&first->list, &v->capture_queue);
+		v->queued_count++;
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return ret;
+	}
 
-        return ret;
-    }
+	/* 4) Flip software state to “running” (publish before MMIO) */
+	mutex_lock(&v->state_lock);
+	WRITE_ONCE(v->stop_requested, false);
+	WRITE_ONCE(v->cap_active, true);
+	WRITE_ONCE(v->half_seen, false);
+	WRITE_ONCE(v->last_buf_half_toggle, 0);
+	v->sequence_number = 0;
+	WRITE_ONCE(v->ring_first_half_copied, false);
+	WRITE_ONCE(v->ring_toggle_prev, 0);
+	WRITE_ONCE(v->ring_toggle_hw, 0);
+	WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
+	v->ring_frame_bytes = v->pix.sizeimage;
+	mutex_unlock(&v->state_lock);
 
-    mutex_lock(&v->state_lock);
-    WRITE_ONCE(v->stop_requested, false);
-    WRITE_ONCE(v->cap_active, true);
-    WRITE_ONCE(v->half_seen, false);
-    WRITE_ONCE(v->last_buf_half_toggle, 0);
-    v->sequence_number = 0;
-    WRITE_ONCE(v->ring_first_half_copied, false);
-    WRITE_ONCE(v->ring_toggle_prev, 0);
-    WRITE_ONCE(v->ring_toggle_hw, 0);
-    WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
-    v->ring_frame_bytes = v->pix.sizeimage;
-    mutex_unlock(&v->state_lock);
+	/* 5) Program either the ring (copy-out) or the zero-copy path */
+	if (hws_use_ring(v)) {
+		ret = hws_ring_setup(v);
+		if (ret)
+			return ret;
 
-    if (hws_use_ring(v)) {
-        ret = hws_ring_setup(v);
-        if (ret)
-            return ret;
+		ret = hws_program_video_ring(hws, v);
+		if (ret)
+			return ret;
 
-        ret = hws_program_video_ring(hws, v);
-        if (ret)
-            return ret;
+		/* Doorbell to the ring buffer */
+		hws_set_dma_doorbell(hws, v->channel_index, v->ring_dma, "start_streaming");
+	} else {
+		/* Zero-copy into vb2 buffer */
+		v->half_bytes = max_t(u32, v->pix.half_size, HWS_HALF_ALIGN_BYTES);
+		hws_program_video_from_vb2(hws, v, &first->vb.vb2_buf);
+		wmb();
+		hws_set_dma_doorbell(hws, v->channel_index,
+				     vb2_dma_contig_plane_dma_addr(&first->vb.vb2_buf, 0),
+				     "start_zero_copy");
+	}
 
-        if (!first) {
-            dev_warn(dev, "start_streaming(ch=%u): need at least one queued buffer\n",
-                     v->channel_index);
-            return -ENOBUFS;
-        }
+	/* 6) Latch doorbell: double-tap if the first readback is 0 */
+	{
+		const u32 ch = v->channel_index;
+		u32 dma_after = readl(hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+		u32 buf_base  = readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
+		u32 half_reg  = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
 
-        hws_set_dma_doorbell(hws, v->channel_index, v->ring_dma, "start_streaming");
-        {
-            u32 start_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(v->channel_index)) & 0x1;
+		if (!dma_after) {
+			/* Re-write the same doorbell to tickle bridges that drop the first */
+			if (hws_use_ring(v)) {
+				iowrite32((u32)(v->ring_dma & PCI_E_BAR_ADD_LOWMASK),
+					  hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+			} else {
+				dma_addr_t p = vb2_dma_contig_plane_dma_addr(&first->vb.vb2_buf, 0);
+				iowrite32((u32)(p & PCI_E_BAR_ADD_LOWMASK),
+					  hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+			}
+			wmb();
+			dma_after = readl(hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+		}
 
-            WRITE_ONCE(v->ring_toggle_hw, start_toggle);
-            WRITE_ONCE(v->ring_toggle_prev, start_toggle);
-        }
-        WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
+		dev_info(dev,
+			 "STREAMON ch%u use_ring=%d first=%pK size=%u half=%u | DMA_ADDR=0x%08x BUF_BASE=0x%08x HALF16B=0x%08x\n",
+			 v->channel_index, hws_use_ring(v), first,
+			 v->pix.sizeimage, v->pix.half_size,
+			 dma_after, buf_base, half_reg);
+	}
 
-    } else {
-        if (!first) {
-            dev_warn(dev, "start_streaming(ch=%u): need buffer for zero-copy\n",
-                     v->channel_index);
-            return -ENOBUFS;
-        }
+	/* Capture the starting toggle for ring-mode bookkeeping */
+	if (hws_use_ring(v)) {
+		u32 start_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(v->channel_index)) & 0x1;
+		WRITE_ONCE(v->ring_toggle_hw, start_toggle);
+		WRITE_ONCE(v->ring_toggle_prev, start_toggle);
+		WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
+	} else {
+		WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
+	}
 
-        v->half_bytes = max_t(u32, v->pix.half_size, HWS_HALF_ALIGN_BYTES);
-        first->slot = 0;
-        hws_program_video_from_vb2(hws, v, &first->vb.vb2_buf);
-        wmb();
-        hws_set_dma_doorbell(hws, v->channel_index,
-                             vb2_dma_contig_plane_dma_addr(&first->vb.vb2_buf, 0),
-                             "start_zero_copy");
-        WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
-    }
+	/* 7) Finally enable the per-channel capture gate */
+	hws_enable_video_capture(hws, v->channel_index, true);
 
-    hws_enable_video_capture(hws, v->channel_index, true);
+	/* 8) Arm the DMA timeout watchdog */
+	mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000));
 
-    mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000));
+	/* 9) One-line confirmation */
+	if (hws_use_ring(v))
+		dev_dbg(dev, "start_streaming(ch=%u): ring programmed dma=%pad half=%u\n",
+			v->channel_index, &v->ring_dma, v->half_bytes);
+	else
+		dev_dbg(dev, "start_streaming(ch=%u): zero-copy DMA addr programmed\n",
+			v->channel_index);
 
-    if (hws_use_ring(v))
-        dev_dbg(dev, "start_streaming(ch=%u): ring programmed dma=0x%llx half=%u\n",
-                v->channel_index, (unsigned long long)v->ring_dma, v->half_bytes);
-    else
-        dev_dbg(dev, "start_streaming(ch=%u): zero-copy DMA addr programmed\n",
-                v->channel_index);
-
-    return 0;
+	return 0;
 }
+
 
 static void hws_stop_streaming(struct vb2_queue *q)
 {
