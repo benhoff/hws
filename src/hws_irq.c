@@ -103,6 +103,8 @@ void hws_bh_video(struct tasklet_struct *t)
 			dev_warn_ratelimited(dev,
 				     "ch%u: no CPU mapping for buffer, dropping half %u\n",
 				     ch, completed_slot);
+		wmb();
+		hws_set_dma_doorbell(hws, ch, v->ring_dma, NULL);
 		WRITE_ONCE(v->ring_first_half_copied,
 			   (buf->slot & 0x3) != 0x3);
 	}
@@ -153,8 +155,12 @@ void hws_bh_video(struct tasklet_struct *t)
 					vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
 
 				if (!hws_program_video_from_vb2(hws, v, &next->vb.vb2_buf,
-						"bh_next_zero"))
+						"bh_next_zero")) {
+					wmb();
+					hws_set_dma_doorbell(hws, v->channel_index, dma,
+							     "bh_next_zero");
 					rearm_timer = true;
+				}
 			} else {
 				hws_enable_video_capture(hws, v->channel_index, false);
 				WRITE_ONCE(v->cap_active, false);
@@ -182,8 +188,7 @@ static inline void hws_irq_w1c(struct hws_pcie_dev *pdx, u32 mask)
 {
 	if (!mask || !pdx || !pdx->bar0_base)
 		return;
-	writel(mask, pdx->bar0_base + HWS_REG_INT_STATUS);
-	(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS); /* post write */
+	hws_ack_irq(pdx, mask);
 }
 
 irqreturn_t hws_irq_handler(int irq, void *info)
@@ -211,6 +216,14 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	if (!int_state || int_state == 0xFFFFFFFF) {
 		dev_dbg(dev, "irq: spurious or device-gone int_state=0x%08x\n", int_state);
 		return IRQ_NONE;
+	}
+	if (atomic_read(&pdx->irq_debug_counter) < 8) {
+		dev_info(&pdx->pdev->dev,
+			 "irq: status=0x%08x vcap=0x%08x en_gate=0x%08x\n",
+			 int_state,
+			 readl(pdx->bar0_base + HWS_REG_VCAP_ENABLE),
+			 readl(pdx->bar0_base + INT_EN_REG_BASE));
+		atomic_inc(&pdx->irq_debug_counter);
 	}
 	dev_dbg_ratelimited(dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
 

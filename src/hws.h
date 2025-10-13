@@ -9,6 +9,9 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/sizes.h>
+#include <linux/io.h>
+#include <linux/printk.h>
+#include <linux/atomic.h>
 
 #include <sound/pcm.h>
 #include <sound/core.h>
@@ -124,6 +127,8 @@ struct hws_video {
 	u32                      dma_slot;
 	bool                     ring_ready;
 	bool                     zero_copy;
+	u32                      dma_last_doorbell;
+	u32                      dma_last_offset;
 };
 
 struct hws_audio {
@@ -182,6 +187,7 @@ struct hws_pcie_dev {
 	u8                         cur_max_video_ch;
 	u8                         cur_max_linein_ch;
 	bool                       start_run;
+	bool                       log_probe_regs;
 
 	bool                       buf_allocated;
 	u32                        audio_pkt_size;
@@ -201,6 +207,40 @@ struct hws_pcie_dev {
 	/* ───── error flags ───── */
 	int                        pci_lost;
 
+	/* debug counters */
+	atomic_t                   irq_debug_counter;
+
 };
+
+static inline void hws_mmio_write(struct hws_pcie_dev *hws, u32 offset,
+				  u32 value)
+{
+	void __iomem *addr;
+
+	if (!hws || !hws->bar0_base)
+		return;
+
+	addr = hws->bar0_base + offset;
+	writel(value, addr);
+
+	if (unlikely(hws->log_probe_regs)) {
+		if (hws->pdev)
+			dev_info(&hws->pdev->dev,
+				 "probe-reg write offset=0x%08x value=0x%08x caller=%ps\n",
+				 offset, value, __builtin_return_address(0));
+		else
+			pr_info("probe-reg write offset=0x%08x value=0x%08x caller=%ps\n",
+				offset, value, __builtin_return_address(0));
+	}
+}
+
+static inline void hws_ack_irq(struct hws_pcie_dev *hws, u32 mask)
+{
+	if (!mask || !hws || !hws->bar0_base)
+		return;
+
+	hws_mmio_write(hws, HWS_REG_INT_STATUS, mask);
+	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+}
 
 #endif

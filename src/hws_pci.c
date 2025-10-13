@@ -236,13 +236,27 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 			hdev->hw_ver = 1;
 			u32 dma_max = (u32)(MAX_VIDEO_SCALER_SIZE / 16);
 
-			writel(dma_max, hdev->bar0_base + HWS_REG_DMA_MAX_SIZE);
+			hws_mmio_write(hdev, HWS_REG_DMA_MAX_SIZE, dma_max);
 			/* readback to flush posted MMIO write */
 			(void)readl(hdev->bar0_base + HWS_REG_DMA_MAX_SIZE);
 		}
 	} else {
 		hdev->hw_ver = 0;
 	}
+}
+
+static bool hws_should_log_probe_regs(const struct hws_pcie_dev *hdev)
+{
+	if (!hdev)
+		return false;
+
+	if (hdev->device_ver > 121) {
+		if (hdev->device_id == 0x8501 && hdev->device_ver == 122)
+			return false;
+		return true;
+	}
+
+	return false;
 }
 
 static void hws_stop_device(struct hws_pcie_dev *hws);
@@ -269,9 +283,15 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->audio_pkt_size = MAX_DMA_AUDIO_PK_SIZE;
 	hdev->start_run = false;
 	hdev->pci_lost = 0;
+	hdev->log_probe_regs = hws_should_log_probe_regs(hdev);
+	if (hdev->log_probe_regs)
+		dev_info(&hdev->pdev->dev,
+			 "probe register logging enabled (device=0x%04x version=%u.%u port=%u)\n",
+			 hdev->device_id, hdev->device_ver, hdev->sub_ver,
+			 hdev->port_id);
 
-	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);  LOG_DEC("after 0x00");
-	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE); LOG_DEC("after 0x10");
+	hws_mmio_write(hdev, HWS_REG_DEC_MODE, 0x00000000);  LOG_DEC("after 0x00");
+	hws_mmio_write(hdev, HWS_REG_DEC_MODE, 0x00000010); LOG_DEC("after 0x10");
 
 	hws_configure_hardware_capabilities(hdev);
 
@@ -338,26 +358,138 @@ static void hws_stop_kthread_action(void *data)
 
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
+	struct device *dev;
+	size_t need;
+	int ch;
+
+	if (!hws || !hws->pdev)
+		return -EINVAL;
+
+	if (hws->buf_allocated)
+		return 0;
+
+	dev = &hws->pdev->dev;
+	need = max_t(size_t, hws->max_hw_video_buf_sz,
+		     HWS_HALF_ALIGN_BYTES * 2);
+	need = ALIGN(need, PAGE_SIZE);
+	if (!need)
+		return -EINVAL;
+
+	for (ch = 0; ch < hws->max_channels; ch++) {
+		struct hws_scratch_dma *scratch = &hws->scratch_vid[ch];
+
+		if (scratch->cpu) {
+			if (scratch->size >= need)
+				continue;
+
+			dma_free_coherent(dev, scratch->size,
+					  scratch->cpu, scratch->dma);
+			memset(scratch, 0, sizeof(*scratch));
+		}
+
+		scratch->cpu = dma_alloc_coherent(dev, need,
+						  &scratch->dma, GFP_KERNEL);
+		if (!scratch->cpu) {
+			dev_err(dev,
+				"ch%u: scratch DMA alloc (%zu bytes) failed\n",
+				ch, need);
+			goto err_free;
+		}
+		scratch->size = need;
+	}
+
+	hws->buf_allocated = true;
 	return 0;
+
+err_free:
+	for (ch = 0; ch < hws->max_channels; ch++) {
+		struct hws_scratch_dma *scratch = &hws->scratch_vid[ch];
+
+		if (!scratch->cpu)
+			continue;
+		dma_free_coherent(dev, scratch->size,
+				  scratch->cpu, scratch->dma);
+		memset(scratch, 0, sizeof(*scratch));
+	}
+	hws->buf_allocated = false;
+
+	return -ENOMEM;
 }
 
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 {
+	struct device *dev;
+	int ch;
+
+	if (!hws || !hws->pdev)
+		return;
+
+	dev = &hws->pdev->dev;
+	for (ch = 0; ch < hws->max_channels; ch++) {
+		struct hws_scratch_dma *scratch = &hws->scratch_vid[ch];
+
+		if (scratch->cpu)
+			dma_free_coherent(dev, scratch->size,
+					  scratch->cpu, scratch->dma);
+		memset(scratch, 0, sizeof(*scratch));
+	}
+
+	hws->buf_allocated = false;
 }
 
 static void hws_seed_all_channels(struct hws_pcie_dev *hws)
 {
+	int ch;
+
+	if (!hws)
+		return;
+
+	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+		struct hws_video *vid = &hws->video[ch];
+		struct hws_scratch_dma *scratch = &hws->scratch_vid[ch];
+		size_t avail;
+		u32 half;
+		int ret;
+
+		if (!scratch->cpu || !scratch->size)
+			continue;
+
+		avail = scratch->size;
+		if (!vid->pix.sizeimage)
+			vid->pix.sizeimage = ALIGN(vid->pix.width * 2, 64) *
+					     max_t(u32, vid->pix.height, 1);
+
+		half = vid->pix.half_size;
+		if (!half)
+			half = rounddown(vid->pix.sizeimage / 2,
+					 HWS_HALF_ALIGN_BYTES);
+		if (!half)
+			half = HWS_HALF_ALIGN_BYTES;
+
+		if ((size_t)half * 2 > avail) {
+			if (avail < HWS_HALF_ALIGN_BYTES * 2)
+				continue;
+			half = rounddown(avail / 2, HWS_HALF_ALIGN_BYTES);
+		}
+
+		ret = hws_program_video_mapping(hws, vid, scratch->dma,
+						"seed", half, NULL);
+		if (ret)
+			dev_warn(&hws->pdev->dev,
+				 "ch%u: seed mapping failed (%d)\n",
+				 ch, ret);
+	}
 }
 
 static void hws_irq_mask_gate(struct hws_pcie_dev *hws)
 {
-    writel(0x00000000, hws->bar0_base + INT_EN_REG_BASE);
+    hws_mmio_write(hws, INT_EN_REG_BASE, 0x00000000);
     (void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
 static void hws_irq_unmask_gate(struct hws_pcie_dev *hws)
 {
-    writel(0x0003FFFF, hws->bar0_base + INT_EN_REG_BASE);
+    hws_mmio_write(hws, INT_EN_REG_BASE, 0x0003FFFF);
     (void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
@@ -365,7 +497,7 @@ static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 {
     u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
     if (st) {
-        writel(st, hws->bar0_base + HWS_REG_INT_STATUS); /* W1C */
+        hws_mmio_write(hws, HWS_REG_INT_STATUS, st); /* W1C */
         (void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
     }
 }
@@ -384,8 +516,10 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		return -ENOMEM;
 
 	hws->pdev = pdev;
+	hws->log_probe_regs = false;
 	hws->irq = -1;
 	hws->suspended = false;
+ atomic_set(&hws->irq_debug_counter, 0);
 	pci_set_drvdata(pdev, hws);
 
 	/* 1) Enable device + bus mastering (managed) */
@@ -413,7 +547,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	/* 4) Identify chip & capabilities */
 	read_chip_id(hws);
 	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n", pdev->vendor, pdev->device);
-    hws_init_video_sys(hws, false);
 
 	/* 5) Init channels (video/audio state, locks, vb2, ctrls) */
 	for (i = 0; i < hws->max_channels; i++) {
@@ -431,8 +564,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	/* 6) Allocate scratch DMA and seed BAR table + channel base/half (legacy SetDMAAddress) */
 	ret = hws_alloc_seed_buffers(hws);
-	if (!ret)
-		hws_seed_all_channels(hws);
+	if (ret) {
+		dev_err(&pdev->dev, "scratch DMA allocation failed: %d\n", ret);
+		goto err_unwind_channels;
+	}
+	hws_seed_all_channels(hws);
 
 	/* 7) Start-run sequence (like InitVideoSys) */
 	hws_init_video_sys(hws, false);
@@ -445,13 +581,13 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	dev_info(&pdev->dev, "IRQ mode: legacy INTx (shared), irq=%d\n", irq);
 
 	/* B) Mask the device's global/bridge gate (INT_EN_REG_BASE) */
-	writel(0x00000000, hws->bar0_base + INT_EN_REG_BASE);
+	hws_mmio_write(hws, INT_EN_REG_BASE, 0x00000000);
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 
 	/* C) Clear any sticky pending interrupt status (W1C) before we arm the line */
 	st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
 	if (st) {
-		writel(st, hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_mmio_write(hws, HWS_REG_INT_STATUS, st);
 		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 	}
 
@@ -463,17 +599,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		goto err_unwind_channels;
 	}
 
-	/* E) Set the global interrupt enable bit in main control register */
-	{
-		u32 ctl_reg = readl(hws->bar0_base + HWS_REG_CTL);
-		ctl_reg |= HWS_CTL_IRQ_ENABLE_BIT;
-		writel(ctl_reg, hws->bar0_base + HWS_REG_CTL);
-		(void)readl(hws->bar0_base + HWS_REG_CTL); /* flush write */
-		dev_info(&pdev->dev, "Global IRQ enable bit set in control register\n");
-	}
-
-	/* F) Open the global gate just like legacy did: INT_EN_REG_BASE = 0x3ffff */
-	writel(0x0003ffff, hws->bar0_base + INT_EN_REG_BASE);
+	/* E) Open the global gate just like legacy did: INT_EN_REG_BASE = 0x3ffff */
+	hws_mmio_write(hws, INT_EN_REG_BASE, 0x0003ffff);
 	dev_info(&pdev->dev, "INT_EN_GATE readback=0x%08x\n",
 	         readl(hws->bar0_base + INT_EN_REG_BASE));
 
@@ -506,15 +633,20 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	/* 13) Final: show the line is armed */
 	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
-    hws_dump_all_regs(hws, "probe:end");
+    // hws_dump_all_regs(hws, "probe:end");
+	if (hws->log_probe_regs)
+		dev_info(&pdev->dev, "probe register logging disabled\n");
+	hws->log_probe_regs = false;
 	return 0;
 
 err_unregister_va:
+	hws->log_probe_regs = false;
 	hws_stop_device(hws);
 	hws_audio_unregister(hws);
 	hws_video_unregister(hws);
     hws_free_seed_buffers(hws);
 err_unwind_channels:
+	hws->log_probe_regs = false;
 	hws_free_seed_buffers(hws);
 	while (--i >= 0) {
 		hws_video_cleanup_channel(hws, i);
@@ -555,12 +687,12 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 		return;
 
 	/* Tell the DSP to stop */
-	writel(0x10, hws->bar0_base + HWS_REG_DEC_MODE);
+	hws_mmio_write(hws, HWS_REG_DEC_MODE, 0x00000010);
 
 	if (hws_check_busy(hws))
 		dev_warn(&hws->pdev->dev, "DSP busy timeout on stop\n");
 	/* Disable video capture engine in the DSP */
-	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	hws_mmio_write(hws, HWS_REG_VCAP_ENABLE, 0x00000000);
 }
 
 /* Publish stop so ISR/BH won’t touch ALSA/VB2 anymore. */
@@ -593,8 +725,8 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 	unsigned int i;
 
 	/* Mask device enables: no new DMA starts. */
-	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	writel(0x0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	hws_mmio_write(hws, HWS_REG_VCAP_ENABLE, 0x00000000);
+	hws_mmio_write(hws, HWS_REG_ACAP_ENABLE, 0x00000000);
 	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush */
 
 	/* Let any in-flight DMAs finish (best-effort). */
@@ -609,10 +741,8 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 		ackmask |= HWS_INT_VDONE_BIT(i);
 	for (i = 0; i < hws->cur_max_linein_ch; ++i)
 		ackmask |= HWS_INT_ADONE_BIT(i);
-	if (ackmask) {
-		writel(ackmask, hws->bar0_base + HWS_REG_INT_ACK);
-		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
-	}
+	if (ackmask)
+		hws_ack_irq(hws, ackmask);
 
 	/* Ensure no hard IRQ is still running. */
 	if (hws->irq >= 0)

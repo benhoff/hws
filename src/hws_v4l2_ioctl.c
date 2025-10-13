@@ -46,7 +46,7 @@ static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,
 
 	if (!hws || !hws->bar0_base || ch >= hws->max_channels)
 		return;
-	writel_relaxed(packed, hws->bar0_base + HWS_REG_BCHS(ch));
+	hws_mmio_write(hws, HWS_REG_BCHS(ch), packed);
 	(void)readl(hws->bar0_base + HWS_REG_BCHS(ch)); /* post write */
 }
 

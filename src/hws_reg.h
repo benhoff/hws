@@ -87,13 +87,6 @@ static inline u32 hws_dma_pagemask(void)
 #define HWS_SYS_DMA_BUSY_BIT     BIT(3)   /* 0x08 = DMA busy flag */
 
 #define HWS_REG_DEC_MODE       (CVBS_IN_BASE +  0 * PCIE_BARADDROFSIZE)
-#define HWS_REG_CTL            (CVBS_IN_BASE +  4 * PCIE_BARADDROFSIZE) /* Main control register */
-#define HWS_CTL_IRQ_ENABLE_BIT BIT(0)   /* Global interrupt enable bit */
-/*  Write 0x00 to fully reset decoder,
- *  set bit 31=1 to “start run”,
- *  low byte=0x13 selects YUYV/BT.709/etc,
- *  in ReadChipId() we also write 0x00 and 0x10 here for chip-ID sequencing.
- */
 
 /* per-pipe base: 0x4000, stride 0x800 ------------------------------------ */
 #define HWS_REG_PIPE_BASE(n)   (CVBS_IN_BASE + ((n) * 0x800))
@@ -129,8 +122,6 @@ static inline u32 hws_dma_pagemask(void)
 /* ── per-interrupt bits (video 0-3, audio 0-3) ────────────────────── */
 #define HWS_INT_VDONE_BIT(ch)     BIT(ch)         /* 0x01,0x02,0x04,0x08  */
 #define HWS_INT_ADONE_BIT(ch)     BIT(8 + (ch))   /* 0x100 .. 0x800 */
-
-#define HWS_REG_INT_ACK           (CVBS_IN_BASE + 0x4000 + 1 * PCIE_BARADDROFSIZE)
 
 #define HWS_REG_IN_RES(ch)             (CVBS_IN_BASE + (90  + (ch) * 2) * PCIE_BARADDROFSIZE) /* 16-bit W | 16-bit H      */
 #define HWS_REG_BCHS(ch)               (CVBS_IN_BASE + (91  + (ch) * 2) * PCIE_BARADDROFSIZE) /* B|C|H|S packed bytes     */
