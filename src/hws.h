@@ -370,6 +370,7 @@ struct hws_pcie_dev {
 	spinlock_t				audiolock[MAX_VID_CHANNELS];
 	//----------------------------
 	u32 *map_bar0_addr;
+	bool					log_probe_regs;
 	struct workqueue_struct *wq;
 	struct workqueue_struct *auwq;
 	unsigned long video_data[MAX_VID_CHANNELS];

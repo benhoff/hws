@@ -15,6 +15,7 @@
 #include <sound/pcm.h>
 #include <sound/rawmidi.h>
 #include <sound/initval.h>
+#include <linux/kallsyms.h>
 
 static void hws_adapters_init(struct hws_pcie_dev *dev);
 static void hws_get_video_param(struct hws_pcie_dev *dev,int index);
@@ -25,6 +26,24 @@ static int StartAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopAudioCapture(struct hws_pcie_dev *pdx,int index);
 static void StopVideoCapture(struct hws_pcie_dev *pdx,int index);
 static void InitVideoSys(struct hws_pcie_dev *pdx,int set);
+static u32 READ_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset);
+static void log_stream_regs(struct hws_pcie_dev *pdx, int index,
+			    const char *stage);
+static bool hws_should_log_probe_regs(const struct hws_pcie_dev *pdx);
+
+static bool hws_should_log_probe_regs(const struct hws_pcie_dev *pdx)
+{
+	if (!pdx)
+		return false;
+
+	if (pdx->m_Device_Version > 121) {
+		if ((pdx->dwDeviceID == 0x8501) && (pdx->m_Device_Version == 122))
+			return false;
+		return true;
+	}
+
+	return false;
+}
 
 //------------------------
 
@@ -3552,7 +3571,17 @@ static void  WRITE_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset,u
 	bar0 = (char*)pdx->map_bar0_addr;
 	iowrite32(Value,bar0+RegisterOffset);
 	//map_bar0_addr[RegisterOffset/4] = Value;
+	if (unlikely(pdx && pdx->log_probe_regs)) {
+		void *caller = __builtin_return_address(0);
 
+		if (pdx->pdev)
+			dev_info(&pdx->pdev->dev,
+				 "probe-reg write offset=0x%08x value=0x%08x caller=%ps\n",
+				 RegisterOffset, Value, caller);
+		else
+			pr_info("probe-reg write offset=0x%08x value=0x%08x caller=%ps\n",
+				RegisterOffset, Value, caller);
+	}
 }
 
 static u32 READ_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset)
@@ -3631,6 +3660,52 @@ static void EnableVideoCapture(struct hws_pcie_dev *pdx,int index,int en)
 	WRITE_REGISTER_ULONG(pdx,( CVBS_IN_BASE + (2 * PCIE_BARADDROFSIZE)), status);
 	status = READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE+2*PCIE_BARADDROFSIZE));
 	//printk("EnableVideoCapture[%d]=%X %d \n",index,status,pdx->m_bVCapStarted[index]);
+}
+
+static void log_stream_regs(struct hws_pcie_dev *pdx, int index,
+			    const char *stage)
+{
+	u32 sys, int_status, int_gate;
+	u32 vcap, acap, active, hdcp;
+	u32 dma_addr, buf_base, half_sz;
+	u32 toggle, atoggle, remap_hi, remap_lo;
+	u32 in_res, out_res, in_fps, out_fps;
+
+	if (!pdx || index < 0 || index >= MAX_VID_CHANNELS)
+		return;
+
+	sys        = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (0 * PCIE_BARADDROFSIZE));
+	int_status = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (1 * PCIE_BARADDROFSIZE));
+	vcap       = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (2 * PCIE_BARADDROFSIZE));
+	acap       = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (3 * PCIE_BARADDROFSIZE));
+	active     = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (5 * PCIE_BARADDROFSIZE));
+	hdcp       = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (8 * PCIE_BARADDROFSIZE));
+	int_gate   = READ_REGISTER_ULONG(pdx, INT_EN_REG_BASE);
+
+	dma_addr = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + ((26 + index) * PCIE_BARADDROFSIZE));
+	buf_base = READ_REGISTER_ULONG(pdx, CBVS_IN_BUF_BASE + index * PCIE_BARADDROFSIZE);
+	half_sz  = READ_REGISTER_ULONG(pdx, CBVS_IN_BUF_BASE2 + index * PCIE_BARADDROFSIZE);
+	toggle   = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + ((32 + index) * PCIE_BARADDROFSIZE));
+	atoggle  = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + ((40 + index) * PCIE_BARADDROFSIZE));
+
+	remap_hi = READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE + 0x208 + index * 8);
+	remap_lo = READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE + 0x208 + index * 8 + PCIE_BARADDROFSIZE);
+
+	in_res   = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + ((90 + index * 2) * PCIE_BARADDROFSIZE));
+	out_res  = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + ((120 + index) * PCIE_BARADDROFSIZE));
+	in_fps   = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + ((110 + index) * PCIE_BARADDROFSIZE));
+	out_fps  = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + ((130 + index) * PCIE_BARADDROFSIZE));
+
+	printk(KERN_INFO "[%s] SYS=0x%08x INT_STATUS=0x%08x INT_GATE=0x%08x\n",
+	       stage ? stage : "stream", sys, int_status, int_gate);
+	printk(KERN_INFO "[%s] VCAP=0x%08x ACAP=0x%08x ACTIVE=0x%08x HDCP=0x%08x\n",
+	       stage ? stage : "stream", vcap, acap, active, hdcp);
+	printk(KERN_INFO "[%s][ch%d] DMA_ADDR=0x%08x BUF_BASE=0x%08x HALF16B=0x%08x remap_hi=0x%08x remap_lo=0x%08x\n",
+	       stage ? stage : "stream", index, dma_addr, buf_base, half_sz,
+	       remap_hi, remap_lo);
+	printk(KERN_INFO "[%s][ch%d] TOGGLE=0x%08x AToggle=0x%08x IN_RES=0x%08x OUT_RES=0x%08x IN_FPS=%u OUT_FPS=%u\n",
+	       stage ? stage : "stream", index, toggle, atoggle, in_res, out_res,
+	       in_fps, out_fps);
 }
 static void EnableAudioCapture(struct hws_pcie_dev *pdx,int index,int en)
 {
@@ -4161,7 +4236,9 @@ static int StartVideoCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->m_pVideoEvent[index] = 1;
 	pdx->m_nVideoBusy[index] =0;
 	pdx->video_data[index]  =0;
+	log_stream_regs(pdx, index, "legacy-pre");
 	EnableVideoCapture(pdx,index,1);
+	log_stream_regs(pdx, index, "legacy-post");
 	return 0;
 }
 
@@ -5627,6 +5704,16 @@ static int ReadChipId(struct hws_pcie_dev *pdx)
 		pdx->m_dwAudioPTKSize = MAX_DMA_AUDIO_PK_SIZE; //128*16*4;
 		pdx->m_bStartRun = 0;
 		pdx->m_PciDeviceLost =0;
+		{
+			bool enable_probe_log = hws_should_log_probe_regs(pdx);
+
+			pdx->log_probe_regs = enable_probe_log;
+			if (enable_probe_log)
+				dev_info(&pdx->pdev->dev,
+					 "probe register logging enabled (device=0x%04x version=%u.%u port=%u)\n",
+					 pdx->dwDeviceID, pdx->m_Device_Version,
+					 pdx->m_Device_SubVersion, pdx->m_Device_PortID);
+		}
 
 		//--------
 		for( i=0; i<MAX_VID_CHANNELS; i++)
@@ -5668,6 +5755,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	gdev = alloc_dev_instance(pdev);
 	//sys_dvrs_hw_pdx = gdev;
 	gdev->pdev = pdev;
+	gdev->log_probe_regs = false;
 	
 	gdev->dwDeviceID = gdev->pdev->device;
 	gdev->dwVendorID = gdev->pdev->vendor;
@@ -5852,8 +5940,12 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		if(hws_audio_register(gdev))
 		goto err_mem_alloc;
 #endif	
+	if (gdev->log_probe_regs)
+		dev_info(&gdev->pdev->dev, "probe register logging disabled\n");
+	gdev->log_probe_regs = false;
 	return 0;
 err_mem_alloc:
+	gdev->log_probe_regs = false;
 	
 		 gdev->m_bBufferAllocate = TRUE;
 		 DmaMemFreePool(gdev);
@@ -5862,6 +5954,7 @@ err_register:
 		iounmap(gdev->info.mem[0].internal_addr);
 		irq_teardown(gdev);
 disable_msi:	
+		gdev->log_probe_regs = false;
 		if (gdev->msix_enabled) 
 		{		
 		pci_disable_msix(pdev); 	
@@ -5873,11 +5966,15 @@ disable_msi:
 			gdev->msi_enabled = 0;	
 		}
 err_release:
+	if (gdev)
+		gdev->log_probe_regs = false;
 		kfree(gdev);
 		pci_release_regions(pdev);
 		pci_disable_device(pdev);
 		return err;
 err_alloc:
+	if (gdev)
+		gdev->log_probe_regs = false;
 		kfree(gdev);
 			
 	return	-1;
