@@ -3,6 +3,7 @@
 #define _HWS_PCIE_REG_H
 
 #include <linux/bits.h>
+#include <linux/compiler.h>
 #include <linux/sizes.h>
 
 #define XDMA_CHANNEL_NUM_MAX (1)
@@ -28,10 +29,26 @@
 /* 2 Mib */
 #define MAX_L_VIDEO_SIZE			0x200000U
 
-
 #define PCI_E_BAR_PAGE_SIZE 0x20000000
-#define PCI_E_BAR_ADD_MASK 0xE0000000
-#define PCI_E_BAR_ADD_LOWMASK 0x1FFFFFFF
+
+extern unsigned int hws_dma_offset_bits;
+
+static inline u32 hws_dma_lowmask(void)
+{
+	unsigned int bits = READ_ONCE(hws_dma_offset_bits);
+
+	if (bits >= 32)
+		return U32_MAX;
+	return BIT(bits) - 1U;
+}
+
+static inline u32 hws_dma_pagemask(void)
+{
+	return ~hws_dma_lowmask();
+}
+
+#define HWS_DMA_LOWMASK    hws_dma_lowmask()
+#define HWS_DMA_PAGEMASK   hws_dma_pagemask()
 
 #define MAX_DMA_AUDIO_PK_SIZE      (128U * 16U * 2U)
 

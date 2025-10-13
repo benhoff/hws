@@ -48,6 +48,11 @@ static bool hws_disable_audio = true;
 module_param_named(disable_audio, hws_disable_audio, bool, 0644);
 MODULE_PARM_DESC(disable_audio, "Disable ALSA capture support (default: true)");
 
+unsigned int hws_dma_offset_bits = 29;
+module_param_named(dma_offset_bits, hws_dma_offset_bits, uint, 0644);
+MODULE_PARM_DESC(dma_offset_bits,
+		 "Number of low-order PCIe address bits used as DMA window offset (default: 29)");
+
 #define LOG_DEC(tag) dev_info(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n", tag, readl(hdev->bar0_base + HWS_REG_DEC_MODE))
 
 static const struct pci_device_id hws_pci_table[] = {

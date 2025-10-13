@@ -82,8 +82,8 @@ void hws_audio_program_next_period(struct hws_pcie_dev *hws, unsigned int ch)
 	/* 32-bit DMA mask guarantees upper_32_bits(dma) == 0 */
 	addr_low = lower_32_bits(dma);
 
-	pci_addr_lowmasked = (addr_low & PCI_E_BAR_ADD_LOWMASK); /* into AXI base */
-	bar_low_masked     = (addr_low & PCI_E_BAR_ADD_MASK);    /* into table LOW */
+	pci_addr_lowmasked = (addr_low & HWS_DMA_LOWMASK);  /* offset inside window */
+	bar_low_masked     = (addr_low & HWS_DMA_PAGEMASK); /* page-aligned base   */
 
 	/* Legacy address-table layout: start 0x208, step 8 per channel */
 	table_off = 0x208u + (ch * 8u);
@@ -571,4 +571,3 @@ int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws)
 
 	return ret;
 }
-

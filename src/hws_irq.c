@@ -154,11 +154,13 @@ void hws_bh_video(struct tasklet_struct *t)
 				dma_addr_t dma =
 					vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
 
-				hws_program_video_from_vb2(hws, v, &next->vb.vb2_buf);
-				wmb();
-				hws_set_dma_doorbell(hws, v->channel_index, dma,
-						     "bh_next_zero");
-				rearm_timer = true;
+				if (!hws_program_video_from_vb2(hws, v, &next->vb.vb2_buf,
+								"bh_next_zero")) {
+					wmb();
+					hws_set_dma_doorbell(hws, v->channel_index, dma,
+							     "bh_next_zero");
+					rearm_timer = true;
+				}
 			} else {
 				hws_enable_video_capture(hws, v->channel_index, false);
 				WRITE_ONCE(v->cap_active, false);
@@ -301,4 +303,3 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 	return IRQ_HANDLED;
 }
-

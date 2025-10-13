@@ -104,6 +104,9 @@ struct hws_video {
 	bool ring_first_half_copied;
 	u32  ring_frame_bytes;
 	unsigned long ring_last_toggle_jiffies;
+	dma_addr_t dma_last_addr;
+	u32 dma_last_offset;
+	u32 dma_last_doorbell;
 
 	/* ───── timeout and error handling ───── */
 	struct timer_list        dma_timeout_timer;
