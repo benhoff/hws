@@ -53,6 +53,7 @@ int hws_program_video_from_vb2(struct hws_pcie_dev *hws,
 			       struct hws_video *vid,
 			       struct vb2_buffer *vb,
 			       const char *tag);
+static bool hws_signal_present(struct hws_pcie_dev *hws, unsigned int ch);
 static void hws_ring_release(struct hws_video *vid);
 static int hws_ring_setup(struct hws_video *vid);
 static int hws_program_video_ring(struct hws_pcie_dev *hws,
@@ -153,10 +154,117 @@ too_small:
 	return -ENOBUFS;
 }
 
+static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
+{
+	struct hws_pcie_dev *hws;
+	unsigned long flags;
+	struct hwsvideo_buffer *buf = NULL, *next = NULL;
+	bool ring_mode;
+	bool have_next = false;
+
+	if (!v)
+		return false;
+
+	hws = v->parent;
+	if (!hws || READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
+		return false;
+
+	ring_mode = hws_use_ring(v);
+
+	spin_lock_irqsave(&v->irq_lock, flags);
+	if (v->active) {
+		buf = v->active;
+		v->active = NULL;
+		buf->slot = 0;
+	} else if (!list_empty(&v->capture_queue)) {
+		buf = list_first_entry(&v->capture_queue,
+				       struct hwsvideo_buffer, list);
+		list_del_init(&buf->list);
+		if (v->queued_count)
+			v->queued_count--;
+		buf->slot = 0;
+	}
+
+	if (!list_empty(&v->capture_queue)) {
+		next = list_first_entry(&v->capture_queue,
+					struct hwsvideo_buffer, list);
+		list_del_init(&next->list);
+		if (v->queued_count)
+			v->queued_count--;
+		next->slot = 0;
+		v->active = next;
+		have_next = true;
+	} else {
+		v->active = NULL;
+	}
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+
+	/* Reset toggle tracking so the next real VDONE is observed */
+	WRITE_ONCE(v->ring_toggle_prev, 0);
+	WRITE_ONCE(v->ring_toggle_hw, 0);
+
+	if (!buf)
+		return false;
+
+	/* Populate buffer with a neutral pattern (Y=16, UV midpoints). */
+	{
+		struct vb2_v4l2_buffer *vb2v = &buf->vb;
+		void *dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+
+		if (dst)
+			memset(dst, 0x10, v->pix.sizeimage);
+
+		vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
+		vb2v->sequence = ++v->sequence_number;
+		vb2v->vb2_buf.timestamp = ktime_get_ns();
+		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
+	}
+
+	WRITE_ONCE(v->ring_first_half_copied, false);
+	WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
+
+	if (ring_mode) {
+		wmb();
+		hws_set_dma_doorbell(hws, v->channel_index, v->ring_dma,
+				     tag ? tag : "nosignal_ring");
+	} else if (have_next && next) {
+		dma_addr_t dma =
+			vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
+
+		if (!hws_program_video_from_vb2(hws, v, &next->vb.vb2_buf,
+						tag ? tag : "nosignal_zero")) {
+			wmb();
+			hws_set_dma_doorbell(hws, v->channel_index, dma,
+					     tag ? tag : "nosignal_zero");
+		}
+	}
+
+	return true;
+}
+
 /* DMA timeout handler */
 static void hws_dma_timeout_handler(struct timer_list *t)
 {
-        /* Legacy driver had no watchdog; keep timer as no-op */
+	struct hws_video *v = container_of(t, struct hws_video,
+					   dma_timeout_timer);
+	struct hws_pcie_dev *hws = v ? v->parent : NULL;
+
+	if (!v || !hws)
+		return;
+
+	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
+		return;
+
+	/* If a signal is present the hardware should be handling toggles */
+	if (hws_signal_present(hws, v->channel_index)) {
+		mod_timer(&v->dma_timeout_timer,
+			  jiffies + msecs_to_jiffies(2000));
+		return;
+	}
+
+	hws_force_no_signal_frame(v, "timeout");
+	mod_timer(&v->dma_timeout_timer,
+		  jiffies + msecs_to_jiffies(2000));
 }
 
 static void hws_ring_release(struct hws_video *vid)
@@ -946,11 +1054,10 @@ void check_video_format(struct hws_pcie_dev *pdx)
 		/* If we just detected a loss on an active capture channel… */
 		if (pdx->video[i].signal_loss_cnt == 1 &&
 		    pdx->video[i].cap_active) {
-			/* …schedule the “no‐video” handler on the vido_wq workqueue */
-			// FIXME: this is where we can catch if the system has blanked on us
-			// probably need to rewire this, because we removed the videowork
-			// https://chatgpt.com/s/t_689fce8c84308191a15ec967d75165a7
-			// queue_work(pdx->vido_wq, &pdx->video[i].videowork);
+			if (hws_force_no_signal_frame(&pdx->video[i],
+						      "monitor_nosignal"))
+				mod_timer(&pdx->video[i].dma_timeout_timer,
+					  jiffies + msecs_to_jiffies(2000));
 		}
 	}
 }
