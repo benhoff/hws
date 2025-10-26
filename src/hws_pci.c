@@ -11,7 +11,6 @@
 #include <linux/pm.h>
 #include <linux/freezer.h>
 #include <linux/pci_regs.h>
-#include <linux/seq_file.h>
 
 #include <media/v4l2-ctrls.h>
 
@@ -43,7 +42,7 @@
 	  .driver_data = (unsigned long)(__configptr) }
 
 #define CH_SHIFT 2 /* need 2 bits for 0-3            */
-#define LOG_DEC(tag) dev_info(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n", tag, readl(hdev->bar0_base + HWS_REG_DEC_MODE))
+#define LOG_DEC(tag) dev_dbg(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n", tag, readl(hdev->bar0_base + HWS_REG_DEC_MODE))
 
 static const struct pci_device_id hws_pci_table[] = {
 	MAKE_ENTRY(0x8888, 0x9534, 0x8888, 0x0007, NULL),
@@ -68,109 +67,6 @@ static inline u32 hws_r32(void __iomem *base, u32 off)
 {
 	/* Single place to add barriers or tracing if needed */
 	return readl(base + off);
-}
-
-static void hws_dump_pipe_regs(struct hws_pcie_dev *hws, int ch)
-{
-	u32 hpd = hws_r32(hws->bar0_base, HWS_REG_HPD(ch));
-	u32 vtoggle = hws_r32(hws->bar0_base, HWS_REG_VBUF_TOGGLE(ch));
-	u32 atoggle = hws_r32(hws->bar0_base, HWS_REG_ABUF_TOGGLE(ch));
-	u32 in_res   = hws_r32(hws->bar0_base, HWS_REG_IN_RES(ch));
-	u32 bchs     = hws_r32(hws->bar0_base, HWS_REG_BCHS(ch));
-	u32 infps    = hws_r32(hws->bar0_base, HWS_REG_FRAME_RATE(ch));
-	u32 out_res  = hws_r32(hws->bar0_base, HWS_REG_OUT_RES(ch));
-	u32 outfps   = hws_r32(hws->bar0_base, HWS_REG_OUT_FRAME_RATE(ch));
-
-	u16 in_w  = (in_res >> 16) & 0xFFFF;
-	u16 in_h  = (in_res >>  0) & 0xFFFF;
-	u16 out_w = (out_res >> 16) & 0xFFFF;
-	u16 out_h = (out_res >>  0) & 0xFFFF;
-
-	pr_info("  [CH%u]\n", ch);
-	pr_info("    HPD=0x%08x (HPD=%d, +5V=%d)\n",
-		hpd, !!(hpd & HWS_HPD_BIT), !!(hpd & HWS_5V_BIT));
-	pr_info("    VBUF_TOGGLE=%u  ABUF_TOGGLE=%u\n", vtoggle & 1, atoggle & 1);
-	pr_info("    IN_RES=%ux%u  (raw=0x%08x)  IN_FPS=%u\n",
-		in_w, in_h, in_res, infps);
-	pr_info("    OUT_RES=%ux%u (raw=0x%08x)  OUT_FPS=%u\n",
-		out_w, out_h, out_res, outfps);
-	pr_info("    BCHS=0x%08x  [B=%u C=%u H=%u S=%u]\n",
-		bchs, (bchs >> 24) & 0xFF, (bchs >> 16) & 0xFF,
-		(bchs >> 8) & 0xFF, bchs & 0xFF);
-}
-
-static void hws_dump_all_regs(struct hws_pcie_dev *hws, const char *tag)
-{
-	u32 sys_status   = hws_r32(hws->bar0_base, HWS_REG_SYS_STATUS);
-	u32 dec_mode     = hws_r32(hws->bar0_base, HWS_REG_DEC_MODE);
-	u32 int_status   = hws_r32(hws->bar0_base, HWS_REG_INT_STATUS);
-	u32 int_en_gate  = hws_r32(hws->bar0_base, INT_EN_REG_BASE);
-	u32 int_route    = hws_r32(hws->bar0_base, PCIE_INT_DEC_REG_BASE);
-	u32 br_en        = hws_r32(hws->bar0_base, PCIEBR_EN_REG_BASE);
-
-	u32 v_en         = hws_r32(hws->bar0_base, HWS_REG_VCAP_ENABLE);
-	u32 a_en         = hws_r32(hws->bar0_base, HWS_REG_ACAP_ENABLE);
-	u32 active       = hws_r32(hws->bar0_base, HWS_REG_ACTIVE_STATUS);
-	u32 hdcp         = hws_r32(hws->bar0_base, HWS_REG_HDCP_STATUS);
-	u32 dma_max      = hws_r32(hws->bar0_base, HWS_REG_DMA_MAX_SIZE);
-	u32 vbuf1_addr   = hws_r32(hws->bar0_base, HWS_REG_VBUF1_ADDR);
-	u32 dev_info     = hws_r32(hws->bar0_base, HWS_REG_DEVICE_INFO);
-
-	u8  dev_ver      = (dev_info >>  0) & 0xFF;
-	u8  dev_subver   = (dev_info >>  8) & 0xFF;
-	u8  port_id      = (dev_info >> 16) & 0x1F;  /* as per comment: 23:24 etc. */
-	u8  yv12_flags   = (dev_info >> 28) & 0x0F;
-
-	pr_info("=============== HWS REG DUMP (%s) ===============\n", tag ? tag : "");
-	pr_info(" BAR0=%p\n", hws->bar0_base);
-
-	/* Core / global */
-	pr_info("-- CORE/GLOBAL --\n");
-	pr_info(" SYS_STATUS     = 0x%08x  [DMA_BUSY=%d]\n",
-		sys_status, !!(sys_status & HWS_SYS_DMA_BUSY_BIT));
-	pr_info(" DEC_MODE       = 0x%08x\n", dec_mode);
-
-	/* Interrupt fabric */
-	pr_info("-- INTERRUPTS --\n");
-	pr_info(" INT_STATUS     = 0x%08x\n", int_status);
-	pr_info(" INT_EN_GATE    = 0x%08x  (global/bridge gate)\n", int_en_gate);
-	pr_info(" INT_ROUTE      = 0x%08x  (router/decoder)\n", int_route);
-	pr_info(" BRIDGE_EN      = 0x%08x\n", br_en);
-
-	/* Capture on/off + activity */
-	pr_info("-- CAPTURE/STATUS --\n");
-	pr_info(" VCAP_ENABLE    = 0x%08x (bits0-3 CH0..CH3)\n", v_en);
-	pr_info(" ACAP_ENABLE    = 0x%08x (bits0-3 CH0..CH3)\n", a_en);
-	pr_info(" ACTIVE_STATUS  = 0x%08x (sig bits0-3 | interlace bits8-11)\n", active);
-	pr_info(" HDCP_STATUS    = 0x%08x\n", hdcp);
-
-	/* DMA / buffers */
-	pr_info("-- DMA/BUFFERS --\n");
-	pr_info(" DMA_MAX_SIZE   = 0x%08x\n", dma_max);
-	pr_info(" VBUF1_ADDR     = 0x%08x\n", vbuf1_addr);
-
-	/* Device info */
-	pr_info("-- DEVICE --\n");
-	pr_info(" DEVICE_INFO    = 0x%08x  (ver=%u subver=%u port=%u yv12=0x%x)\n",
-		dev_info, dev_ver, dev_subver, port_id, yv12_flags);
-
-	/* Per-channel block */
-	pr_info("-- PER-CHANNEL --\n");
-	for (int ch = 0; ch < MAX_VID_CHANNELS; ch++)
-		hws_dump_pipe_regs(hws, ch);
-
-	/* Helpful decoded view of INT_STATUS for ch0..3 (video+audio done bits) */
-	{
-		u32 st = int_status;
-		pr_info("-- INT_STATUS DECODE --\n");
-		for (int ch = 0; ch < MAX_VID_CHANNELS; ch++) {
-			bool vdone = !!(st & HWS_INT_VDONE_BIT(ch));
-			bool adone = !!(st & HWS_INT_ADONE_BIT(ch));
-			pr_info("  CH%u: VDONE=%d ADONE=%d\n", ch, vdone, adone);
-		}
-	}
-
-	pr_info("============== END HWS REG DUMP (%s) ==============\n", tag ? tag : "");
 }
 
 
@@ -562,10 +458,9 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		goto err_unregister_va; /* reset already stopped the thread */
 	}
 
-	/* 13) Final: show the line is armed */
-	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
-    hws_dump_all_regs(hws, "probe:end");
-	return 0;
+		/* 13) Final: show the line is armed */
+		dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
+		return 0;
 
 err_unregister_va:
 	hws_stop_device(hws);
