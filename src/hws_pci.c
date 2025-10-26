@@ -42,7 +42,9 @@
 	  .driver_data = (unsigned long)(__configptr) }
 
 #define CH_SHIFT 2 /* need 2 bits for 0-3            */
-#define LOG_DEC(tag) dev_dbg(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n", tag, readl(hdev->bar0_base + HWS_REG_DEC_MODE))
+#define LOG_DEC(tag)							\
+	dev_dbg(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n",		\
+		(tag), readl(hdev->bar0_base + HWS_REG_DEC_MODE))
 
 static const struct pci_device_id hws_pci_table[] = {
 	MAKE_ENTRY(0x8888, 0x9534, 0x8888, 0x0007, NULL),
@@ -62,13 +64,11 @@ static const struct pci_device_id hws_pci_table[] = {
 	{}
 };
 
-
 static inline u32 hws_r32(void __iomem *base, u32 off)
 {
 	/* Single place to add barriers or tracing if needed */
 	return readl(base + off);
 }
-
 
 static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
 {
@@ -255,10 +255,13 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
+
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 		if (hws->scratch_vid[ch].cpu) {
-			dma_free_coherent(&hws->pdev->dev, hws->scratch_vid[ch].size,
-			                  hws->scratch_vid[ch].cpu, hws->scratch_vid[ch].dma);
+			dma_free_coherent(&hws->pdev->dev,
+					  hws->scratch_vid[ch].size,
+					  hws->scratch_vid[ch].cpu,
+					  hws->scratch_vid[ch].dma);
 			hws->scratch_vid[ch].cpu = NULL;
 			hws->scratch_vid[ch].size = 0;
 		}
@@ -274,21 +277,27 @@ static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
 
 	lo &= PCI_E_BAR_ADD_MASK;
 
-	/* Program 64-bit BAR remap entry for this channel (table @ 0x208 + ch*8) */
-	writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + ch*8);
-	writel_relaxed(lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + ch*8 + PCIE_BARADDROFSIZE);
+	/* Program 64-bit BAR remap entry for this channel (table @ 0x208 + ch * 8) */
+	writel_relaxed(hi, hws->bar0_base +
+			    PCI_ADDR_TABLE_BASE + 0x208 + ch * 8);
+	writel_relaxed(lo, hws->bar0_base +
+			    PCI_ADDR_TABLE_BASE + 0x208 + ch * 8 +
+			    PCIE_BARADDROFSIZE);
 
 	/* Program capture engine per-channel base/half */
 	writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-	               hws->bar0_base + CVBS_IN_BUF_BASE + ch * PCIE_BARADDROFSIZE);
+		       hws->bar0_base + CVBS_IN_BUF_BASE +
+		       ch * PCIE_BARADDROFSIZE);
 
 	/* half size: use either the current format’s half or half of scratch */
 	{
 		u32 half = hws->video[ch].pix.half_size ?
-		           hws->video[ch].pix.half_size :
-		           (u32)(hws->scratch_vid[ch].size / 2);
+			hws->video[ch].pix.half_size :
+			(u32)(hws->scratch_vid[ch].size / 2);
+
 		writel_relaxed(half / 16,
-		               hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
+			       hws->bar0_base + CVBS_IN_BUF_BASE2 +
+			       ch * PCIE_BARADDROFSIZE);
 	}
 
 	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush posted writes */
@@ -297,6 +306,7 @@ static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
 static void hws_seed_all_channels(struct hws_pcie_dev *hws)
 {
 	int ch;
+
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 		if (hws->scratch_vid[ch].cpu)
 			hws_seed_channel(hws, ch);
@@ -305,23 +315,24 @@ static void hws_seed_all_channels(struct hws_pcie_dev *hws)
 
 static void hws_irq_mask_gate(struct hws_pcie_dev *hws)
 {
-    writel(0x00000000, hws->bar0_base + INT_EN_REG_BASE);
-    (void)readl(hws->bar0_base + INT_EN_REG_BASE);
+	writel(0x00000000, hws->bar0_base + INT_EN_REG_BASE);
+	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
 static void hws_irq_unmask_gate(struct hws_pcie_dev *hws)
 {
-    writel(0x0003FFFF, hws->bar0_base + INT_EN_REG_BASE);
-    (void)readl(hws->bar0_base + INT_EN_REG_BASE);
+	writel(0x0003ffff, hws->bar0_base + INT_EN_REG_BASE);
+	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
 static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 {
-    u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-    if (st) {
-        writel(st, hws->bar0_base + HWS_REG_INT_STATUS); /* W1C */
-        (void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
-    }
+	u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+
+	if (st) {
+		writel(st, hws->bar0_base + HWS_REG_INT_STATUS); /* W1C */
+		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	}
 }
 
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
@@ -329,7 +340,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	struct hws_pcie_dev *hws;
 	int i, ret, nvec, irq;
 	unsigned long irqf = 0;
-    u32 en_read = 0, st = 0;
 	bool has_msix_cap, has_msi_cap, using_msi;
 
 	/* devres-backed device object */
@@ -366,8 +376,9 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	/* 4) Identify chip & capabilities */
 	read_chip_id(hws);
-	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n", pdev->vendor, pdev->device);
-    hws_init_video_sys(hws, false);
+	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n",
+		 pdev->vendor, pdev->device);
+	hws_init_video_sys(hws, false);
 
 	/* 5) Init channels (video/audio state, locks, vb2, ctrls) */
 	for (i = 0; i < hws->max_channels; i++) {
@@ -394,24 +405,19 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
 	pci_intx(pdev, 1);
 	irqf = IRQF_SHARED;
-	irq  = pdev->irq;
+	irq = pdev->irq;
 	hws->irq = irq;
 	dev_info(&pdev->dev, "IRQ mode: legacy INTx (shared), irq=%d\n", irq);
 
 	/* B) Mask the device's global/bridge gate (INT_EN_REG_BASE) */
-	writel(0x00000000, hws->bar0_base + INT_EN_REG_BASE);
-	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
+	hws_irq_mask_gate(hws);
 
 	/* C) Clear any sticky pending interrupt status (W1C) before we arm the line */
-	st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-	if (st) {
-		writel(st, hws->bar0_base + HWS_REG_INT_STATUS);
-		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
-	}
+	hws_irq_clear_pending(hws);
 
 	/* D) Request the legacy shared interrupt line (no vectors/MSI/MSI-X) */
 	ret = devm_request_irq(&pdev->dev, irq, hws_irq_handler, irqf,
-	                       dev_name(&pdev->dev), hws);
+			       dev_name(&pdev->dev), hws);
 	if (ret) {
 		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n", irq, ret);
 		goto err_unwind_channels;
@@ -420,6 +426,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	/* E) Set the global interrupt enable bit in main control register */
 	{
 		u32 ctl_reg = readl(hws->bar0_base + HWS_REG_CTL);
+
 		ctl_reg |= HWS_CTL_IRQ_ENABLE_BIT;
 		writel(ctl_reg, hws->bar0_base + HWS_REG_CTL);
 		(void)readl(hws->bar0_base + HWS_REG_CTL); /* flush write */
@@ -427,9 +434,9 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	}
 
 	/* F) Open the global gate just like legacy did: INT_EN_REG_BASE = 0x3ffff */
-	writel(0x0003ffff, hws->bar0_base + INT_EN_REG_BASE);
+	hws_irq_unmask_gate(hws);
 	dev_info(&pdev->dev, "INT_EN_GATE readback=0x%08x\n",
-	         readl(hws->bar0_base + INT_EN_REG_BASE));
+		 readl(hws->bar0_base + INT_EN_REG_BASE));
 
 	/* 11) Register V4L2/ALSA */
 	ret = hws_video_register(hws);
@@ -458,15 +465,15 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		goto err_unregister_va; /* reset already stopped the thread */
 	}
 
-		/* 13) Final: show the line is armed */
-		dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
-		return 0;
+	/* 13) Final: show the line is armed */
+	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
+	return 0;
 
 err_unregister_va:
 	hws_stop_device(hws);
 	hws_audio_unregister(hws);
 	hws_video_unregister(hws);
-    hws_free_seed_buffers(hws);
+	hws_free_seed_buffers(hws);
 err_unwind_channels:
 	hws_free_seed_buffers(hws);
 	while (--i >= 0) {
