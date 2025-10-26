@@ -219,10 +219,6 @@ static int hws_ctrls_init(struct hws_video *vid)
 					  MAX_VAMP_HUE_UNITS, 1,
 					  HWS_HUE_DEFAULT);
 
-	if (vid->detect_tx_5v_control)
-		vid->detect_tx_5v_control->flags |= V4L2_CTRL_FLAG_VOLATILE |
-		    V4L2_CTRL_FLAG_READ_ONLY;
-
 	if (hdl->error) {
 		int err = hdl->error;
 
@@ -776,10 +772,6 @@ static bool update_hpd_status(struct hws_pcie_dev *pdx, unsigned int ch)
 	u32 hpd = hws_read_port_hpd(pdx, ch);	/* jack-level status   */
 	bool power = !!(hpd & HWS_5V_BIT);	/* +5 V present        */
 	bool hpd_hi = !!(hpd & HWS_HPD_BIT);	/* HPD line asserted   */
-
-	/* Cache the +5 V state in V4L2 ctrl core (only when it changes) */
-	if (power != pdx->video[ch].detect_tx_5v_control->cur.val)
-		v4l2_ctrl_s_ctrl(pdx->video[ch].detect_tx_5v_control, power);
 
 	/* “Signal present” means *both* rails up. Tweak if your HW differs. */
 	return power && hpd_hi;

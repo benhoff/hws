@@ -81,7 +81,6 @@ struct hws_video {
 
 	/* ───── V4L2 controls ───── */
 	struct v4l2_ctrl_handler control_handler;
-	struct v4l2_ctrl *detect_tx_5v_control;
 	struct v4l2_ctrl *hotplug_detect_control;
 	struct v4l2_ctrl *ctrl_brightness;
 	struct v4l2_ctrl *ctrl_contrast;
