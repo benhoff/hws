@@ -162,17 +162,12 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	WRITE_ONCE(v->ring_toggle_hw, 0);
 	if (!buf)
 		return false;
-	/* Populate buffer with a neutral pattern (Y=16, UV midpoints). */
+	/* Complete buffer with an error state to signal loss to userspace. */
 	{
 		struct vb2_v4l2_buffer *vb2v = &buf->vb;
-		void *dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
 
-		if (dst)
-			memset(dst, 0x10, v->pix.sizeimage);
-		vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
-		vb2v->sequence = ++v->sequence_number;
-		vb2v->vb2_buf.timestamp = ktime_get_ns();
-		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
+		vb2_set_plane_payload(&vb2v->vb2_buf, 0, 0);
+		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
 	}
 	WRITE_ONCE(v->ring_first_half_copied, false);
 	WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
@@ -1196,49 +1191,31 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 		vid->queued_count--;
 		vid->active = buf;
 
-		if (ring_mode) {
-			/* Ring buffer should already be set up by start_streaming */
-			if (vid->ring_cpu) {
-				wmb(); /* ensure ring descriptors visible before doorbell */
-				hws_set_dma_doorbell(hws, vid->channel_index,
-						     vid->ring_dma,
-						     "buffer_queue_ring");
-			} else {
-				dma_addr_t dma_addr;
+		if (!ring_mode || !vid->ring_cpu) {
+			dma_addr_t dma_addr;
 
+			if (ring_mode && !vid->ring_cpu)
 				pr_warn("buffer_queue(ch=%u): ring buffer missing, using direct mode\n",
 					vid->channel_index);
-				/* Fall back to direct mode */
-				dma_addr = vb2_dma_contig_plane_dma_addr(vb2_buf, 0);
 
-				iowrite32(lower_32_bits(dma_addr),
-					  hws->bar0_base +
-					  HWS_REG_DMA_ADDR(vid->channel_index));
-				hws_program_video_from_vb2(vid->parent,
-							   vid->channel_index,
-							   vb2_buf);
-			}
-		} else {
-			/* Direct VB2 buffer programming */
-			dma_addr_t dma_addr =
-			    vb2_dma_contig_plane_dma_addr(vb2_buf, 0);
-
+			dma_addr = vb2_dma_contig_plane_dma_addr(vb2_buf, 0);
 			iowrite32(lower_32_bits(dma_addr),
 				  hws->bar0_base +
 				  HWS_REG_DMA_ADDR(vid->channel_index));
-
 			hws_program_video_from_vb2(vid->parent,
 						   vid->channel_index,
 						   vb2_buf);
-			if (check_video_capture(vid->parent, vid->channel_index)
-			    == 0) {
-				pr_debug
-				    ("buffer_queue(ch=%u): enabling capture now\n",
-				     vid->channel_index);
-				hws_enable_video_capture(vid->parent,
-							 vid->channel_index,
-							 true);
-			}
+			ring_mode = false;
+		}
+
+		wmb(); /* ensure descriptors visible before enabling capture */
+		hws_enable_video_capture(hws, vid->channel_index, true);
+
+		if (ring_mode) {
+			wmb(); /* ensure ring descriptors visible before doorbell */
+			hws_set_dma_doorbell(hws, vid->channel_index,
+					     vid->ring_dma,
+					     "buffer_queue_ring");
 		}
 	}
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
@@ -1299,59 +1276,42 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 			prog_vb2 = &to_program->vb.vb2_buf;
 
 		if (ring_mode) {
-			/* Set up ring buffer and start DMA to ring */
 			ret = hws_ring_setup(v);
 			if (ret) {
 				dev_warn(&hws->pdev->dev,
 					 "start_streaming: ch=%u ring setup failed (%d), switching to direct mode\n",
 					 v->channel_index, ret);
 				ring_mode = false;
-				fallthrough;
-			} else {
-				wmb(); /* ensure ring descriptors visible before doorbell */
-				hws_set_dma_doorbell(hws, v->channel_index,
-						     v->ring_dma,
-						     "start_streaming_ring");
-				dev_dbg(&hws->pdev->dev,
-					"start_streaming: ch=%u ring mode active\n",
-					v->channel_index);
 			}
 		}
 
 		if (!ring_mode) {
-			/* Direct VB2 buffer programming */
-			dma_addr_t dma_addr =
-			    vb2_dma_contig_plane_dma_addr(prog_vb2, 0);
+			dma_addr_t dma_addr;
 
-			/* First, program the DMA address register */
+			dma_addr = vb2_dma_contig_plane_dma_addr(prog_vb2, 0);
 			iowrite32(lower_32_bits(dma_addr),
 				  hws->bar0_base +
 				  HWS_REG_DMA_ADDR(v->channel_index));
-
-			/* Then program the rest of the video buffer setup */
-			wmb(); /* ensure buffer descriptors visible before programming */
 			hws_program_video_from_vb2(hws, v->channel_index,
 						   prog_vb2);
-
 			dev_dbg(&hws->pdev->dev,
 				"start_streaming: ch=%u programmed buffer %p dma=0x%08x\n",
 				v->channel_index, to_program,
 				lower_32_bits(dma_addr));
-			/* flush posted writes */
 			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		}
 
-			en = check_video_capture(hws, v->channel_index);
-			if (en < 0)
-				return en;
+		wmb(); /* ensure descriptors visible before enabling capture */
+		hws_enable_video_capture(hws, v->channel_index, true);
 
-			/* Only start hardware streaming after DMA address is programmed */
-			if (en == 0) {
-				hws_enable_video_capture(hws, v->channel_index,
-							 true);
-				dev_dbg(&hws->pdev->dev,
-					"start_streaming: ch=%u capture enabled\n",
-					v->channel_index);
-			}
+		if (ring_mode) {
+			wmb(); /* ensure ring descriptors visible before doorbell */
+			hws_set_dma_doorbell(hws, v->channel_index,
+					     v->ring_dma,
+					     "start_streaming_ring");
+			dev_dbg(&hws->pdev->dev,
+				"start_streaming: ch=%u ring mode active\n",
+				v->channel_index);
 		}
 	} else {
 		dev_dbg(&hws->pdev->dev,
