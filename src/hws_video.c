@@ -1163,14 +1163,6 @@ static int hws_buffer_prepare(struct vb2_buffer *vb)
 		return -EINVAL;
 	}
 
-	/* Check if buffer is in valid DMA range */
-	if (dma_addr + need > DMA_BIT_MASK(32)) {
-		dev_err(&hws->pdev->dev,
-			"Buffer DMA address 0x%llx exceeds 32-bit range\n",
-			(unsigned long long)dma_addr);
-		return -EINVAL;
-	}
-
 	vb2_set_plane_payload(vb, 0, need);
 	return 0;
 }
