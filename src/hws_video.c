@@ -6,8 +6,6 @@
 #include <linux/delay.h>
 #include <linux/bits.h>
 #include <linux/jiffies.h>
-#include <linux/timer.h>
-#include <linux/version.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -30,10 +28,6 @@
 #include <sound/pcm.h>
 #include <sound/rawmidi.h>
 #include <sound/initval.h>
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
-#define del_timer_sync(timer) timer_delete_sync(timer)
-#endif
 
 #define HWS_MAX_BUFS 32
 #define HWS_REMAP_SLOT_OFF(ch)   (0x208 + (ch) * 8)     /* one 64-bit slot per ch */
@@ -185,28 +179,6 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	return true;
 }
 
-/* DMA timeout handler */
-static void hws_dma_timeout_handler(struct timer_list *t)
-{
-	/* Legacy driver had no watchdog; keep timer as no-op */
-	struct hws_video *v = container_of(t, struct hws_video,
-					   dma_timeout_timer);
-	struct hws_pcie_dev *hws = v ? v->parent : NULL;
-	if (!v || !hws)
-		return;
-	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
-		return;
-	/* If a signal is present the hardware should be handling toggles */
-	if (hws_signal_present(hws, v->channel_index)) {
-		mod_timer(&v->dma_timeout_timer,
-			  jiffies + msecs_to_jiffies(2000));
-		return;
-	}
-	hws_force_no_signal_frame(v, "timeout");
-	mod_timer(&v->dma_timeout_timer,
-		  jiffies + msecs_to_jiffies(2000));
-}
-
 static int hws_ctrls_init(struct hws_video *vid)
 {
 	struct v4l2_ctrl_handler *hdl = &vid->control_handler;
@@ -291,9 +263,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	/* typed tasklet: bind handler once */
 	tasklet_setup(&vid->bh_tasklet, hws_bh_video);
 
-	/* DMA timeout timer setup */
-	timer_setup(&vid->dma_timeout_timer, hws_dma_timeout_handler, 0);
-	vid->last_frame_jiffies = jiffies;
+	/* DMA watchdog removed; retain counters for diagnostics */
 	vid->timeout_count = 0;
 	vid->error_count = 0;
 
@@ -488,8 +458,9 @@ void hws_program_video_from_vb2(struct hws_pcie_dev *hws, unsigned int ch,
         u32 r_lo  = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE);
         u32 r_base= readl(hws->bar0_base + CVBS_IN_BUF_BASE  + ch * PCIE_BARADDROFSIZE);
         u32 r_half= readl(hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-        pr_info("ch%u remap: hi=0x%08x(lo exp 0x%08x got 0x%08x) base=0x%08x exp=0x%08x half16B=0x%08x\n",
-                ch, r_hi, page_lo, r_lo, r_base, (ch+1)*PCIEBAR_AXI_BASE + pci_addr, r_half);
+        dev_dbg(&hws->pdev->dev,
+                "ch%u remap: hi=0x%08x(lo exp 0x%08x got 0x%08x) base=0x%08x exp=0x%08x half16B=0x%08x\n",
+                ch, r_hi, page_lo, r_lo, r_base, (ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half);
     }
 }
 
@@ -740,10 +711,8 @@ void check_video_format(struct hws_pcie_dev *pdx)
 		if (pdx->video[i].signal_loss_cnt == 1 &&
 		    pdx->video[i].cap_active) {
 			/* Use the two-buffer approach for signal loss handling */
-			if (hws_force_no_signal_frame(&pdx->video[i],
-						      "monitor_nosignal"))
-				mod_timer(&pdx->video[i].dma_timeout_timer,
-					  jiffies + msecs_to_jiffies(2000));
+			hws_force_no_signal_frame(&pdx->video[i],
+						  "monitor_nosignal");
 		}
 	}
 }
@@ -1461,8 +1430,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
                          v->channel_index);
             }
         }
-        /* Start timeout timer for first buffer */
-        mod_timer(&v->dma_timeout_timer, jiffies + msecs_to_jiffies(2000));
     } else {
         pr_info("start_streaming(ch=%u): no buffer to program yet (will arm on QBUF)\n",
                  v->channel_index);
@@ -1490,9 +1457,6 @@ static void hws_stop_streaming(struct vb2_queue *q)
     WRITE_ONCE(v->cap_active, false);
     WRITE_ONCE(v->stop_requested, true);
     mutex_unlock(&v->state_lock);
-
-    /* Cancel any pending timeout */
-    del_timer_sync(&v->dma_timeout_timer);
 
     hws_enable_video_capture(v->parent, v->channel_index, false);
     

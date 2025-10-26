@@ -668,7 +668,7 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 	for (i = 0; i < hws->cur_max_linein_ch; ++i)
 		ackmask |= HWS_INT_ADONE_BIT(i);
 	if (ackmask) {
-		writel(ackmask, hws->bar0_base + HWS_REG_INT_ACK);
+		writel(ackmask, hws->bar0_base + HWS_REG_INT_STATUS);
 		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 	}
 
