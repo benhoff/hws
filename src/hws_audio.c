@@ -46,7 +46,8 @@ static void hws_audio_hw_stop(struct hws_pcie_dev *hws, unsigned int ch)
 		u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
 
 		if (st & abit) {
-            hws_ack_irq(hws, abit);
+			writel(abit, hws->bar0_base + HWS_REG_INT_ACK);
+			readl(hws->bar0_base + HWS_REG_INT_STATUS);
 		}
 	}
 }
@@ -81,16 +82,16 @@ void hws_audio_program_next_period(struct hws_pcie_dev *hws, unsigned int ch)
 	/* 32-bit DMA mask guarantees upper_32_bits(dma) == 0 */
 	addr_low = lower_32_bits(dma);
 
-	pci_addr_lowmasked = (addr_low & HWS_DMA_LOWMASK);  /* offset inside window */
-	bar_low_masked     = (addr_low & HWS_DMA_PAGEMASK); /* page-aligned base   */
+	pci_addr_lowmasked = (addr_low & PCI_E_BAR_ADD_LOWMASK); /* into AXI base */
+	bar_low_masked     = (addr_low & PCI_E_BAR_ADD_MASK);    /* into table LOW */
 
 	/* Legacy address-table layout: start 0x208, step 8 per channel */
 	table_off = 0x208u + (ch * 8u);
 
 	/* 1) Program PCIe address table: HIGH (0) then LOW (BAR-masked) */
-	hws_mmio_write(hws, PCI_ADDR_TABLE_BASE + table_off, addr_high);
-	hws_mmio_write(hws, PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE,
-		       bar_low_masked);
+	writel(addr_high, hws->bar0_base + (PCI_ADDR_TABLE_BASE + table_off));
+	writel(bar_low_masked,
+	       hws->bar0_base + (PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE));
 
 	/* Optional posted-write flush/readback */
 	(void)readl(hws->bar0_base + (PCI_ADDR_TABLE_BASE + table_off));
@@ -98,13 +99,13 @@ void hws_audio_program_next_period(struct hws_pcie_dev *hws, unsigned int ch)
 
 	/* 2) Program AXI-visible base for AUDIO slot (8 + ch) */
 	axi_index = 8u + ch;
-	hws_mmio_write(hws, CVBS_IN_BUF_BASE + (axi_index * PCIE_BARADDROFSIZE),
-		       ((ch + 1u) * PCIEBAR_AXI_BASE) + pci_addr_lowmasked);
+	writel(((ch + 1u) * PCIEBAR_AXI_BASE) + pci_addr_lowmasked,
+	       hws->bar0_base + CVBS_IN_BUF_BASE + (axi_index * PCIE_BARADDROFSIZE));
 
 	/* 3) Program period length (legacy: bytes/16 granularity) */
 	length_units = (a->period_bytes / 16u);
-	hws_mmio_write(hws, CVBS_IN_BUF_BASE2 + (ch * PCIE_BARADDROFSIZE),
-		       length_units);
+	writel(length_units,
+	       hws->bar0_base + (CVBS_IN_BUF_BASE2 + (ch * PCIE_BARADDROFSIZE)));
 
 	/* Optional flush */
 	(void)readl(hws->bar0_base + (CVBS_IN_BUF_BASE  + (axi_index * PCIE_BARADDROFSIZE)));
@@ -239,7 +240,9 @@ static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws, unsigned int 
 	u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
 
 	if (st & abit) {
-        hws_ack_irq(hws, abit);
+		writel(abit, hws->bar0_base + HWS_REG_INT_ACK);
+		/* flush posted write */
+		readl(hws->bar0_base + HWS_REG_INT_STATUS);
 	}
 }
 
@@ -249,8 +252,10 @@ static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 
 	for (unsigned int ch = 0; ch < hws->cur_max_linein_ch; ch++)
 		mask |= HWS_INT_ADONE_BIT(ch);
-    if (mask)
-        hws_ack_irq(hws, mask);
+	if (mask) {
+		writel(mask, hws->bar0_base + HWS_REG_INT_ACK);
+		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	}
 }
 
 void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
@@ -293,7 +298,7 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 	else
 		reg &= ~mask;
 
-	hws_mmio_write(hws, HWS_REG_ACAP_ENABLE, reg);
+	writel(reg, hws->bar0_base + HWS_REG_ACAP_ENABLE);
 
 	dev_dbg(&hws->pdev->dev, "audio capture %s ch%u, reg=0x%08x\n",
 		enable ? "enabled" : "disabled", ch, reg);
@@ -566,3 +571,4 @@ int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws)
 
 	return ret;
 }
+

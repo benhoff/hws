@@ -9,9 +9,6 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/sizes.h>
-#include <linux/io.h>
-#include <linux/printk.h>
-#include <linux/atomic.h>
 
 #include <sound/pcm.h>
 #include <sound/core.h>
@@ -42,7 +39,7 @@ struct hws_pix_state {
 	enum v4l2_quantization quantization;/* V4L2_QUANTIZATION_LIM_RANGE */
 	enum v4l2_xfer_func   xfer_func;    /* V4L2_XFER_FUNC_DEFAULT */
 	bool                  interlaced;   /* cached hardware state */
-	u32                   half_size;
+	u32                   half_size;    /* optional: if your HW needs it */
 };
 
 #define	UNSET	(-1U)
@@ -53,7 +50,7 @@ struct hws_adapter;
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head       list;
-	unsigned int           slot;
+	int                    slot;  /* for two-buffer approach */
 };
 
 struct hws_video {
@@ -64,7 +61,6 @@ struct hws_video {
 	struct vb2_queue			 buffer_queue;
 	struct list_head			 capture_queue;
 	struct hwsvideo_buffer *active;
-	u32                          queued_count;
 
 	/* ───── locking ───── */
 	struct mutex			 state_lock;		  /* primary state */
@@ -92,7 +88,7 @@ struct hws_video {
 	struct v4l2_ctrl           *ctrl_saturation;
 	struct v4l2_ctrl           *ctrl_hue;
 	/* ───── capture queue status ───── */
-
+	// FIXME: https://chatgpt.com/s/t_68aaabb351b48191b791152813d52e9a
 	struct hws_pix_state         pix;
 	u32 alloc_sizeimage;
 
@@ -102,11 +98,6 @@ struct hws_video {
 	u8                      last_buf_half_toggle;
 	bool half_seen;
 	u32  sequence_number;
-	u8   ring_toggle_hw;
-	u8   ring_toggle_prev;
-	bool ring_first_half_copied;
-	u32  ring_frame_bytes;
-	unsigned long ring_last_toggle_jiffies;
 
 	/* ───── timeout and error handling ───── */
 	struct timer_list        dma_timeout_timer;
@@ -114,21 +105,18 @@ struct hws_video {
 	u32                      timeout_count;
 	u32                      error_count;
 
+	/* ───── two-buffer approach ───── */
+	dma_addr_t               ring_dma;
+	void                    *ring_cpu;
+	size_t                   ring_size;
+	u32                      ring_toggle_prev;
+	u32                      ring_toggle_hw;
+	bool                     ring_first_half_copied;
+	unsigned long            ring_last_toggle_jiffies;
+	u32                      queued_count;
+
 	/* ───── misc counters ───── */
 	int signal_loss_cnt;
-
-	/* ───── scratch ring DMA (copy-out) ───── */
-	void                    *ring_cpu;
-	dma_addr_t               ring_dma;
-	u32                      ring_bytes;
-	u32                      half_bytes;
-	void                    *half_cpu[2];
-	dma_addr_t               half_dma[2];
-	u32                      dma_slot;
-	bool                     ring_ready;
-	bool                     zero_copy;
-	u32                      dma_last_doorbell;
-	u32                      dma_last_offset;
 };
 
 struct hws_audio {
@@ -187,7 +175,6 @@ struct hws_pcie_dev {
 	u8                         cur_max_video_ch;
 	u8                         cur_max_linein_ch;
 	bool                       start_run;
-	bool                       log_probe_regs;
 
 	bool                       buf_allocated;
 	u32                        audio_pkt_size;
@@ -207,40 +194,6 @@ struct hws_pcie_dev {
 	/* ───── error flags ───── */
 	int                        pci_lost;
 
-	/* debug counters */
-	atomic_t                   irq_debug_counter;
-
 };
-
-static inline void hws_mmio_write(struct hws_pcie_dev *hws, u32 offset,
-				  u32 value)
-{
-	void __iomem *addr;
-
-	if (!hws || !hws->bar0_base)
-		return;
-
-	addr = hws->bar0_base + offset;
-	writel(value, addr);
-
-	if (unlikely(hws->log_probe_regs)) {
-		if (hws->pdev)
-			dev_info(&hws->pdev->dev,
-				 "probe-reg write offset=0x%08x value=0x%08x caller=%ps\n",
-				 offset, value, __builtin_return_address(0));
-		else
-			pr_info("probe-reg write offset=0x%08x value=0x%08x caller=%ps\n",
-				offset, value, __builtin_return_address(0));
-	}
-}
-
-static inline void hws_ack_irq(struct hws_pcie_dev *hws, u32 mask)
-{
-	if (!mask || !hws || !hws->bar0_base)
-		return;
-
-	hws_mmio_write(hws, HWS_REG_INT_STATUS, mask);
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
-}
 
 #endif

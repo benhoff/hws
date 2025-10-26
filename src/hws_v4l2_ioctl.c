@@ -46,7 +46,7 @@ static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,
 
 	if (!hws || !hws->bar0_base || ch >= hws->max_channels)
 		return;
-	hws_mmio_write(hws, HWS_REG_BCHS(ch), packed);
+	writel_relaxed(packed, hws->bar0_base + HWS_REG_BCHS(ch));
 	(void)readl(hws->bar0_base + HWS_REG_BCHS(ch)); /* post write */
 }
 
@@ -195,7 +195,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	new_h = bt->height;
 	interlaced = !!bt->interlaced;
 
-    lockdep_assert_held(&vid->state_lock);
+    lockdep_assert_held(&vid->qlock);
 
 	/* If vb2 has active buffers and size would change, reject. */
 	was_busy = vb2_is_busy(&vid->buffer_queue);
@@ -219,11 +219,8 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	/* Recompute stride/sizeimage/half_size using your helper */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
 	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
-	vid->pix.half_size    = vid->pix.sizeimage / 2;
-
 	if (!was_busy)
-		vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
-
+		vid->alloc_sizeimage = vid->pix.sizeimage;
 	return ret;
 }
 
@@ -410,27 +407,27 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-    /* Only YUYV */
-    pix->pixelformat = V4L2_PIX_FMT_YUYV;
+	/* Only YUYV */
+	pix->pixelformat = V4L2_PIX_FMT_YUYV;
 
-    /* Defaults then clamp */
-    w = req_w ? req_w : (vid ? vid->pix.width : 640);
-    h = req_h ? req_h : (vid ? vid->pix.height : 480);
-    if (w > MAX_VIDEO_HW_W) w = MAX_VIDEO_HW_W;
-    if (h > MAX_VIDEO_HW_H) h = MAX_VIDEO_HW_H;
-    if (!w) w = 640;  /* hard fallback in case macros are odd */
-    if (!h) h = 480;
+	/* Defaults then clamp */
+	w = (req_w ? req_w : 640);
+	h = (req_h ? req_h : 480);
+	if (w > MAX_VIDEO_HW_W) w = MAX_VIDEO_HW_W;
+	if (h > MAX_VIDEO_HW_H) h = MAX_VIDEO_HW_H;
+	if (!w) w = 640;  /* hard fallback in case macros are odd */
+	if (!h) h = 480;
 
-    /* Field policy */
-    pix->field = V4L2_FIELD_NONE;
+	/* Field policy */
+	pix->field = V4L2_FIELD_NONE;
 
-    /* Stride policy for packed 16bpp, 64B align */
-    min_bpl = ALIGN(w * 2, 64);
+	/* Stride policy for packed 16bpp, 64B align */
+	min_bpl = ALIGN(w * 2, 64);
 
-    /* Bound requested bpl to something sane, then align */
-    bpl = pix->bytesperline;
-    if (bpl < min_bpl)
-        bpl = min_bpl;
+	/* Bound requested bpl to something sane, then align */
+	bpl = pix->bytesperline;
+	if (bpl < min_bpl)
+		bpl = min_bpl;
 	else {
 		/* Cap at 16x width to avoid silly values that overflow sizeimage */
 		u32 max_bpl = ALIGN(w * 2 * 16, 64);
@@ -438,25 +435,19 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 			bpl = max_bpl;
 		bpl = ALIGN(bpl, 64);
 	}
-
 	if (h && max_frame) {
 		size_t max_bpl_hw = max_frame / h;
-
 		if (max_bpl_hw < min_bpl)
 			return -ERANGE;
-
 		max_bpl_hw = rounddown(max_bpl_hw, 64);
-
 		if (!max_bpl_hw)
 			return -ERANGE;
-
 		if (bpl > max_bpl_hw) {
 			pr_debug("try_fmt: clamp bpl %u -> %zu due to hw buf cap %zu\n",
 				 bpl, max_bpl_hw, max_frame);
 			bpl = (u32)max_bpl_hw;
 		}
 	}
-
 	/* Overflow-safe sizeimage = bpl * h */
 	if (__builtin_mul_overflow((size_t)bpl, (size_t)h, &size) || size == 0)
 		return -ERANGE; /* compliance-friendly: reject impossible requests */
@@ -469,8 +460,8 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	pix->bytesperline = bpl;
 	pix->sizeimage    = (u32)size; /* logical size, not page-aligned */
 
-    hws_set_colorimetry_fmt(pix);
-    pr_debug("try_fmt: w=%u h=%u bpl=%u size=%u field=%u\n",
+	hws_set_colorimetry_fmt(pix);
+	pr_debug("try_fmt: w=%u h=%u bpl=%u size=%u field=%u\n",
              pix->width, pix->height, pix->bytesperline,
              pix->sizeimage, pix->field);
     return 0;

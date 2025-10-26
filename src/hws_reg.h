@@ -3,7 +3,6 @@
 #define _HWS_PCIE_REG_H
 
 #include <linux/bits.h>
-#include <linux/compiler.h>
 #include <linux/sizes.h>
 
 #define XDMA_CHANNEL_NUM_MAX (1)
@@ -29,26 +28,10 @@
 /* 2 Mib */
 #define MAX_L_VIDEO_SIZE			0x200000U
 
+
 #define PCI_E_BAR_PAGE_SIZE 0x20000000
-
-extern unsigned int hws_dma_offset_bits;
-
-static inline u32 hws_dma_lowmask(void)
-{
-	unsigned int bits = READ_ONCE(hws_dma_offset_bits);
-
-	if (bits >= 32)
-		return U32_MAX;
-	return BIT(bits) - 1U;
-}
-
-static inline u32 hws_dma_pagemask(void)
-{
-	return ~hws_dma_lowmask();
-}
-
-#define HWS_DMA_LOWMASK    hws_dma_lowmask()
-#define HWS_DMA_PAGEMASK   hws_dma_pagemask()
+#define PCI_E_BAR_ADD_MASK 0xE0000000
+#define PCI_E_BAR_ADD_LOWMASK 0x1FFFFFFF
 
 #define MAX_DMA_AUDIO_PK_SIZE      (128U * 16U * 2U)
 
@@ -87,6 +70,13 @@ static inline u32 hws_dma_pagemask(void)
 #define HWS_SYS_DMA_BUSY_BIT     BIT(3)   /* 0x08 = DMA busy flag */
 
 #define HWS_REG_DEC_MODE       (CVBS_IN_BASE +  0 * PCIE_BARADDROFSIZE)
+#define HWS_REG_CTL            (CVBS_IN_BASE +  4 * PCIE_BARADDROFSIZE) /* Main control register */
+#define HWS_CTL_IRQ_ENABLE_BIT BIT(0)   /* Global interrupt enable bit */
+/*  Write 0x00 to fully reset decoder,
+ *  set bit 31=1 to “start run”,
+ *  low byte=0x13 selects YUYV/BT.709/etc,
+ *  in ReadChipId() we also write 0x00 and 0x10 here for chip-ID sequencing.
+ */
 
 /* per-pipe base: 0x4000, stride 0x800 ------------------------------------ */
 #define HWS_REG_PIPE_BASE(n)   (CVBS_IN_BASE + ((n) * 0x800))
@@ -122,6 +112,8 @@ static inline u32 hws_dma_pagemask(void)
 /* ── per-interrupt bits (video 0-3, audio 0-3) ────────────────────── */
 #define HWS_INT_VDONE_BIT(ch)     BIT(ch)         /* 0x01,0x02,0x04,0x08  */
 #define HWS_INT_ADONE_BIT(ch)     BIT(8 + (ch))   /* 0x100 .. 0x800 */
+
+#define HWS_REG_INT_ACK           (CVBS_IN_BASE + 0x4000 + 1 * PCIE_BARADDROFSIZE)
 
 #define HWS_REG_IN_RES(ch)             (CVBS_IN_BASE + (90  + (ch) * 2) * PCIE_BARADDROFSIZE) /* 16-bit W | 16-bit H      */
 #define HWS_REG_BCHS(ch)               (CVBS_IN_BASE + (91  + (ch) * 2) * PCIE_BARADDROFSIZE) /* B|C|H|S packed bytes     */
