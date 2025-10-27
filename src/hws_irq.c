@@ -56,8 +56,16 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 
 	/* Avoid MMIO during suspend */
 	if (unlikely(READ_ONCE(hws->suspended))) {
+		unsigned long f;
+
 		dev_dbg(&hws->pdev->dev,
 			"arm_next(ch=%u): suspended after pick\n", ch);
+		spin_lock_irqsave(&v->irq_lock, f);
+		if (v->active) {
+			list_add(&buf->list, &v->capture_queue);
+			v->active = NULL;
+		}
+		spin_unlock_irqrestore(&v->irq_lock, f);
 		return -EBUSY;
 	}
 
@@ -68,10 +76,6 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 		hws_program_dma_for_addr(hws, ch, dma_addr);
 		iowrite32(lower_32_bits(dma_addr),
 			  hws->bar0_base + HWS_REG_DMA_ADDR(ch));
-		/* Ensure DMA is ready for device access */
-		dma_sync_single_for_device(&hws->pdev->dev, dma_addr,
-					   vb2_plane_size(&buf->vb.vb2_buf, 0),
-					   DMA_FROM_DEVICE);
 	}
 
 	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): programmed buffer %p\n", ch,
