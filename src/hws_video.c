@@ -158,6 +158,7 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	struct hwsvideo_buffer *buf = NULL, *next = NULL;
 	bool ring_mode;
 	bool have_next = false;
+	bool doorbell = false;
 
 	if (!v)
 		return false;
@@ -196,25 +197,40 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	WRITE_ONCE(v->ring_toggle_hw, 0);
 	if (!buf)
 		return false;
-	/* Complete buffer with an error state to signal loss to userspace. */
+	/* Complete buffer with a neutral frame so dequeuers keep running. */
 	{
 		struct vb2_v4l2_buffer *vb2v = &buf->vb;
+		void *dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
 
-		vb2_set_plane_payload(&vb2v->vb2_buf, 0, 0);
-		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
+		if (dst)
+			memset(dst, 0x10, v->pix.sizeimage);
+		vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
+		vb2v->sequence = ++v->sequence_number;
+		vb2v->vb2_buf.timestamp = ktime_get_ns();
+		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 	WRITE_ONCE(v->ring_first_half_copied, false);
 	WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
-	if (ring_mode) {
-		wmb(); /* ensure ring descriptors visible before doorbell */
+	if (ring_mode && v->ring_cpu) {
+		hws_program_dma_window(v, v->ring_dma);
 		hws_set_dma_doorbell(hws, v->channel_index, v->ring_dma,
 				     tag ? tag : "nosignal_ring");
+		doorbell = true;
 	} else if (have_next && next) {
 		dma_addr_t dma =
 		    vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
-		wmb(); /* ensure DMA address published before doorbell */
+		hws_program_dma_for_addr(hws, v->channel_index, dma);
 		hws_set_dma_doorbell(hws, v->channel_index, dma,
 				     tag ? tag : "nosignal_zero");
+		doorbell = true;
+	} else if (ring_mode && !v->ring_cpu) {
+		dev_warn(&hws->pdev->dev,
+			 "nosignal: ch%u ring buffer missing, cannot doorbell\n",
+			 v->channel_index);
+	}
+	if (doorbell) {
+		wmb(); /* ensure descriptors visible before enabling capture */
+		hws_enable_video_capture(hws, v->channel_index, true);
 	}
 	return true;
 }
