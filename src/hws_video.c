@@ -1202,14 +1202,12 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 			ring_mode = false;
 		}
 
+		if (ring_mode)
+			hws_set_dma_doorbell(hws, vid->channel_index, vid->ring_dma,
+				     "buffer_queue_ring");
+
 		wmb(); /* ensure descriptors visible before enabling capture */
 		hws_enable_video_capture(hws, vid->channel_index, true);
-
-		if (ring_mode) {
-			hws_set_dma_doorbell(hws, vid->channel_index,
-					     vid->ring_dma,
-					     "buffer_queue_ring");
-		}
 	}
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 }
@@ -1289,9 +1287,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 		}
 
-		wmb(); /* ensure descriptors visible before enabling capture */
-		hws_enable_video_capture(hws, v->channel_index, true);
-
 		if (ring_mode) {
 			hws_set_dma_doorbell(hws, v->channel_index,
 					     v->ring_dma,
@@ -1300,6 +1295,9 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 				"start_streaming: ch=%u ring mode active\n",
 				v->channel_index);
 		}
+
+		wmb(); /* ensure descriptors visible before enabling capture */
+		hws_enable_video_capture(hws, v->channel_index, true);
 	} else {
 		dev_dbg(&hws->pdev->dev,
 			"start_streaming: ch=%u no buffer yet (will arm on QBUF)\n",
