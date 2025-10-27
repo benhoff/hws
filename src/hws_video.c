@@ -950,6 +950,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	 * BH/ISR reads in hws_bh_video/hws_arm_next.
 	 */
 	smp_wmb();
+	wmb(); /* ensure DMA window/address writes visible before enable */
 	hws_enable_video_capture(pdx, ch, true);
 	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
 }
