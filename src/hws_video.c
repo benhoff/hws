@@ -927,14 +927,16 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (!list_empty(&v->capture_queue)) {
 		struct hwsvideo_buffer *buf;
+		dma_addr_t dma;
 
 		buf = list_first_entry(&v->capture_queue,
 				       struct hwsvideo_buffer, list);
 		v->active = buf;
 		list_del_init(&v->active->list);
-		hws_program_dma_for_addr(pdx, ch,
-					 vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf,
-									0));
+		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+		hws_program_dma_for_addr(pdx, ch, dma);
+		iowrite32(lower_32_bits(dma),
+			  pdx->bar0_base + HWS_REG_DMA_ADDR(ch));
 		reenable = true;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
