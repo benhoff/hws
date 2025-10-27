@@ -50,6 +50,7 @@ static int hws_ring_setup(struct hws_video *vid);
 static bool hws_use_ring(struct hws_video *vid);
 static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 				 dma_addr_t dma, const char *tag);
+static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 
 static bool hws_signal_present(struct hws_pcie_dev *hws, unsigned int ch)
 {
@@ -70,11 +71,55 @@ static bool hws_use_ring(struct hws_video *vid)
 static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 				 dma_addr_t dma, const char *tag)
 {
-	/* Program DMA address and start capture */
 	iowrite32(lower_32_bits(dma), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
-	hws_enable_video_capture(hws, ch, true);
 	pr_debug("dma_doorbell ch%u: dma=0x%llx tag=%s\n", ch, (u64)dma,
 		 tag ? tag : "");
+}
+
+static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
+{
+	const u32 addr_mask = PCI_E_BAR_ADD_MASK;	// 0xE0000000
+	const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;	// 0x1FFFFFFF
+	struct hws_pcie_dev *hws = vid->parent;
+	unsigned int ch = vid->channel_index;
+	u32 table_off = HWS_REMAP_SLOT_OFF(ch);
+	u32 lo = lower_32_bits(dma);
+	u32 hi = upper_32_bits(dma);
+	u32 pci_addr = lo & addr_low_mask;	// low 29 bits inside 512MB window
+	u32 page_lo = lo & addr_mask;	// bits 31..29 only (page bits)
+
+	/* Remap entry: HI then page_LO (legacy order) */
+	writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
+	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
+	writel(page_lo,
+	       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
+	       PCIE_BARADDROFSIZE);
+	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
+		    PCIE_BARADDROFSIZE);
+
+	/* Program per-channel base and half-size */
+	writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
+	       hws->bar0_base + HWS_BUF_BASE_OFF(ch));
+	(void)readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
+
+	writel(vid->pix.half_size / 16, hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+	(void)readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+
+	/* Optional: verify and log */
+	{
+		u32 r_hi =
+		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
+		u32 r_lo =
+		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
+			  PCIE_BARADDROFSIZE);
+		u32 r_base = readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
+		u32 r_half = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+
+		dev_dbg(&hws->pdev->dev,
+			"ch%u remap: hi=0x%08x(lo exp 0x%08x got 0x%08x) base=0x%08x exp=0x%08x half16B=0x%08x\n",
+			ch, r_hi, page_lo, r_lo, r_base,
+			(ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half);
+	}
 }
 
 static int hws_ring_setup(struct hws_video *vid)
@@ -417,55 +462,10 @@ static void hws_buf_cleanup(struct vb2_buffer *vb)
 void hws_program_video_from_vb2(struct hws_pcie_dev *hws, unsigned int ch,
 				struct vb2_buffer *vb)
 {
-	const u32 addr_mask = PCI_E_BAR_ADD_MASK;	// 0xE0000000
-	const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;	// 0x1FFFFFFF
-	const u32 table_off = 0x208 + ch * 8;	// same as legacy
-
+	struct hws_video *vid = &hws->video[ch];
 	dma_addr_t paddr = vb2_dma_contig_plane_dma_addr(vb, 0);
-	u32 lo = lower_32_bits(paddr);
-	u32 hi = upper_32_bits(paddr);
-	u32 pci_addr = lo & addr_low_mask;	// low 29 bits inside 512MB window
-	u32 page_lo = lo & addr_mask;	// bits 31..29 only (page bits)
 
-	/* Remap entry: HI then page_LO (legacy order) */
-	writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
-	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
-	writel(page_lo,
-	       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-	       PCIE_BARADDROFSIZE);
-	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-		    PCIE_BARADDROFSIZE);
-
-	/* Program per-channel base and half-size */
-	writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-	       hws->bar0_base + CVBS_IN_BUF_BASE + ch * PCIE_BARADDROFSIZE);
-	(void)readl(hws->bar0_base + CVBS_IN_BUF_BASE +
-		    ch * PCIE_BARADDROFSIZE);
-
-	writel(hws->video[ch].pix.half_size / 16,
-	       hws->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-	(void)readl(hws->bar0_base + CVBS_IN_BUF_BASE2 +
-		    ch * PCIE_BARADDROFSIZE);
-
-	/* Optional: verify and log */
-	{
-		u32 r_hi =
-		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off + 0);
-		u32 r_lo =
-		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-			  PCIE_BARADDROFSIZE);
-		u32 r_base =
-		    readl(hws->bar0_base + CVBS_IN_BUF_BASE +
-			  ch * PCIE_BARADDROFSIZE);
-		u32 r_half =
-		    readl(hws->bar0_base + CVBS_IN_BUF_BASE2 +
-			  ch * PCIE_BARADDROFSIZE);
-
-		dev_dbg(&hws->pdev->dev,
-			"ch%u remap: hi=0x%08x(lo exp 0x%08x got 0x%08x) base=0x%08x exp=0x%08x half16B=0x%08x\n",
-			ch, r_hi, page_lo, r_lo, r_base,
-			(ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half);
-	}
+	hws_program_dma_window(vid, paddr);
 }
 
 static inline u32 hws_read_port_hpd(struct hws_pcie_dev *hws, unsigned int port)
@@ -1191,7 +1191,9 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 		vid->queued_count--;
 		vid->active = buf;
 
-		if (!ring_mode || !vid->ring_cpu) {
+		if (ring_mode && vid->ring_cpu) {
+			hws_program_dma_window(vid, vid->ring_dma);
+		} else {
 			dma_addr_t dma_addr;
 
 			if (ring_mode && !vid->ring_cpu)
@@ -1212,7 +1214,6 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 		hws_enable_video_capture(hws, vid->channel_index, true);
 
 		if (ring_mode) {
-			wmb(); /* ensure ring descriptors visible before doorbell */
 			hws_set_dma_doorbell(hws, vid->channel_index,
 					     vid->ring_dma,
 					     "buffer_queue_ring");
@@ -1285,7 +1286,9 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 			}
 		}
 
-		if (!ring_mode) {
+		if (ring_mode) {
+			hws_program_dma_window(v, v->ring_dma);
+		} else {
 			dma_addr_t dma_addr;
 
 			dma_addr = vb2_dma_contig_plane_dma_addr(prog_vb2, 0);
@@ -1305,7 +1308,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		hws_enable_video_capture(hws, v->channel_index, true);
 
 		if (ring_mode) {
-			wmb(); /* ensure ring descriptors visible before doorbell */
 			hws_set_dma_doorbell(hws, v->channel_index,
 					     v->ring_dma,
 					     "start_streaming_ring");
