@@ -41,7 +41,6 @@
 	  .subdevice = (__subdev),                                  \
 	  .driver_data = (unsigned long)(__configptr) }
 
-#define CH_SHIFT 2 /* need 2 bits for 0-3            */
 #define LOG_DEC(tag)							\
 	dev_dbg(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n",		\
 		(tag), readl(hdev->bar0_base + HWS_REG_DEC_MODE))
@@ -63,12 +62,6 @@ static const struct pci_device_id hws_pci_table[] = {
 
 	{}
 };
-
-static inline u32 hws_r32(void __iomem *base, u32 off)
-{
-	/* Single place to add barriers or tracing if needed */
-	return readl(base + off);
-}
 
 static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
 {
@@ -131,7 +124,6 @@ static void hws_stop_device(struct hws_pcie_dev *hws);
 static int read_chip_id(struct hws_pcie_dev *hdev)
 {
 	u32 reg;
-	int i;
 	/* mirror PCI IDs for later switches */
 	hdev->device_id = hdev->pdev->device;
 	hdev->vendor_id = hdev->pdev->vendor;
@@ -621,6 +613,9 @@ static void hws_remove(struct pci_dev *pdev)
 		hws_video_cleanup_channel(hws, i);
 		hws_audio_cleanup_channel(hws, i, true);
 	}
+
+	/* Release seeded DMA buffers */
+	hws_free_seed_buffers(hws);
 	/* kthread is stopped by the devm action you added in probe */
 }
 
