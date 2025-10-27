@@ -44,23 +44,12 @@ static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced);
 
 /* Two-buffer approach helper functions */
-static bool hws_signal_present(struct hws_pcie_dev *hws, unsigned int ch);
 static void hws_ring_release(struct hws_video *vid);
 static int hws_ring_setup(struct hws_video *vid);
 static bool hws_use_ring(struct hws_video *vid);
 static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 				 dma_addr_t dma, const char *tag);
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
-
-static bool hws_signal_present(struct hws_pcie_dev *hws, unsigned int ch)
-{
-	u32 reg;
-
-	if (!hws || !hws->bar0_base || ch >= hws->cur_max_video_ch)
-		return false;
-	reg = readl(hws->bar0_base + HWS_REG_ACTIVE_STATUS);
-	return !!(reg & BIT(ch));
-}
 
 static bool hws_use_ring(struct hws_video *vid)
 {
@@ -72,8 +61,8 @@ static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 				 dma_addr_t dma, const char *tag)
 {
 	iowrite32(lower_32_bits(dma), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
-	pr_debug("dma_doorbell ch%u: dma=0x%llx tag=%s\n", ch, (u64)dma,
-		 tag ? tag : "");
+	dev_dbg(&hws->pdev->dev, "dma_doorbell ch%u: dma=0x%llx tag=%s\n", ch,
+		(u64)dma, tag ? tag : "");
 }
 
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
@@ -442,13 +431,8 @@ static int hws_buf_init(struct vb2_buffer *vb)
 
 static void hws_buf_finish(struct vb2_buffer *vb)
 {
-	struct hws_video *vid = vb->vb2_queue->drv_priv;
-	struct hws_pcie_dev *hws = vid->parent;
-
-	/* Ensure DMA is complete and visible to CPU */
-	dma_sync_single_for_cpu(&hws->pdev->dev,
-				vb2_dma_contig_plane_dma_addr(vb, 0),
-				vb2_plane_size(vb, 0), DMA_FROM_DEVICE);
+	/* vb2 core handles cache maintenance for dma-contig buffers */
+	(void)vb;
 }
 
 static void hws_buf_cleanup(struct vb2_buffer *vb)
@@ -459,13 +443,12 @@ static void hws_buf_cleanup(struct vb2_buffer *vb)
 		list_del_init(&b->list);
 }
 
-void hws_program_video_from_vb2(struct hws_pcie_dev *hws, unsigned int ch,
-				struct vb2_buffer *vb)
+void hws_program_dma_for_addr(struct hws_pcie_dev *hws, unsigned int ch,
+			      dma_addr_t dma)
 {
 	struct hws_video *vid = &hws->video[ch];
-	dma_addr_t paddr = vb2_dma_contig_plane_dma_addr(vb, 0);
 
-	hws_program_dma_window(vid, paddr);
+	hws_program_dma_window(vid, dma);
 }
 
 static inline u32 hws_read_port_hpd(struct hws_pcie_dev *hws, unsigned int port)
@@ -631,7 +614,7 @@ static void hws_open_irq_fabric(struct hws_pcie_dev *hws)
 	(void)readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
 
 	/* Open the global/bridge gate (legacy 0x3FFFF) */
-	writel(0x0003FFFF, hws->bar0_base + INT_EN_REG_BASE);
+	writel(HWS_INT_EN_MASK, hws->bar0_base + INT_EN_REG_BASE);
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
@@ -656,11 +639,7 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 		}
 	}
 
-	/* 4) enable all interrupts */
-	writel(0x3ffff, hws->bar0_base + INT_EN_REG_BASE);
-	LOG_DEC("after runbit");
-
-	/* 5) “Start run”: set bit31, wait a bit, then program low 24 bits */
+	/* 4) “Start run”: set bit31, wait a bit, then program low 24 bits */
 	writel(0x80000000, hws->bar0_base + HWS_REG_DEC_MODE);
 	LOG_DEC("start run");
 	// udelay(500);
@@ -715,7 +694,8 @@ void check_video_format(struct hws_pcie_dev *pdx)
 
 		if (!hws_update_active_interlace(pdx, i)) {
 			// return 1;                         /* no active video */
-			pdx->video[i].signal_loss_cnt = 1;
+			if (pdx->video[i].signal_loss_cnt == 0)
+				pdx->video[i].signal_loss_cnt = 1;
 		} else {
 			if (pdx->hw_ver > 0)
 				handle_hwv2_path(pdx, i);
@@ -733,6 +713,7 @@ void check_video_format(struct hws_pcie_dev *pdx)
 			/* Use the two-buffer approach for signal loss handling */
 			hws_force_no_signal_frame(&pdx->video[i],
 						  "monitor_nosignal");
+			pdx->video[i].signal_loss_cnt = 2;
 		}
 	}
 }
@@ -945,10 +926,15 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	/* Re-prime first VB2 buffer if present */
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (!list_empty(&v->capture_queue)) {
-		v->active = list_first_entry(&v->capture_queue,
-					     struct hwsvideo_buffer, list);
+		struct hwsvideo_buffer *buf;
+
+		buf = list_first_entry(&v->capture_queue,
+				       struct hwsvideo_buffer, list);
+		v->active = buf;
 		list_del_init(&v->active->list);
-		hws_program_video_from_vb2(pdx, ch, &v->active->vb.vb2_buf);
+		hws_program_dma_for_addr(pdx, ch,
+					 vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf,
+									0));
 		reenable = true;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -1132,8 +1118,9 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 	if (*num_buffers > room)
 		*num_buffers = room;
 	if (*num_buffers == 0) {
-		pr_debug("queue_setup: reject, no room (have=%u, max=%u)\n",
-			 have, HWS_MAX_BUFS);
+		dev_dbg(&hws->pdev->dev,
+			"queue_setup: reject, no room (have=%u, max=%u)\n", have,
+			HWS_MAX_BUFS);
 		return -ENOBUFS;	/* or -ENOMEM; either is fine for CREATE_BUFS clamp */
 	}
 	return 0;
@@ -1171,9 +1158,10 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	unsigned long flags;
 	bool ring_mode;
 
-	pr_debug("buffer_queue(ch=%u): vb=%p sizeimage=%u q_active=%d\n",
-		 vid->channel_index, vb, vid->pix.sizeimage,
-		 READ_ONCE(vid->cap_active));
+	dev_dbg(&hws->pdev->dev,
+		"buffer_queue(ch=%u): vb=%p sizeimage=%u q_active=%d\n",
+		vid->channel_index, vb, vid->pix.sizeimage,
+		READ_ONCE(vid->cap_active));
 
 	/* Initialize buffer slot */
 	buf->slot = 0;
@@ -1185,8 +1173,9 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 
 	/* If streaming and no in-flight buffer, prime HW immediately */
 	if (READ_ONCE(vid->cap_active) && !vid->active) {
-		pr_debug("buffer_queue(ch=%u): priming first vb=%p\n",
-			 vid->channel_index, vb2_buf);
+		dev_dbg(&hws->pdev->dev,
+			"buffer_queue(ch=%u): priming first vb=%p\n",
+			vid->channel_index, vb2_buf);
 		list_del_init(&buf->list);
 		vid->queued_count--;
 		vid->active = buf;
@@ -1197,16 +1186,17 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 			dma_addr_t dma_addr;
 
 			if (ring_mode && !vid->ring_cpu)
-				pr_warn("buffer_queue(ch=%u): ring buffer missing, using direct mode\n",
-					vid->channel_index);
+				dev_warn(&hws->pdev->dev,
+					 "buffer_queue(ch=%u): ring buffer missing, using direct mode\n",
+					 vid->channel_index);
 
 			dma_addr = vb2_dma_contig_plane_dma_addr(vb2_buf, 0);
+			hws_program_dma_for_addr(vid->parent,
+					 vid->channel_index,
+					 dma_addr);
 			iowrite32(lower_32_bits(dma_addr),
 				  hws->bar0_base +
 				  HWS_REG_DMA_ADDR(vid->channel_index));
-			hws_program_video_from_vb2(vid->parent,
-						   vid->channel_index,
-						   vb2_buf);
 			ring_mode = false;
 		}
 
@@ -1222,12 +1212,6 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 }
 
-static inline u32 hws_r32(void __iomem *base, u32 off)
-{
-	/* Single place to add barriers or tracing if needed */
-	return readl(base + off);
-}
-
 static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct hws_video *v = q->drv_priv;
@@ -1235,7 +1219,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct hwsvideo_buffer *to_program = NULL;	/* local copy */
 	struct vb2_buffer *prog_vb2 = NULL;
 	unsigned long flags;
-	int en, ret;
+	int ret;
 	bool ring_mode;
 
 	dev_dbg(&hws->pdev->dev, "start_streaming: ch=%u count=%u\n",
@@ -1292,11 +1276,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 			dma_addr_t dma_addr;
 
 			dma_addr = vb2_dma_contig_plane_dma_addr(prog_vb2, 0);
+			hws_program_dma_for_addr(hws, v->channel_index, dma_addr);
 			iowrite32(lower_32_bits(dma_addr),
 				  hws->bar0_base +
 				  HWS_REG_DMA_ADDR(v->channel_index));
-			hws_program_video_from_vb2(hws, v->channel_index,
-						   prog_vb2);
 			dev_dbg(&hws->pdev->dev,
 				"start_streaming: ch=%u programmed buffer %p dma=0x%08x\n",
 				v->channel_index, to_program,

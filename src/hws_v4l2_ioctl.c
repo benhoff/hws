@@ -443,8 +443,10 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 		if (!max_bpl_hw)
 			return -ERANGE;
 		if (bpl > max_bpl_hw) {
-			pr_debug("try_fmt: clamp bpl %u -> %zu due to hw buf cap %zu\n",
-				 bpl, max_bpl_hw, max_frame);
+			if (pdev)
+				dev_dbg(&pdev->pdev->dev,
+					"try_fmt: clamp bpl %u -> %zu due to hw buf cap %zu\n",
+					bpl, max_bpl_hw, max_frame);
 			bpl = (u32)max_bpl_hw;
 		}
 	}
@@ -461,10 +463,12 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	pix->sizeimage    = (u32)size; /* logical size, not page-aligned */
 
 	hws_set_colorimetry_fmt(pix);
-	pr_debug("try_fmt: w=%u h=%u bpl=%u size=%u field=%u\n",
-             pix->width, pix->height, pix->bytesperline,
-             pix->sizeimage, pix->field);
-    return 0;
+	if (pdev)
+		dev_dbg(&pdev->pdev->dev,
+			"try_fmt: w=%u h=%u bpl=%u size=%u field=%u\n",
+			pix->width, pix->height, pix->bytesperline,
+			pix->sizeimage, pix->field);
+	return 0;
 }
 
 
@@ -512,9 +516,10 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	/* Refresh vb2 watermark when idle */
 	if (!vb2_is_busy(&vid->buffer_queue))
 		vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
-    pr_debug("s_fmt:   w=%u h=%u bpl=%u size=%u alloc=%u\n",
-         vid->pix.width, vid->pix.height, vid->pix.bytesperline,
-         vid->pix.sizeimage, vid->alloc_sizeimage);
+	dev_dbg(&vid->parent->pdev->dev,
+		"s_fmt:   w=%u h=%u bpl=%u size=%u alloc=%u\n",
+		vid->pix.width, vid->pix.height, vid->pix.bytesperline,
+		vid->pix.sizeimage, vid->alloc_sizeimage);
 
 	return 0;
 }

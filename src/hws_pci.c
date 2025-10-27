@@ -205,7 +205,7 @@ static int main_ks_thread_handle(void *data)
 		schedule_timeout_interruptible(msecs_to_jiffies(1000));
 	}
 
-	pr_debug("%s: exiting\n", __func__);
+	dev_dbg(&pdx->pdev->dev, "%s: exiting\n", __func__);
 	return 0;
 }
 
@@ -321,7 +321,7 @@ static void hws_irq_mask_gate(struct hws_pcie_dev *hws)
 
 static void hws_irq_unmask_gate(struct hws_pcie_dev *hws)
 {
-	writel(0x0003ffff, hws->bar0_base + INT_EN_REG_BASE);
+	writel(HWS_INT_EN_MASK, hws->bar0_base + INT_EN_REG_BASE);
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
@@ -433,7 +433,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_info(&pdev->dev, "Global IRQ enable bit set in control register\n");
 	}
 
-	/* F) Open the global gate just like legacy did: INT_EN_REG_BASE = 0x3ffff */
+	/* F) Open the global gate just like legacy did */
 	hws_irq_unmask_gate(hws);
 	dev_info(&pdev->dev, "INT_EN_GATE readback=0x%08x\n",
 		 readl(hws->bar0_base + INT_EN_REG_BASE));
