@@ -287,7 +287,7 @@ static int hws_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_DV_RX_IT_CONTENT_TYPE:
 		// FIXME
 		// ctrl->val = hdmi_content_type(vid); /* unchanged */
-		return 0;
+		return -EINVAL;
 
 	default:
 		return -EINVAL;
