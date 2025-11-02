@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <linux/compiler.h>
+#include <linux/types.h>
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/string.h>
 
 #include <sound/pcm.h>
 #include <media/videobuf2-dma-contig.h>
@@ -15,110 +17,88 @@
 #define MAX_INT_LOOPS 100
 
 
-static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
+
+static void hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 {
-    struct hws_video *v = &hws->video[ch];
-    unsigned long flags;
-    struct hwsvideo_buffer *buf;
-    pr_debug("arm_next(ch=%u): stop=%d cap=%d queued=%d\n",
-             ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active), !list_empty(&v->capture_queue));
+	struct hws_video *v = &hws->video[ch];
+	unsigned long flags;
+	struct hwsvideo_buffer *buf;
 
-    if (unlikely(READ_ONCE(hws->suspended))) {
-        pr_debug("arm_next(ch=%u): suspended\n", ch);
-        return -EBUSY;
-    }
-
-    if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))) {
-        pr_debug("arm_next(ch=%u): stop=%d cap=%d -> cancel\n",
-                   ch, v->stop_requested, v->cap_active);
-        return -ECANCELED;
-    }
-
-
-    spin_lock_irqsave(&v->irq_lock, flags);
-    if (list_empty(&v->capture_queue)) {
-        spin_unlock_irqrestore(&v->irq_lock, flags);
-        pr_debug("arm_next(ch=%u): queue empty\n", ch);
-        return -EAGAIN;
-    }
-
-    buf = list_first_entry(&v->capture_queue, struct hwsvideo_buffer, list);
-    list_del(&buf->list);
-    v->active = buf;
-    spin_unlock_irqrestore(&v->irq_lock, flags);
-    pr_debug("arm_next(ch=%u): picked buffer %p\n", ch, buf);
-
-    /* Publish descriptor(s) before doorbell/MMIO kicks. */
-    wmb();
-
-    /* Avoid MMIO during suspend */
-    if (unlikely(READ_ONCE(hws->suspended))) {
-        pr_debug("arm_next(ch=%u): suspended after pick\n", ch);
-        return -EBUSY;
-    }
-
-    hws_program_video_from_vb2(hws, ch, &buf->vb.vb2_buf);
-    
-    /* Also program the DMA address register directly */
-    {
-        dma_addr_t dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-        iowrite32(lower_32_bits(dma_addr), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
-        /* Ensure DMA is ready for device access */
-        dma_sync_single_for_device(&hws->pdev->dev, dma_addr, 
-                                  vb2_plane_size(&buf->vb.vb2_buf, 0), 
-                                  DMA_FROM_DEVICE);
-    }
-    
-    pr_debug("arm_next(ch=%u): programmed buffer %p\n", ch, buf);
-    return 0;
+	spin_lock_irqsave(&v->irq_lock, flags);
+	if (!v->active && !list_empty(&v->capture_queue)) {
+		buf = list_first_entry(&v->capture_queue,
+					struct hwsvideo_buffer, list);
+		list_del_init(&buf->list);
+		if (v->queued_count)
+			v->queued_count--;
+		buf->slot = 0;
+		v->active = buf;
+		WRITE_ONCE(v->ring_first_half_copied, false);
+	}
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 }
+
 
 void hws_bh_video(struct tasklet_struct *t)
 {
-    struct hws_video *v = from_tasklet(v, t, bh_tasklet);
-    struct hws_pcie_dev *hws = v->parent;
-    unsigned int ch = v->channel_index;
-    struct hwsvideo_buffer *done;
+	struct hws_video *v = from_tasklet(v, t, bh_tasklet);
+	struct hws_pcie_dev *hws = v->parent;
+	struct device *dev = &hws->pdev->dev;
+	unsigned int ch = v->channel_index;
+	unsigned long flags;
+	struct hwsvideo_buffer *buf;
+	u8 *dst;
 
-    pr_debug("bh_video(ch=%u): stop=%d cap=%d active=%p\n",
-             ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active), v->active);
+	if (unlikely(READ_ONCE(hws->suspended)))
+		return;
 
-    int ret;
-    pr_debug("bh_video(ch=%u): entry stop=%d cap=%d\n", ch, v->stop_requested, v->cap_active);
-    if (unlikely(READ_ONCE(hws->suspended)))
-        return;
+	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
+		return;
 
-    if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
-        return;
+	spin_lock_irqsave(&v->irq_lock, flags);
+	buf = v->active;
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 
-    /* 1) Complete the buffer the HW just finished (if any) */
-    done = v->active;
-    if (done) {
-        struct vb2_v4l2_buffer *vb2v = &done->vb;
+	if (!buf) {
+		WRITE_ONCE(v->ring_first_half_copied, false);
+		WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
+		hws_arm_next(hws, ch);
+		return;
+	}
 
-        dma_rmb(); /* device writes visible before userspace sees it */
+	dst = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+	if (dst && v->ring_cpu && v->ring_bytes) {
+		memcpy(dst, v->ring_cpu, v->ring_bytes);
+	} else {
+		dev_warn_ratelimited(dev,
+			"ch%u: unable to copy frame (dst=%p ring_cpu=%p bytes=%u)\n",
+			ch, dst, v->ring_cpu, v->ring_bytes);
+	}
 
-        vb2v->sequence = ++v->sequence_number;          /* BH-only increment */
-        vb2v->vb2_buf.timestamp = ktime_get_ns();
-        pr_debug("bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
-                 ch, done, vb2v->sequence, v->half_seen, v->last_buf_half_toggle);
+	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, v->pix.sizeimage);
+	buf->vb.sequence = ++v->sequence_number;
+	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	WRITE_ONCE(v->ring_first_half_copied, false);
+	WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
 
+	spin_lock_irqsave(&v->irq_lock, flags);
+	if (!list_empty(&v->capture_queue)) {
+		struct hwsvideo_buffer *next =
+			list_first_entry(&v->capture_queue,
+					 struct hwsvideo_buffer, list);
+		list_del_init(&next->list);
+		if (v->queued_count)
+			v->queued_count--;
+		next->slot = 0;
+		v->active = next;
+	} else {
+		v->active = NULL;
+	}
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 
-        v->active = NULL; /* channel no longer owns this buffer */
-        vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
-    }
-
-    if (unlikely(READ_ONCE(hws->suspended)))
-        return;
-
-    /* 2) Immediately arm the next queued buffer (if present) */
-    ret = hws_arm_next(hws, ch);
-    if (ret == -EAGAIN) {
-        pr_debug("bh_video(ch=%u): no queued buffer to arm\n", ch);
-        return;
-    }
-    pr_debug("bh_video(ch=%u): armed next buffer, active=%p\n", ch, v->active);
-    /* On success the engine now points at v->active’s DMA address */
+	hws_arm_next(hws, ch);
+	hws_set_dma_doorbell(hws, ch, v->ring_dma, "bh_ring");
 }
 
 
@@ -161,13 +141,14 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
             ack_mask |= vbit;
             /* Always schedule BH while streaming; don't gate on toggle bit */
-            if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
+			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
                        !READ_ONCE(pdx->video[ch].stop_requested))) {
                 /* Optional: snapshot toggle for debug visibility */
                 u32 toggle = readl(pdx->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
                 dma_rmb(); /* ensure DMA writes visible before we inspect */
                 WRITE_ONCE(pdx->video[ch].half_seen, true);
                 WRITE_ONCE(pdx->video[ch].last_buf_half_toggle, toggle);
+                WRITE_ONCE(pdx->video[ch].ring_toggle_hw, toggle);
                 pr_debug("irq: VDONE ch=%u toggle=%u scheduling BH (cap=%d)\n",
                          ch, toggle, pdx->video[ch].cap_active);
                 tasklet_schedule(&pdx->video[ch].bh_tasklet);

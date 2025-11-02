@@ -107,10 +107,17 @@ struct hws_video {
 	dma_addr_t               ring_dma;
 	void                    *ring_cpu;
 	size_t                   ring_size;
+	u32                      ring_bytes;
+	u32                      half_bytes;
+	void                    *half_cpu[2];
+	dma_addr_t               half_dma[2];
 	u32                      ring_toggle_prev;
 	u32                      ring_toggle_hw;
 	bool                     ring_first_half_copied;
 	unsigned long            ring_last_toggle_jiffies;
+	u32                      ring_frame_bytes;
+	u32                      dma_slot;
+	bool                     ring_ready;
 	u32                      queued_count;
 
 	/* ───── misc counters ───── */
