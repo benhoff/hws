@@ -160,6 +160,7 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	struct hwsvideo_buffer *buf = NULL, *next = NULL;
 	bool ring_mode;
 	bool have_next = false;
+	bool doorbell = false;
 
 	if (!v)
 		return false;
@@ -198,25 +199,40 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	WRITE_ONCE(v->ring_toggle_hw, 0);
 	if (!buf)
 		return false;
-	/* Complete buffer with an error state to signal loss to userspace. */
+	/* Complete buffer with a neutral frame so dequeuers keep running. */
 	{
 		struct vb2_v4l2_buffer *vb2v = &buf->vb;
+		void *dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
 
-		vb2_set_plane_payload(&vb2v->vb2_buf, 0, 0);
-		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
+		if (dst)
+			memset(dst, 0x10, v->pix.sizeimage);
+		vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
+		vb2v->sequence = ++v->sequence_number;
+		vb2v->vb2_buf.timestamp = ktime_get_ns();
+		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 	WRITE_ONCE(v->ring_first_half_copied, false);
 	WRITE_ONCE(v->ring_last_toggle_jiffies, jiffies);
-	if (ring_mode) {
-		wmb(); /* ensure ring descriptors visible before doorbell */
+	if (ring_mode && v->ring_cpu) {
+		hws_program_dma_window(v, v->ring_dma);
 		hws_set_dma_doorbell(hws, v->channel_index, v->ring_dma,
 				     tag ? tag : "nosignal_ring");
+		doorbell = true;
 	} else if (have_next && next) {
 		dma_addr_t dma =
 		    vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
-		wmb(); /* ensure DMA address published before doorbell */
+		hws_program_dma_for_addr(hws, v->channel_index, dma);
 		hws_set_dma_doorbell(hws, v->channel_index, dma,
 				     tag ? tag : "nosignal_zero");
+		doorbell = true;
+	} else if (ring_mode && !v->ring_cpu) {
+		dev_warn(&hws->pdev->dev,
+			 "nosignal: ch%u ring buffer missing, cannot doorbell\n",
+			 v->channel_index);
+	}
+	if (doorbell) {
+		wmb(); /* ensure descriptors visible before enabling capture */
+		hws_enable_video_capture(hws, v->channel_index, true);
 	}
 	return true;
 }
@@ -454,54 +470,6 @@ void hws_program_dma_for_addr(struct hws_pcie_dev *hws, unsigned int ch,
 	hws_program_dma_window(vid, dma);
 }
 
-static inline u32 hws_read_port_hpd(struct hws_pcie_dev *hws, unsigned int port)
-{
-	u32 v0, v1;
-	unsigned int pipe0, pipe1;
-
-	if (!hws || !hws->bar0_base)
-		return 0;
-
-	/* Each HDMI jack uses two pipes: 2*port and 2*port+1.
-	 * Use cur_max_video_ch since it reflects the active HW config.
-	 */
-	pipe0 = port * 2;
-	pipe1 = pipe0 + 1;
-	if (pipe1 >= hws->cur_max_video_ch)
-		return 0;
-
-	v0 = readl(hws->bar0_base + HWS_REG_HPD(pipe0));
-	v1 = readl(hws->bar0_base + HWS_REG_HPD(pipe1));
-
-	/* Treat all-ones as device-gone and avoid propagating garbage. */
-	if (unlikely(v0 == 0xFFFFFFFF || v1 == 0xFFFFFFFF)) {
-		hws->pci_lost = true;
-		return 0;
-	}
-
-	return v0 | v1;
-}
-
-static int check_video_capture(struct hws_pcie_dev *hws, unsigned int ch)
-{
-	u32 status;
-
-	if (!hws || !hws->bar0_base)
-		return -ENODEV;
-	if (ch >= hws->max_channels)
-		return -EINVAL;
-
-	status = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
-
-	/* Common pattern for a dead/removed PCIe device */
-	if (unlikely(status == 0xFFFFFFFF)) {
-		hws->pci_lost = true;
-		return -ENODEV;
-	}
-
-	return !!(status & BIT(ch));
-}
-
 void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 			      bool on)
 {
@@ -691,10 +659,6 @@ void check_video_format(struct hws_pcie_dev *pdx)
 	int i;
 
 	for (i = 0; i < pdx->cur_max_video_ch; i++) {
-		// FIXME: I don't think this works?
-		// if (!update_hpd_status(pdx, ch))
-		//    return 1;                         /* no +5 V / HPD */
-
 		if (!hws_update_active_interlace(pdx, i)) {
 			// return 1;                         /* no active video */
 			if (pdx->video[i].signal_loss_cnt == 0)
@@ -744,16 +708,6 @@ static inline void hws_write_if_diff(struct hws_pcie_dev *hws, u32 reg_off,
 		/* Post the write on some bridges / enforce ordering. */
 		(void)readl(addr);
 	}
-}
-
-static bool update_hpd_status(struct hws_pcie_dev *pdx, unsigned int ch)
-{
-	u32 hpd = hws_read_port_hpd(pdx, ch);	/* jack-level status   */
-	bool power = !!(hpd & HWS_5V_BIT);	/* +5 V present        */
-	bool hpd_hi = !!(hpd & HWS_HPD_BIT);	/* HPD line asserted   */
-
-	/* “Signal present” means *both* rails up. Tweak if your HW differs. */
-	return power && hpd_hi;
 }
 
 static bool hws_update_active_interlace(struct hws_pcie_dev *pdx,
