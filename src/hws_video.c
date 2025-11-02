@@ -53,8 +53,10 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 
 static bool hws_use_ring(struct hws_video *vid)
 {
-	/* Use ring buffer approach for legacy hardware compatibility */
-	return true;
+	if (!vid)
+		return false;
+
+	return READ_ONCE(vid->prefer_ring);
 }
 
 static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
@@ -299,6 +301,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->ring_first_half_copied = false;
 	vid->ring_last_toggle_jiffies = jiffies;
 	vid->queued_count = 0;
+	vid->prefer_ring = true;
 
 	/* default format (adjust to your HW) */
 	vid->pix.width = 1920;
@@ -1126,6 +1129,8 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 			HWS_MAX_BUFS);
 		return -ENOBUFS;	/* or -ENOMEM; either is fine for CREATE_BUFS clamp */
 	}
+
+	WRITE_ONCE(vid->prefer_ring, have + *num_buffers > 2);
 	return 0;
 }
 

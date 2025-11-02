@@ -111,6 +111,7 @@ struct hws_video {
 	bool ring_first_half_copied;
 	unsigned long ring_last_toggle_jiffies;
 	u32 queued_count;
+	bool prefer_ring;
 
 	/* ───── misc counters ───── */
 	int signal_loss_cnt;
