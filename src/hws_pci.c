@@ -356,9 +356,18 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		return dev_err_probe(&pdev->dev, ret, "pcim_iomap_regions BAR0\n");
 	hws->bar0_base = pcim_iomap_table(pdev)[0];
 
-	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret, "No 32-bit DMA support\n");
+	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (ret) {
+		dev_warn(&pdev->dev,
+			 "64-bit DMA mask unavailable, falling back to 32-bit (%d)\n",
+			 ret);
+		ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "No suitable DMA configuration\n");
+	} else {
+		dev_dbg(&pdev->dev, "Using 64-bit DMA mask\n");
+	}
 
 	/* 3) Optional PCIe tuning (same as before) */
 	enable_pcie_relaxed_ordering(pdev);
