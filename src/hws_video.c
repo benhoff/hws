@@ -1096,6 +1096,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_querybuf = vb2_ioctl_querybuf,
 	.vidioc_qbuf = vb2_ioctl_qbuf,
 	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_expbuf = vb2_ioctl_expbuf,
 	.vidioc_streamon = vb2_ioctl_streamon,
 	.vidioc_streamoff = vb2_ioctl_streamoff,
 
@@ -1154,13 +1155,14 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
         if (*nplanes != 1)
             return -EINVAL;
         if (!sizes[0])
-            sizes[0] = need_min;            // publish minimal, not page-aligned
+            sizes[0] = need_alloc;
         if (sizes[0] < need_min)
             return -EINVAL;
+        sizes[0] = max_t(unsigned int, sizes[0], need_alloc);
         vid->alloc_sizeimage = need_alloc;  // keep internal aligned size
     } else {
         *nplanes = 1;
-        sizes[0] = need_min;                // report minimal requirement
+        sizes[0] = need_alloc;
         vid->alloc_sizeimage = need_alloc;
     }
 
@@ -1190,24 +1192,34 @@ static int hws_buffer_prepare(struct vb2_buffer *vb)
 	dma_addr_t dma_addr;
 
 	if (vb2_plane_size(vb, 0) < need)
+	{
+		dev_err(&hws->pdev->dev,
+		        "QBUF reject: userspace payload %u < required %zu (sizeimage=%zu)\n",
+		        vb2_plane_size(vb, 0), need, vid->pix.sizeimage);
 		return -EINVAL;
+	}
 
 	/* Validate DMA address alignment */
 	dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
 	if (dma_addr & 0x3F) { /* 64-byte alignment required */
-		dev_err(&hws->pdev->dev, "Buffer DMA address 0x%llx not 64-byte aligned\n", 
-		        (unsigned long long)dma_addr);
+		dev_err(&hws->pdev->dev,
+		        "QBUF reject: DMA addr 0x%llx not 64-byte aligned (need=%zu sizeimage=%zu)\n",
+		        (unsigned long long)dma_addr, need, vid->pix.sizeimage);
 		return -EINVAL;
 	}
 
 	/* Check if buffer is in valid DMA range */
 	if (dma_addr + need > DMA_BIT_MASK(32)) {
-		dev_err(&hws->pdev->dev, "Buffer DMA address 0x%llx exceeds 32-bit range\n",
-		        (unsigned long long)dma_addr);
+		dev_err(&hws->pdev->dev,
+		        "QBUF reject: DMA addr 0x%llx + size %zu exceeds 32-bit range\n",
+		        (unsigned long long)dma_addr, need);
 		return -EINVAL;
 	}
 
 	vb2_set_plane_payload(vb, 0, need);
+	dev_dbg(&hws->pdev->dev,
+	        "QBUF accept: DMA addr 0x%llx size %zu (sizeimage=%zu aligned=%zu)\n",
+	        (unsigned long long)dma_addr, need, vid->pix.sizeimage, vid->alloc_sizeimage);
 	return 0;
 }
 
