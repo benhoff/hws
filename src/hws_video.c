@@ -317,7 +317,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->ring_first_half_copied = false;
 	vid->ring_last_toggle_jiffies = jiffies;
 	vid->queued_count = 0;
-	vid->prefer_ring = true;
+	vid->prefer_ring = false;
 
 	/* default format (adjust to your HW) */
 	vid->pix.width = 1920;
@@ -1085,7 +1085,7 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 		return -ENOBUFS;	/* or -ENOMEM; either is fine for CREATE_BUFS clamp */
 	}
 
-	WRITE_ONCE(vid->prefer_ring, have + *num_buffers > 2);
+	WRITE_ONCE(vid->prefer_ring, false);
 	return 0;
 }
 
@@ -1206,7 +1206,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (!v->active && !list_empty(&v->capture_queue)) {
 		to_program = list_first_entry(&v->capture_queue,
 					      struct hwsvideo_buffer, list);
-		list_del(&to_program->list);
+		list_del_init(&to_program->list);
 		v->queued_count--;
 		v->active = to_program;
 		prog_vb2 = &to_program->vb.vb2_buf;
@@ -1485,7 +1485,7 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 			struct hwsvideo_buffer *b =
 			    list_first_entry(&ch->capture_queue,
 					     struct hwsvideo_buffer, list);
-			list_del(&b->list);
+			list_del_init(&b->list);
 			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 		}
 
