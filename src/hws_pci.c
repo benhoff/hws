@@ -161,11 +161,28 @@ static void hws_free_irq_vectors_action(void *data)
 	pci_free_irq_vectors((struct pci_dev *)data);
 }
 
+static bool hws_any_capture_active(const struct hws_pcie_dev *pdx)
+{
+	unsigned int ch, max;
+
+	if (!pdx)
+		return false;
+
+	max = READ_ONCE(pdx->cur_max_video_ch);
+	if (max > pdx->max_channels)
+		max = pdx->max_channels;
+
+	for (ch = 0; ch < max; ch++) {
+		if (READ_ONCE(pdx->video[ch].cap_active))
+			return true;
+	}
+
+	return false;
+}
+
 static int main_ks_thread_handle(void *data)
 {
 	struct hws_pcie_dev *pdx = data;
-	int i;
-	bool need_check;
 
 	set_freezable();
 
@@ -177,17 +194,7 @@ static int main_ks_thread_handle(void *data)
 			continue;
 		}
 
-		need_check = false;
-
-		/* See if any channel is running */
-		for (i = 0; i < pdx->max_channels; i++) {
-			if (pdx->video[i].cap_active) {
-				need_check = true;
-				break;
-			}
-		}
-
-		if (need_check)
+		if (hws_any_capture_active(pdx))
 			/* avoid MMIO when suspended (guarded above) */
 			check_video_format(pdx);
 
