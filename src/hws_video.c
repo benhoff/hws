@@ -79,19 +79,39 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 	u32 pci_addr = lo & addr_low_mask;	// low 29 bits inside 512MB window
 	u32 page_lo = lo & addr_mask;	// bits 31..29 only (page bits)
 
-	/* Remap entry: HI then page_LO (legacy order) */
-	writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-	writel(page_lo,
-	       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-	       PCIE_BARADDROFSIZE);
+	bool wrote = false;
 
-	/* Program per-channel base and half-size */
-	writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-	       hws->bar0_base + HWS_BUF_BASE_OFF(ch));
+	/* Remap entry only when DMA crosses into a new 512 MB page */
+	if (!vid->window_valid || vid->last_dma_hi != hi ||
+	    vid->last_dma_page != page_lo) {
+		writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
+		writel(page_lo,
+		       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
+		       PCIE_BARADDROFSIZE);
+		vid->last_dma_hi = hi;
+		vid->last_dma_page = page_lo;
+		wrote = true;
+	}
 
-	writel(vid->pix.half_size / 16, hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+	/* Base pointer only needs low 29 bits */
+	if (!vid->window_valid || vid->last_pci_addr != pci_addr) {
+		writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
+		       hws->bar0_base + HWS_BUF_BASE_OFF(ch));
+		vid->last_pci_addr = pci_addr;
+		wrote = true;
+	}
 
-	if (unlikely(dma_window_verify)) {
+	/* Half-size only changes when resolution changes */
+	if (!vid->window_valid || vid->last_half16 != vid->pix.half_size / 16) {
+		writel(vid->pix.half_size / 16,
+		       hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+		vid->last_half16 = vid->pix.half_size / 16;
+		wrote = true;
+	}
+
+	vid->window_valid = true;
+
+	if (unlikely(dma_window_verify) && wrote) {
 		u32 r_hi =
 		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
 		u32 r_lo =
@@ -105,7 +125,7 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 			ch, r_hi, r_lo, page_lo, r_base,
 			(ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half,
 			vid->pix.half_size / 16);
-	} else {
+	} else if (wrote) {
 		/* Flush posted writes before arming DMA */
 		readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
 	}
@@ -365,6 +385,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->ring_last_toggle_jiffies = jiffies;
 	vid->queued_count = 0;
 	vid->prefer_ring = false;
+	vid->window_valid = false;
 
 	/* default format (adjust to your HW) */
 	vid->pix.width = 1920;
@@ -903,6 +924,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	v->pix.interlaced = interlaced;
 
 	new_size = hws_calc_sizeimage(v, w, h, interlaced);
+	v->window_valid = false;
 
 	/* Notify listeners that the resolution changed whenever we have
 	 * an active queue, regardless of whether we can continue streaming

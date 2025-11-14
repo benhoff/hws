@@ -114,6 +114,11 @@ struct hws_video {
 	unsigned long ring_last_toggle_jiffies;
 	u32 queued_count;
 	bool prefer_ring;
+	bool window_valid;
+	u32 last_dma_hi;
+	u32 last_dma_page;
+	u32 last_pci_addr;
+	u32 last_half16;
 
 	/* ───── misc counters ───── */
 	int signal_loss_cnt;

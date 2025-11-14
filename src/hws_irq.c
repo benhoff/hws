@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/compiler.h>
+#include <linux/moduleparam.h>
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
@@ -13,6 +14,11 @@
 #include "hws_audio.h"
 
 #define MAX_INT_LOOPS 100
+
+static bool hws_toggle_debug;
+module_param_named(toggle_debug, hws_toggle_debug, bool, 0644);
+MODULE_PARM_DESC(toggle_debug,
+		 "Read toggle registers in IRQ handler for debug logging");
 
 static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 {
@@ -112,14 +118,10 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	done = v->active;
-	if (done) {
-		if (v->next_prepared) {
-			v->active = v->next_prepared;
-			v->next_prepared = NULL;
-			promoted = true;
-		} else {
-			v->active = NULL;
-		}
+	if (done && v->next_prepared) {
+		v->active = v->next_prepared;
+		v->next_prepared = NULL;
+		promoted = true;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
@@ -136,7 +138,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			ch, done, vb2v->sequence, v->half_seen,
 			v->last_buf_half_toggle);
 
-		v->active = NULL;	/* channel no longer owns this buffer */
+		if (!promoted)
+			v->active = NULL;	/* channel no longer owns this buffer */
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
@@ -211,17 +214,20 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			/* Always schedule BH while streaming; don't gate on toggle bit */
 				if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
 					   !READ_ONCE(pdx->video[ch].stop_requested))) {
-					/* Optional: snapshot toggle for debug visibility */
-					u32 toggle =
-					    readl(pdx->bar0_base +
-						  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-				dma_rmb();	/* ensure DMA writes visible before we inspect */
-				WRITE_ONCE(pdx->video[ch].half_seen, true);
+			if (unlikely(hws_toggle_debug)) {
+				/* Optional: snapshot toggle for debug visibility */
+				u32 toggle =
+				    readl(pdx->bar0_base +
+					  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
 				WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
 					   toggle);
+			}
+			dma_rmb();	/* ensure DMA writes visible before we inspect */
+			WRITE_ONCE(pdx->video[ch].half_seen, true);
 					dev_dbg(&pdx->pdev->dev,
 						"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
-						ch, toggle,
+						ch,
+						READ_ONCE(pdx->video[ch].last_buf_half_toggle),
 						READ_ONCE(pdx->video[ch].cap_active));
 					hws_video_handle_vdone(&pdx->video[ch]);
 			} else {
@@ -246,10 +252,10 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			    !READ_ONCE(pdx->audio[ch].stream_running))
 				continue;
 
-			/* If your HW exposes a 0/1 toggle, read it (optional) */
-			pdx->audio[ch].last_period_toggle =
-			    readl(pdx->bar0_base +
-				  HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+			if (unlikely(hws_toggle_debug))
+				pdx->audio[ch].last_period_toggle =
+				    readl(pdx->bar0_base +
+					  HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 
 			/* Make device writes visible before notifying ALSA */
 			dma_rmb();
