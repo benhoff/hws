@@ -70,9 +70,6 @@ struct hws_video {
 	/* ───── indices ───── */
 	int channel_index;
 
-	/* ───── async helpers ───── */
-	struct tasklet_struct bh_tasklet;
-
 	/* ───── colour controls ───── */
 	int current_brightness;
 	int current_contrast;

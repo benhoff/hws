@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/bits.h>
 #include <linux/jiffies.h>
+#include <linux/interrupt.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -301,9 +302,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->sequence_number = 0;
 	vid->active = NULL;
 
-	/* typed tasklet: bind handler once */
-	tasklet_setup(&vid->bh_tasklet, hws_bh_video);
-
 	/* DMA watchdog removed; retain counters for diagnostics */
 	vid->timeout_count = 0;
 	vid->error_count = 0;
@@ -397,8 +395,9 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	WRITE_ONCE(vid->stop_requested, true);
 	WRITE_ONCE(vid->cap_active, false);
 
-	/* 3) Make sure the tasklet can’t run anymore (prevents races with drain) */
-	tasklet_kill(&vid->bh_tasklet);
+	/* 3) Ensure the IRQ handler finished any in-flight completions */
+	if (vid->parent && vid->parent->irq >= 0)
+		synchronize_irq(vid->parent->irq);
 
 	/* 4) Drain SW capture queue & in-flight under lock */
 	spin_lock_irqsave(&vid->irq_lock, flags);
@@ -821,17 +820,18 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	WRITE_ONCE(v->stop_requested, true);
 	WRITE_ONCE(v->cap_active, false);
-	/* Publish software stop first so the hardirq/BH see the stop before
-	 * we touch MMIO or the lists. Pairs with READ_ONCE() checks in
-	 * hws_bh_video() and hws_arm_next(). Required to prevent the BH/ISR
-	 * from completing/arming buffers while we are changing modes.
+	/* Publish software stop first so the IRQ completion path sees the stop
+	 * before we touch MMIO or the lists. Pairs with READ_ONCE() checks in the
+	 * VDONE handler and hws_arm_next() to prevent completions while modes
+	 * change.
 	 */
 	smp_wmb();
 
 	hws_enable_video_capture(pdx, ch, false);
 	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
 
-	tasklet_kill(&v->bh_tasklet);
+	if (v->parent && v->parent->irq >= 0)
+		synchronize_irq(v->parent->irq);
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->active) {
@@ -855,16 +855,25 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	new_size = hws_calc_sizeimage(v, w, h, interlaced);
 
-	/* If buffers are smaller than new requirement, signal src-change & error the queue */
-	if (vb2_is_busy(&v->buffer_queue) && new_size > v->alloc_sizeimage) {
+	/* Notify listeners that the resolution changed whenever we have
+	 * an active queue, regardless of whether we can continue streaming
+	 * with the existing buffers. This ensures user space sees a source
+	 * change event instead of an empty queue (VIDIOC_DQEVENT -> -ENOENT).
+	 */
+	if (vb2_is_busy(&v->buffer_queue)) {
 		struct v4l2_event ev = {
 			.type = V4L2_EVENT_SOURCE_CHANGE,
 		};
 		ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
-
 		v4l2_event_queue(v->video_device, &ev);
-		vb2_queue_error(&v->buffer_queue);
-		return;
+
+		/* If buffers are smaller than new requirement, error the queue
+		 * so users re-request buffers before we restart streaming.
+		 */
+		if (new_size > v->alloc_sizeimage) {
+			vb2_queue_error(&v->buffer_queue);
+			return;
+		}
 	}
 
 	/* Program HW with new resolution */
@@ -904,7 +913,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	WRITE_ONCE(v->stop_requested, false);
 	WRITE_ONCE(v->cap_active, true);
 	/* Publish stop_requested/cap_active before HW disable; pairs with
-	 * BH/ISR reads in hws_bh_video/hws_arm_next.
+	 * BH/ISR reads in the VDONE handler/hws_arm_next.
 	 */
 	smp_wmb();
 	wmb(); /* ensure DMA window/address writes visible before enable */

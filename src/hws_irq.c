@@ -83,9 +83,8 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	return 0;
 }
 
-void hws_bh_video(struct tasklet_struct *t)
+static void hws_video_handle_vdone(struct hws_video *v)
 {
-	struct hws_video *v = from_tasklet(v, t, bh_tasklet);
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
 	struct hwsvideo_buffer *done;
@@ -183,21 +182,21 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 			ack_mask |= vbit;
 			/* Always schedule BH while streaming; don't gate on toggle bit */
-			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
-				   !READ_ONCE(pdx->video[ch].stop_requested))) {
-				/* Optional: snapshot toggle for debug visibility */
-				u32 toggle =
-				    readl(pdx->bar0_base +
-					  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+				if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
+					   !READ_ONCE(pdx->video[ch].stop_requested))) {
+					/* Optional: snapshot toggle for debug visibility */
+					u32 toggle =
+					    readl(pdx->bar0_base +
+						  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
 				dma_rmb();	/* ensure DMA writes visible before we inspect */
 				WRITE_ONCE(pdx->video[ch].half_seen, true);
 				WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
 					   toggle);
-				dev_dbg(&pdx->pdev->dev,
-					"irq: VDONE ch=%u toggle=%u scheduling BH (cap=%d)\n",
-					ch, toggle,
-					READ_ONCE(pdx->video[ch].cap_active));
-				tasklet_schedule(&pdx->video[ch].bh_tasklet);
+					dev_dbg(&pdx->pdev->dev,
+						"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
+						ch, toggle,
+						READ_ONCE(pdx->video[ch].cap_active));
+					hws_video_handle_vdone(&pdx->video[ch]);
 			} else {
 				dev_dbg(&pdx->pdev->dev,
 					"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",

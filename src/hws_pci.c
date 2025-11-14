@@ -568,10 +568,6 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 	/* Let any in-flight DMAs finish (best-effort). */
 	(void)hws_check_busy(hws);
 
-	/* Kill video tasklets to avoid late BH completions. */
-	for (i = 0; i < hws->cur_max_video_ch; ++i)
-		tasklet_kill(&hws->video[i].bh_tasklet);
-
 	/* Ack any latched VDONE/ADONE. */
 	for (i = 0; i < hws->cur_max_video_ch; ++i)
 		ackmask |= HWS_INT_VDONE_BIT(i);

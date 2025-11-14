@@ -7,8 +7,5 @@
 
 irqreturn_t hws_irq_handler(int irq, void *info);
 void hws_dpc_audio(unsigned long data);
-void hws_bh_video(struct tasklet_struct *t);
-
 
 #endif /* HWS_INTERRUPT_H */
-
