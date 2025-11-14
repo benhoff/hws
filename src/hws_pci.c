@@ -194,9 +194,8 @@ static int main_ks_thread_handle(void *data)
 			continue;
 		}
 
-		if (hws_any_capture_active(pdx))
-			/* avoid MMIO when suspended (guarded above) */
-			check_video_format(pdx);
+		/* avoid MMIO when suspended (guarded above) */
+		check_video_format(pdx);
 
 		try_to_freeze(); /* cooperate with freezer each loop */
 

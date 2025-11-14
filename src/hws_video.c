@@ -9,6 +9,7 @@
 #include <linux/jiffies.h>
 #include <linux/interrupt.h>
 #include <linux/moduleparam.h>
+#include <linux/sysfs.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -53,6 +54,59 @@ static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
 hws_take_queued_buffer_locked(struct hws_video *vid);
+
+#if IS_ENABLED(CONFIG_SYSFS)
+static ssize_t resolution_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct video_device *vdev = to_video_device(dev);
+	struct hws_video *vid = video_get_drvdata(vdev);
+	struct hws_pcie_dev *hws;
+	u32 res_reg;
+	u16 w, h;
+	bool interlaced;
+
+	if (!vid)
+		return -ENODEV;
+
+	hws = vid->parent;
+	if (!hws || !hws->bar0_base)
+		return sysfs_emit(buf, "unknown\n");
+
+	res_reg = readl(hws->bar0_base + HWS_REG_IN_RES(vid->channel_index));
+	if (!res_reg || res_reg == 0xFFFFFFFF)
+		return sysfs_emit(buf, "unknown\n");
+
+	w = res_reg & 0xFFFF;
+	h = (res_reg >> 16) & 0xFFFF;
+
+	interlaced =
+	    !!(readl(hws->bar0_base + HWS_REG_ACTIVE_STATUS) &
+	       BIT(8 + vid->channel_index));
+
+	return sysfs_emit(buf, "%ux%u%s\n", w, h, interlaced ? "i" : "p");
+}
+static DEVICE_ATTR_RO(resolution);
+
+static inline int hws_resolution_create(struct video_device *vdev)
+{
+	return device_create_file(&vdev->dev, &dev_attr_resolution);
+}
+
+static inline void hws_resolution_remove(struct video_device *vdev)
+{
+	device_remove_file(&vdev->dev, &dev_attr_resolution);
+}
+#else
+static inline int hws_resolution_create(struct video_device *vdev)
+{
+	return 0;
+}
+
+static inline void hws_resolution_remove(struct video_device *vdev)
+{
+}
+#endif
 
 static bool dma_window_verify;
 module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
@@ -1531,6 +1585,15 @@ int hws_video_register(struct hws_pcie_dev *dev)
 				ret);
 			goto err_unwind;
 		}
+
+		ret = hws_resolution_create(vdev);
+		if (ret) {
+			dev_err(&dev->pdev->dev,
+				"device_create_file(resolution) ch%u failed: %d\n",
+				i, ret);
+			video_unregister_device(vdev);
+			goto err_unwind;
+		}
 	}
 
 	return 0;
@@ -1539,6 +1602,8 @@ err_unwind:
 	for (i = i - 1; i >= 0; i--) {
 		struct hws_video *ch = &dev->video[i];
 
+		if (video_is_registered(ch->video_device))
+			hws_resolution_remove(ch->video_device);
 		if (video_is_registered(ch->video_device))
 			video_unregister_device(ch->video_device);
 
@@ -1566,6 +1631,9 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
 		unsigned long flags;
+
+		if (ch->video_device)
+			hws_resolution_remove(ch->video_device);
 
 		/* 1) Stop hardware capture for this channel (if running). */
 		if (ch->cap_active)
