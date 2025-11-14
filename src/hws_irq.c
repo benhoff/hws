@@ -86,6 +86,9 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 
 	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): programmed buffer %p\n", ch,
 		buf);
+	spin_lock_irqsave(&v->irq_lock, flags);
+	hws_prime_next_locked(v, hws_use_ring(v));
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 	return 0;
 }
 
@@ -172,7 +175,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 irqreturn_t hws_irq_handler(int irq, void *info)
 {
 	struct hws_pcie_dev *pdx = info;
-	u32 int_state, ack_mask = 0;
+	u32 int_state;
 
 	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
 	if (likely(pdx->bar0_base)) {
@@ -184,16 +187,16 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 	/* Fast path: if suspended, quietly ack and exit */
 	if (unlikely(READ_ONCE(pdx->suspended))) {
-		int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		if (int_state) {
 			writel(int_state, pdx->bar0_base + HWS_REG_INT_STATUS);
-			(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
 		return int_state ? IRQ_HANDLED : IRQ_NONE;
 	}
 	// u32 sys_status = readl(pdx->bar0_base + HWS_REG_SYS_STATUS);
 
-	int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+	int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 	if (!int_state || int_state == 0xFFFFFFFF) {
 		dev_dbg(&pdx->pdev->dev,
 			"irq: spurious or device-gone int_state=0x%08x\n",
@@ -210,26 +213,23 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			if (!(int_state & vbit))
 				continue;
 
-			ack_mask |= vbit;
-			/* Always schedule BH while streaming; don't gate on toggle bit */
-				if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
-					   !READ_ONCE(pdx->video[ch].stop_requested))) {
-			if (unlikely(hws_toggle_debug)) {
-				/* Optional: snapshot toggle for debug visibility */
-				u32 toggle =
-				    readl(pdx->bar0_base +
-					  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-				WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
-					   toggle);
-			}
-			dma_rmb();	/* ensure DMA writes visible before we inspect */
-			WRITE_ONCE(pdx->video[ch].half_seen, true);
-					dev_dbg(&pdx->pdev->dev,
-						"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
-						ch,
-						READ_ONCE(pdx->video[ch].last_buf_half_toggle),
-						READ_ONCE(pdx->video[ch].cap_active));
-					hws_video_handle_vdone(&pdx->video[ch]);
+			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
+			     !READ_ONCE(pdx->video[ch].stop_requested))) {
+				if (unlikely(hws_toggle_debug)) {
+					u32 toggle =
+					    readl_relaxed(pdx->bar0_base +
+						  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+					WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
+						   toggle);
+				}
+				dma_rmb();
+				WRITE_ONCE(pdx->video[ch].half_seen, true);
+				dev_dbg(&pdx->pdev->dev,
+					"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
+					ch,
+					READ_ONCE(pdx->video[ch].last_buf_half_toggle),
+					READ_ONCE(pdx->video[ch].cap_active));
+				hws_video_handle_vdone(&pdx->video[ch]);
 			} else {
 				dev_dbg(&pdx->pdev->dev,
 					"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
@@ -237,6 +237,9 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 					READ_ONCE(pdx->video[ch].cap_active),
 					READ_ONCE(pdx->video[ch].stop_requested));
 			}
+
+			writel(vbit, pdx->bar0_base + HWS_REG_INT_STATUS);
+			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
 
 		for (unsigned int ch = 0; ch < pdx->cur_max_linein_ch; ++ch) {
@@ -245,17 +248,18 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			if (!(int_state & abit))
 				continue;
 
-			ack_mask |= abit;
-
 			/* Only service running streams */
 			if (!READ_ONCE(pdx->audio[ch].cap_active) ||
-			    !READ_ONCE(pdx->audio[ch].stream_running))
+			    !READ_ONCE(pdx->audio[ch].stream_running)) {
+				writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
+				(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 				continue;
+			}
 
 			if (unlikely(hws_toggle_debug))
 				pdx->audio[ch].last_period_toggle =
-				    readl(pdx->bar0_base +
-					  HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+				    readl_relaxed(pdx->bar0_base +
+						  HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 
 			/* Make device writes visible before notifying ALSA */
 			dma_rmb();
@@ -268,11 +272,11 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 				ss = READ_ONCE(a->pcm_substream);
 				if (!ss)
-					continue;
+					goto ack_audio;
 
 				rt = READ_ONCE(ss->runtime);
 				if (!rt)
-					continue;
+					goto ack_audio;
 
 				/* Advance write pointer by exactly one period (frames). */
 				pos = READ_ONCE(a->ring_wpos_byframes);
@@ -288,18 +292,13 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 				/* Notify ALSA now that the hardware advanced. */
 				snd_pcm_period_elapsed(ss);
 			}
+ack_audio:
+			writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
+			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
 
-		/* Acknowledge (clear) all bits we just handled */
-		writel(ack_mask, pdx->bar0_base + HWS_REG_INT_STATUS);
-		(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS);
-		dev_dbg(&pdx->pdev->dev, "irq: ACK mask=0x%08x\n", ack_mask);
-
-		/* Immediately clear ack_mask to avoid re-acknowledging stale bits */
-		ack_mask = 0;
-
 		/* Re‐read in case new interrupt bits popped while processing */
-		int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		dev_dbg(&pdx->pdev->dev,
 			"irq: loop cnt=%u new INT_STATUS=0x%08x\n", cnt,
 			int_state);

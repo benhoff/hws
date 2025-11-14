@@ -127,7 +127,7 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 			vid->pix.half_size / 16);
 	} else if (wrote) {
 		/* Flush posted writes before arming DMA */
-		readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+		readl_relaxed(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
 	}
 }
 
