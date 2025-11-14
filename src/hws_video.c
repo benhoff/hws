@@ -8,6 +8,7 @@
 #include <linux/bits.h>
 #include <linux/jiffies.h>
 #include <linux/interrupt.h>
+#include <linux/moduleparam.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -52,6 +53,11 @@ static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 				 dma_addr_t dma, const char *tag);
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 
+static bool dma_window_verify;
+module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
+MODULE_PARM_DESC(dma_window_verify,
+		 "Read back DMA window registers after programming (debug)");
+
 static bool hws_use_ring(struct hws_video *vid)
 {
 	if (!vid)
@@ -82,23 +88,17 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 
 	/* Remap entry: HI then page_LO (legacy order) */
 	writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
 	writel(page_lo,
 	       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
 	       PCIE_BARADDROFSIZE);
-	(void)readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-		    PCIE_BARADDROFSIZE);
 
 	/* Program per-channel base and half-size */
 	writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
 	       hws->bar0_base + HWS_BUF_BASE_OFF(ch));
-	(void)readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
 
 	writel(vid->pix.half_size / 16, hws->bar0_base + HWS_HALF_SZ_OFF(ch));
-	(void)readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
 
-	/* Optional: verify and log */
-	{
+	if (unlikely(dma_window_verify)) {
 		u32 r_hi =
 		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
 		u32 r_lo =
@@ -108,9 +108,13 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 		u32 r_half = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
 
 		dev_dbg(&hws->pdev->dev,
-			"ch%u remap: hi=0x%08x(lo exp 0x%08x got 0x%08x) base=0x%08x exp=0x%08x half16B=0x%08x\n",
-			ch, r_hi, page_lo, r_lo, r_base,
-			(ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half);
+			"ch%u remap verify: hi=0x%08x page_lo=0x%08x exp_page=0x%08x base=0x%08x exp_base=0x%08x half16B=0x%08x exp_half=0x%08x\n",
+			ch, r_hi, r_lo, page_lo, r_base,
+			(ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half,
+			vid->pix.half_size / 16);
+	} else {
+		/* Flush posted writes before arming DMA */
+		readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
 	}
 }
 
