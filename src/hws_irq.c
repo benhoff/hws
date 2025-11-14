@@ -88,6 +88,9 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
 	struct hwsvideo_buffer *done;
+	unsigned long flags;
+	bool promoted = false;
+	bool ring_mode;
 
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): stop=%d cap=%d active=%p\n",
@@ -105,8 +108,22 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
 		return;
 
-	/* 1) Complete the buffer the HW just finished (if any) */
+	ring_mode = hws_use_ring(v);
+
+	spin_lock_irqsave(&v->irq_lock, flags);
 	done = v->active;
+	if (done) {
+		if (v->next_prepared) {
+			v->active = v->next_prepared;
+			v->next_prepared = NULL;
+			promoted = true;
+		} else {
+			v->active = NULL;
+		}
+	}
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+
+	/* 1) Complete the buffer the HW just finished (if any) */
 	if (done) {
 		struct vb2_v4l2_buffer *vb2v = &done->vb;
 
@@ -125,6 +142,16 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 	if (unlikely(READ_ONCE(hws->suspended)))
 		return;
+
+	if (promoted) {
+		dev_dbg(&hws->pdev->dev,
+			"bh_video(ch=%u): promoted pre-armed buffer active=%p\n",
+			ch, v->active);
+		spin_lock_irqsave(&v->irq_lock, flags);
+		hws_prime_next_locked(v, ring_mode);
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return;
+	}
 
 	/* 2) Immediately arm the next queued buffer (if present) */
 	ret = hws_arm_next(hws, ch);

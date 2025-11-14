@@ -3,6 +3,7 @@
 #define HWS_PCIE_H
 
 #include <linux/types.h>
+#include <linux/compiler.h>
 #include <linux/dma-mapping.h>
 #include <linux/kthread.h>
 #include <linux/pci.h>
@@ -46,12 +47,15 @@ struct hws_pix_state {
 
 struct hws_pcie_dev;
 struct hws_adapter;
+struct hws_video;
 
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
 	int slot;		/* for two-buffer approach */
 };
+
+static inline bool hws_use_ring(struct hws_video *vid);
 
 struct hws_video {
 	/* ───── linkage ───── */
@@ -61,6 +65,7 @@ struct hws_video {
 	struct vb2_queue buffer_queue;
 	struct list_head capture_queue;
 	struct hwsvideo_buffer *active;
+	struct hwsvideo_buffer *next_prepared;
 
 	/* ───── locking ───── */
 	struct mutex state_lock;	/* primary state */
@@ -113,6 +118,14 @@ struct hws_video {
 	/* ───── misc counters ───── */
 	int signal_loss_cnt;
 };
+
+static inline bool hws_use_ring(struct hws_video *vid)
+{
+	if (!vid)
+		return false;
+
+	return READ_ONCE(vid->prefer_ring);
+}
 
 struct hws_audio {
 	/* linkage */
