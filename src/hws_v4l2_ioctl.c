@@ -333,12 +333,9 @@ int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *c
 
 int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh, struct v4l2_fmtdesc *f)
 {
-	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
 	if (f->index != 0)
 		return -EINVAL; /* only one format */
 
-	strscpy(f->description, "YUYV 4:2:2", sizeof(f->description));
 	f->pixelformat = V4L2_PIX_FMT_YUYV;
 	return 0;
 }
