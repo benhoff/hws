@@ -274,23 +274,6 @@ int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 	return 0;
 }
 
-static int hws_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
-{
-	struct hws_video *vid =
-		container_of(ctrl->handler, struct hws_video, control_handler);
-	struct hws_pcie_dev *pdx = vid->parent;
-
-	switch (ctrl->id) {
-	case V4L2_CID_DV_RX_IT_CONTENT_TYPE:
-		// FIXME
-		// ctrl->val = hdmi_content_type(vid); /* unchanged */
-		return -EINVAL;
-
-	default:
-		return -EINVAL;
-	}
-}
-
 static int hws_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct hws_video *vid =
@@ -330,8 +313,7 @@ static int hws_s_ctrl(struct v4l2_ctrl *ctrl)
 }
 
 const struct v4l2_ctrl_ops hws_ctrl_ops = {
-	.s_ctrl          = hws_s_ctrl,
-	.g_volatile_ctrl = hws_g_volatile_ctrl,
+	.s_ctrl = hws_s_ctrl,
 };
 
 int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
