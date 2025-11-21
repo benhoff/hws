@@ -1587,60 +1587,14 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 
 	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
-		unsigned long flags;
 
 		if (ch->video_device)
 			hws_resolution_remove(ch->video_device);
-
-		/* 1) Stop hardware capture for this channel (if running). */
-		if (ch->cap_active)
-			hws_enable_video_capture(dev, i, false);
-
-		/* 2) Drain SW queue + complete in-flight buffer as ERROR. */
-		spin_lock_irqsave(&ch->irq_lock, flags);
-
-		if (ch->active) {
-			vb2_buffer_done(&ch->active->vb.vb2_buf,
-					VB2_BUF_STATE_ERROR);
-			ch->active = NULL;
-		}
-		if (ch->next_prepared) {
-			vb2_buffer_done(&ch->next_prepared->vb.vb2_buf,
-					VB2_BUF_STATE_ERROR);
-			ch->next_prepared = NULL;
-		}
-		while (!list_empty(&ch->capture_queue)) {
-			struct hwsvideo_buffer *b =
-			    list_first_entry(&ch->capture_queue,
-					     struct hwsvideo_buffer, list);
-			list_del_init(&b->list);
-			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-		}
-
-		spin_unlock_irqrestore(&ch->irq_lock, flags);
-
-		/* 3) Release vb2 queue (safe to call once if it was inited). */
-		if (ch->buffer_queue.ops)
-			vb2_queue_release(&ch->buffer_queue);
-
-		/* 4) Free V4L2 controls. */
-		v4l2_ctrl_handler_free(&ch->control_handler);
-
-		/* 5) Unregister the video node (if it was registered). */
 		if (ch->video_device) {
-			if (video_is_registered(ch->video_device))
-				video_unregister_device(ch->video_device);
-			else
-				video_device_release(ch->video_device);
+			vb2_video_unregister_device(ch->video_device);
 			ch->video_device = NULL;
 		}
-		/* 6) Reset lightweight state (optional). */
-		ch->cap_active = false;
-		ch->stop_requested = false;
-		ch->last_buf_half_toggle = 0;
-		ch->half_seen = false;
-		ch->signal_loss_cnt = 0;
-		INIT_LIST_HEAD(&ch->capture_queue);
+		v4l2_ctrl_handler_free(&ch->control_handler);
 	}
 	v4l2_device_unregister(&dev->v4l2_device);
 }
