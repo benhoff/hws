@@ -455,6 +455,8 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->pix.interlaced = false;
 	vid->pix.half_size = vid->pix.sizeimage / 2;	/* if HW uses halves */
 	vid->alloc_sizeimage = vid->pix.sizeimage;
+	hws_set_current_dv_timings(vid, vid->pix.width,
+				   vid->pix.height, vid->pix.interlaced);
 
 	/* color controls default (mid-scale) */
 	vid->current_brightness = 0x80;
@@ -976,6 +978,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	v->pix.width = w;
 	v->pix.height = h;
 	v->pix.interlaced = interlaced;
+	hws_set_current_dv_timings(v, w, h, interlaced);
 
 	new_size = hws_calc_sizeimage(v, w, h, interlaced);
 	v->window_valid = false;

@@ -16,6 +16,7 @@
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
+#include <media/v4l2-dv-timings.h>
 #include <media/videobuf2-dma-sg.h>
 
 #include "hws_reg.h"
@@ -91,6 +92,7 @@ struct hws_video {
 	/* ───── capture queue status ───── */
 	// FIXME: https://chatgpt.com/s/t_68aaabb351b48191b791152813d52e9a
 	struct hws_pix_state pix;
+	struct v4l2_dv_timings cur_dv_timings; /* last configured DV timings */
 	u32 alloc_sizeimage;
 
 	/* ───── per-channel capture state ───── */
@@ -130,6 +132,23 @@ static inline bool hws_use_ring(struct hws_video *vid)
 		return false;
 
 	return READ_ONCE(vid->prefer_ring);
+}
+
+static inline void hws_set_current_dv_timings(struct hws_video *vid,
+					      u32 width, u32 height,
+					      bool interlaced)
+{
+	if (!vid)
+		return;
+
+	vid->cur_dv_timings = (struct v4l2_dv_timings) {
+		.type = V4L2_DV_BT_656_1120,
+		.bt = {
+			.width = width,
+			.height = height,
+			.interlaced = interlaced,
+		},
+	};
 }
 
 struct hws_audio {

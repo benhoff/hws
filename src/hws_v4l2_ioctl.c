@@ -144,17 +144,11 @@ int hws_vidioc_g_dv_timings(struct file *file, void *fh,
 			    struct v4l2_dv_timings *timings)
 {
 	struct hws_video *vid = video_drvdata(file);
-	const struct v4l2_dv_timings *m;
 
 	if (!timings)
 		return -EINVAL;
 
-	m = hws_find_dv_by_wh(vid->pix.width, vid->pix.height,
-			      !!vid->pix.interlaced);
-	if (!m)
-		return -ENOLINK;
-
-	*timings = *m;
+	*timings = vid->cur_dv_timings;
 	return 0;
 }
 
@@ -219,6 +213,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	/* Recompute stride/sizeimage/half_size using your helper */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
 	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
+	vid->cur_dv_timings   = *m;
 	if (!was_busy)
 		vid->alloc_sizeimage = vid->pix.sizeimage;
 	return ret;
@@ -509,6 +504,8 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
     vid->pix.sizeimage    = f->fmt.pix.sizeimage;             /* logical */
 	vid->pix.half_size    = vid->pix.sizeimage / 2;
 	vid->pix.interlaced   = false;
+	hws_set_current_dv_timings(vid, vid->pix.width, vid->pix.height,
+				   vid->pix.interlaced);
 	/* Or:
 	 * hws_calc_sizeimage(vid, vid->pix.width, vid->pix.height, false);
 	 */
