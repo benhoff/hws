@@ -41,10 +41,6 @@
 	  .subdevice = (__subdev),                                  \
 	  .driver_data = (unsigned long)(__configptr) }
 
-#define LOG_DEC(tag)							\
-	dev_dbg(&hdev->pdev->dev, "DEC_MODE %s = 0x%08x\n",		\
-		(tag), readl(hdev->bar0_base + HWS_REG_DEC_MODE))
-
 static const struct pci_device_id hws_pci_table[] = {
 	MAKE_ENTRY(0x8888, 0x9534, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x1F33, 0x8534, 0x8888, 0x0007, NULL),
@@ -143,8 +139,8 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->start_run = false;
 	hdev->pci_lost = 0;
 
-	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);  LOG_DEC("after 0x00");
-	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE); LOG_DEC("after 0x10");
+	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);
+	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE);
 
 	hws_configure_hardware_capabilities(hdev);
 
