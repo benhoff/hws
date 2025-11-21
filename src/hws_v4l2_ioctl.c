@@ -344,9 +344,6 @@ int hws_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *fm
 {
 	struct hws_video *vid = video_drvdata(file);
 
-	if (fmt->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
 	fmt->fmt.pix.width        = vid->pix.width;
 	fmt->fmt.pix.height       = vid->pix.height;
 	fmt->fmt.pix.pixelformat  = V4L2_PIX_FMT_YUYV;
