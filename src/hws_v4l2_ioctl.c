@@ -15,22 +15,27 @@
 #include "hws_reg.h"
 #include "hws_video.h"
 
-static const struct v4l2_dv_timings hws_dv_modes[] = {
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1920, .height = 1080, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  720, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width =  720, .height =  480, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width =  720, .height =  576, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width =  800, .height =  600, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width =  640, .height =  480, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1024, .height =  768, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  768, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  800, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height = 1024, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1360, .height =  768, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1440, .height =  900, .interlaced = 0 } },
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1680, .height = 1050, .interlaced = 0 } },
+struct hws_dv_mode {
+	struct v4l2_dv_timings timings;
+	u32 refresh_hz;
+};
+
+static const struct hws_dv_mode hws_dv_modes[] = {
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1920, .height = 1080, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  720, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  720, .height =  480, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  720, .height =  576, .interlaced = 0 } }, 50 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  800, .height =  600, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  640, .height =  480, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1024, .height =  768, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  768, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  800, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height = 1024, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1360, .height =  768, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1440, .height =  900, .interlaced = 0 } }, 60 },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1680, .height = 1050, .interlaced = 0 } }, 60 },
 	/* Portrait */
-	{ .type = V4L2_DV_BT_656_1120, .bt = { .width = 1080, .height = 1920, .interlaced = 0 } },
+	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1080, .height = 1920, .interlaced = 0 } }, 60 },
 };
 
 static const size_t hws_dv_modes_cnt = ARRAY_SIZE(hws_dv_modes);
@@ -50,44 +55,8 @@ static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,
 	(void)readl(hws->bar0_base + HWS_REG_BCHS(ch)); /* post write */
 }
 
-/* Find a timing by WxH (progressive). If multiple rates exist, we pick the first match. */
-static const struct v4l2_dv_timings *hws_match_mode_by_wh(unsigned int w, unsigned int h)
-{
-	size_t i;
-
-	for (i = 0; i < hws_dv_modes_cnt; i++) {
-		const struct v4l2_bt_timings *bt = &hws_dv_modes[i].bt;
-
-		if (bt->width == w && bt->height == h && bt->interlaced == 0)
-			return &hws_dv_modes[i];
-	}
-	return NULL;
-}
-
 /* Helper: find a supported DV mode by W/H + interlace flag */
-static const struct v4l2_dv_timings *
-hws_find_dv_by_wh(u32 w, u32 h, bool interlaced)
-{
-	size_t i;
-
-	for (i = 0; i < ARRAY_SIZE(hws_dv_modes); i++) {
-		const struct v4l2_dv_timings *t = &hws_dv_modes[i];
-		const struct v4l2_bt_timings *bt = &t->bt;
-
-		if (t->type != V4L2_DV_BT_656_1120)
-			continue;
-
-		if (bt->width == w && bt->height == h &&
-		    !!bt->interlaced == interlaced)
-			return t;
-	}
-	return NULL;
-}
-
-/* Helper: validate the requested timings against our table.
- * We match strictly on type, width, height, and interlace flag.
- */
-static const struct v4l2_dv_timings *
+static const struct hws_dv_mode *
 hws_match_supported_dv(const struct v4l2_dv_timings *req)
 {
 	const struct v4l2_bt_timings *bt;
@@ -99,6 +68,36 @@ hws_match_supported_dv(const struct v4l2_dv_timings *req)
 	return hws_find_dv_by_wh(bt->width, bt->height, !!bt->interlaced);
 }
 
+/* Helper: find a supported DV mode by W/H + interlace flag */
+static const struct hws_dv_mode *
+hws_find_dv_by_wh(u32 w, u32 h, bool interlaced)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(hws_dv_modes); i++) {
+		const struct hws_dv_mode *t = &hws_dv_modes[i];
+		const struct v4l2_bt_timings *bt = &t->timings.bt;
+
+		if (t->timings.type != V4L2_DV_BT_656_1120)
+			continue;
+
+		if (bt->width == w && bt->height == h &&
+		    !!bt->interlaced == interlaced)
+			return t;
+	}
+	return NULL;
+}
+
+static u32 hws_pick_fps_from_mode(u32 w, u32 h, bool interlaced)
+{
+	const struct hws_dv_mode *m = hws_find_dv_by_wh(w, h, interlaced);
+
+	if (m && m->refresh_hz)
+		return m->refresh_hz;
+	/* Fallback to a sane default */
+	return 60;
+}
+
 /* Query the *current detected* DV timings on the input.
  * If you have a real hardware detector, call it here; otherwise we
  * derive from the cached pix state and map to the closest supported DV mode.
@@ -107,7 +106,7 @@ int hws_vidioc_query_dv_timings(struct file *file, void *fh,
 				struct v4l2_dv_timings *timings)
 {
 	struct hws_video *vid = video_drvdata(file);
-	const struct v4l2_dv_timings *m;
+	const struct hws_dv_mode *m;
 
 	if (!timings)
 		return -EINVAL;
@@ -118,7 +117,7 @@ int hws_vidioc_query_dv_timings(struct file *file, void *fh,
 	if (!m)
 		return -ENOLINK;
 
-	*timings = *m;
+	*timings = m->timings;
 	return 0;
 }
 
@@ -135,7 +134,7 @@ int hws_vidioc_enum_dv_timings(struct file *file, void *fh,
 	if (edv->index >= hws_dv_modes_cnt)
 		return -EINVAL;
 
-	edv->timings = hws_dv_modes[edv->index];
+	edv->timings = hws_dv_modes[edv->index].timings;
 	return 0;
 }
 
@@ -170,7 +169,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 			    struct v4l2_dv_timings *timings)
 {
 	struct hws_video *vid = video_drvdata(file);
-	const struct v4l2_dv_timings *m;
+	const struct hws_dv_mode *m;
 	const struct v4l2_bt_timings *bt;
 	u32 new_w, new_h;
 	bool interlaced;
@@ -215,7 +214,8 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	/* Recompute stride/sizeimage/half_size using your helper */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
 	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
-	vid->cur_dv_timings   = *m;
+	vid->cur_dv_timings   = m->timings;
+	vid->current_fps      = m->refresh_hz;
 	if (!was_busy)
 		vid->alloc_sizeimage = vid->pix.sizeimage;
 	return ret;
@@ -238,9 +238,9 @@ int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 	cap->type = V4L2_DV_BT_656_1120;
 
 	for (i = 0; i < ARRAY_SIZE(hws_dv_modes); i++) {
-		const struct v4l2_bt_timings *bt = &hws_dv_modes[i].bt;
+		const struct v4l2_bt_timings *bt = &hws_dv_modes[i].timings.bt;
 
-		if (hws_dv_modes[i].type != V4L2_DV_BT_656_1120)
+		if (hws_dv_modes[i].timings.type != V4L2_DV_BT_656_1120)
 			continue;
 		n++;
 
@@ -478,6 +478,9 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	vid->pix.interlaced   = false;
 	hws_set_current_dv_timings(vid, vid->pix.width, vid->pix.height,
 				   vid->pix.interlaced);
+	vid->current_fps = hws_pick_fps_from_mode(vid->pix.width,
+						  vid->pix.height,
+						  vid->pix.interlaced);
 	/* Or:
 	 * hws_calc_sizeimage(vid, vid->pix.width, vid->pix.height, false);
 	 */
@@ -496,15 +499,18 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *param)
 {
 	struct hws_video *vid = video_drvdata(file);
+	u32 fps;
 
 	if (param->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	/* Fixed 60 Hz; expose timeperframe capability */
+	fps = vid->current_fps ? vid->current_fps : 60;
+
+	/* Report cached frame rate; expose timeperframe capability */
 	param->parm.capture.capability           = V4L2_CAP_TIMEPERFRAME;
 	param->parm.capture.capturemode          = 0;
 	param->parm.capture.timeperframe.numerator   = 1;
-	param->parm.capture.timeperframe.denominator = 60;
+	param->parm.capture.timeperframe.denominator = fps;
 	param->parm.capture.extendedmode         = 0;
 	param->parm.capture.readbuffers          = 0;
 
@@ -539,23 +545,16 @@ int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *param
 {
 	struct hws_video *vid = video_drvdata(file);
 	struct v4l2_captureparm *cap;
+	u32 fps;
 
 	if (param->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
 	cap = &param->parm.capture;
 
-    /* Treat 0/0 as “pick a default”, clamp anything else to 60 Hz */
-    if (!cap->timeperframe.numerator || !cap->timeperframe.denominator) {
-        cap->timeperframe.numerator   = 1;
-        cap->timeperframe.denominator = 60;
-    } else {
-        cap->timeperframe.numerator   = 1;
-        cap->timeperframe.denominator = 60;
-    }
-
+	fps = vid->current_fps ? vid->current_fps : 60;
+	cap->timeperframe.denominator = fps;
 	cap->timeperframe.numerator   = 1;
-	cap->timeperframe.denominator = 60;
 	cap->capability               = V4L2_CAP_TIMEPERFRAME;
 	cap->capturemode              = 0;
 	cap->extendedmode             = 0;

@@ -456,6 +456,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->alloc_sizeimage = vid->pix.sizeimage;
 	hws_set_current_dv_timings(vid, vid->pix.width,
 				   vid->pix.height, vid->pix.interlaced);
+	vid->current_fps = 60;
 
 	/* color controls default (mid-scale) */
 	vid->current_brightness = 0x80;
@@ -858,6 +859,8 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 
 	/* 1) Input frame rate (read-only; log or export via debugfs if wanted) */
 	in_fps = readl(hws->bar0_base + HWS_REG_FRAME_RATE(ch));
+	if (in_fps)
+		vid->current_fps = in_fps;
 	/* dev_dbg(&hws->pdev->dev, "ch%u input fps=%u\n", ch, in_fps); */
 
 	/* 2) Output resolution programming
@@ -970,6 +973,17 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	v->pix.height = h;
 	v->pix.interlaced = interlaced;
 	hws_set_current_dv_timings(v, w, h, interlaced);
+	/* Try to reflect the live frame rate if HW reports it; otherwise default
+	 * to common rates (50 Hz for 576p, else 60 Hz).
+	 */
+	{
+		u32 fps = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(ch));
+
+		if (fps)
+			v->current_fps = fps;
+		else
+			v->current_fps = (h == 576) ? 50 : 60;
+	}
 
 	new_size = hws_calc_sizeimage(v, w, h, interlaced);
 	v->window_valid = false;
