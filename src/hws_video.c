@@ -1503,7 +1503,7 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		vdev->lock = &ch->state_lock;	/* serialize file ops */
 		vdev->ctrl_handler = &ch->control_handler;
 		vdev->vfl_dir = VFL_DIR_RX;
-		vdev->release = video_device_release_empty;
+		vdev->release = video_device_release;
 		if (ch->control_handler.error)
 			goto err_unwind;
 		video_set_drvdata(vdev, ch);
@@ -1520,7 +1520,6 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 		q->lock = &ch->qlock;
 		q->min_queued_buffers = 1;
-		q->min_reqbufs_allocation = 1;
 		q->dev = &dev->pdev->dev;
 
 		ret = vb2_queue_init(q);
@@ -1566,10 +1565,7 @@ err_unwind:
 		if (video_is_registered(ch->video_device))
 			hws_resolution_remove(ch->video_device);
 		if (video_is_registered(ch->video_device))
-			video_unregister_device(ch->video_device);
-
-		if (ch->buffer_queue.ops)
-			vb2_queue_release(&ch->buffer_queue);
+			vb2_video_unregister_device(ch->video_device);
 		v4l2_ctrl_handler_free(&ch->control_handler);
 		if (ch->video_device) {
 			/* If not registered, we must free the alloc’d vdev ourselves */
