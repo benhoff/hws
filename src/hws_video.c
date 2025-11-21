@@ -1071,23 +1071,7 @@ static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch)
 
 static int hws_open(struct file *file)
 {
-	int ret;
-	struct hws_video *vid;
-
-	/* Create V4L2 file handle so events & priorities work */
-	ret = v4l2_fh_open(file);
-	if (ret)
-		return ret;
-
-	vid = video_drvdata(file);
-
-	/* Hard-fail additional opens while a capture is active */
-	if (!v4l2_fh_is_singular_file(file) && vb2_is_busy(&vid->buffer_queue)) {
-		v4l2_fh_release(file);
-		return -EBUSY;
-	}
-
-	return 0;
+	return v4l2_fh_open(file);
 }
 
 static int hws_release(struct file *file)
