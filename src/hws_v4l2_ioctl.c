@@ -185,9 +185,11 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 		return -EINVAL;
 
 	bt = &m->bt;
+	if (bt->interlaced)
+		return -EINVAL; /* only progressive modes are advertised */
 	new_w = bt->width;
 	new_h = bt->height;
-	interlaced = !!bt->interlaced;
+	interlaced = false;
 
     lockdep_assert_held(&vid->qlock);
 
