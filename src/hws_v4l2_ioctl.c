@@ -535,11 +535,6 @@ int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 	return i ? -EINVAL : 0;
 }
 
-int vidioc_log_status(struct file *file, void *priv)
-{
-	return 0;
-}
-
 int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *param)
 {
 	struct hws_video *vid = video_drvdata(file);
