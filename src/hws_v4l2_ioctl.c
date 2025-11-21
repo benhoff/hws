@@ -377,9 +377,6 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	size_t size; /* wider than u32 for overflow check */
 	size_t max_frame = pdev ? pdev->max_hw_video_buf_sz : MAX_MM_VIDEO_SIZE;
 
-	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
 	/* Only YUYV */
 	pix->pixelformat = V4L2_PIX_FMT_YUYV;
 
@@ -423,10 +420,7 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 			bpl = (u32)max_bpl_hw;
 		}
 	}
-	/* Overflow-safe sizeimage = bpl * h */
-	if (__builtin_mul_overflow((size_t)bpl, (size_t)h, &size) || size == 0)
-		return -ERANGE; /* compliance-friendly: reject impossible requests */
-
+	size = (size_t)bpl * (size_t)h;
 	if (size > max_frame)
 		return -ERANGE;
 
