@@ -88,6 +88,34 @@ hws_find_dv_by_wh(u32 w, u32 h, bool interlaced)
 	return NULL;
 }
 
+static bool hws_get_live_dv_geometry(struct hws_video *vid,
+				     u32 *w, u32 *h, bool *interlaced)
+{
+	struct hws_pcie_dev *pdx;
+	u32 reg;
+
+	if (!vid)
+		return false;
+
+	pdx = vid->parent;
+	if (!pdx || !pdx->bar0_base)
+		return false;
+
+	reg = readl(pdx->bar0_base + HWS_REG_IN_RES(vid->channel_index));
+	if (!reg || reg == 0xFFFFFFFF)
+		return false;
+
+	if (w)
+		*w = reg & 0xFFFF;
+	if (h)
+		*h = (reg >> 16) & 0xFFFF;
+	if (interlaced) {
+		reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+		*interlaced = !!(reg & BIT(8 + vid->channel_index));
+	}
+	return true;
+}
+
 static u32 hws_pick_fps_from_mode(u32 w, u32 h, bool interlaced)
 {
 	const struct hws_dv_mode *m = hws_find_dv_by_wh(w, h, interlaced);
@@ -107,17 +135,26 @@ int hws_vidioc_query_dv_timings(struct file *file, void *fh,
 {
 	struct hws_video *vid = video_drvdata(file);
 	const struct hws_dv_mode *m;
+	u32 w, h;
+	bool interlace, live_ok;
 
 	if (!timings)
 		return -EINVAL;
 
-	/* Map current cached WxH/interlace to one of our supported modes. */
-	m = hws_find_dv_by_wh(vid->pix.width, vid->pix.height,
-			      !!vid->pix.interlaced);
+	w = vid->pix.width;
+	h = vid->pix.height;
+	interlace = vid->pix.interlaced;
+	live_ok = hws_get_live_dv_geometry(vid, &w, &h, &interlace);
+	/* Map current (live if available, otherwise cached) WxH/interlace
+	 * to one of our supported modes.
+	 */
+	m = hws_find_dv_by_wh(w, h, !!interlace);
 	if (!m)
 		return -ENOLINK;
 
 	*timings = m->timings;
+	vid->cur_dv_timings = m->timings;
+	vid->current_fps = m->refresh_hz;
 	return 0;
 }
 
