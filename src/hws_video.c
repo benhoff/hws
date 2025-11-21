@@ -33,7 +33,6 @@
 #include <sound/rawmidi.h>
 #include <sound/initval.h>
 
-#define HWS_MAX_BUFS 32
 #define HWS_REMAP_SLOT_OFF(ch)   (0x208 + (ch) * 8)	/* one 64-bit slot per ch */
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
 #define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
@@ -1162,50 +1161,26 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 			   struct device *alloc_devs[])
 {
 	struct hws_video *vid = q->drv_priv;
-	struct hws_pcie_dev *hws = vid->parent;
-	size_t need_min = vid->pix.sizeimage;
-	size_t need_alloc = PAGE_ALIGN(vid->pix.sizeimage);
+	size_t need_alloc;
 
-	if (!need_min) {
+	(void)num_buffers;
+	(void)alloc_devs;
+
+	if (!vid->pix.sizeimage) {
 		vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
 		vid->pix.sizeimage = vid->pix.bytesperline * vid->pix.height;
-		need_min = vid->pix.sizeimage;
-		need_alloc = PAGE_ALIGN(vid->pix.sizeimage);
 	}
+	need_alloc = PAGE_ALIGN(vid->pix.sizeimage);
 
 	if (*nplanes) {
-		if (*nplanes != 1)
+		if (sizes[0] < need_alloc)
 			return -EINVAL;
-		if (!sizes[0])
-			sizes[0] = need_min;	// publish minimal, not page-aligned
-		if (sizes[0] < need_min)
-			return -EINVAL;
-		vid->alloc_sizeimage = need_alloc;	// keep internal aligned size
 	} else {
 		*nplanes = 1;
-		sizes[0] = need_min;	// report minimal requirement
-		vid->alloc_sizeimage = need_alloc;
+		sizes[0] = need_alloc;	// page-aligned requirement
 	}
 
-	if (alloc_devs)
-		alloc_devs[0] = &hws->pdev->dev;	/* vb2-dma-contig device */
-
-	/* Make sure we have a reasonable minimum queue depth. */
-	if (*num_buffers < 1)
-		*num_buffers = 1;
-
-	unsigned int have = vb2_get_num_buffers(q);	/* instead of q->num_buffers */
-	unsigned int room = (have < HWS_MAX_BUFS) ? (HWS_MAX_BUFS - have) : 0;
-
-	if (*num_buffers > room)
-		*num_buffers = room;
-	if (*num_buffers == 0) {
-		dev_dbg(&hws->pdev->dev,
-			"queue_setup: reject, no room (have=%u, max=%u)\n", have,
-			HWS_MAX_BUFS);
-		return -ENOBUFS;	/* or -ENOMEM; either is fine for CREATE_BUFS clamp */
-	}
-
+	vid->alloc_sizeimage = need_alloc;
 	WRITE_ONCE(vid->prefer_ring, false);
 	return 0;
 }
@@ -1544,7 +1519,6 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q->mem_ops = &vb2_dma_contig_memops;
 		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
 		q->lock = &ch->qlock;
-		q->max_num_buffers = HWS_MAX_BUFS;
 		q->min_queued_buffers = 1;
 		q->min_reqbufs_allocation = 1;
 		q->dev = &dev->pdev->dev;
