@@ -20,6 +20,9 @@ struct hws_dv_mode {
 	u32 refresh_hz;
 };
 
+static const struct hws_dv_mode *
+hws_find_dv_by_wh(u32 w, u32 h, bool interlaced);
+
 static const struct hws_dv_mode hws_dv_modes[] = {
 	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1920, .height = 1080, .interlaced = 0 } }, 60 },
 	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  720, .interlaced = 0 } }, 60 },
@@ -220,7 +223,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	if (!m)
 		return -EINVAL;
 
-	bt = &m->bt;
+	bt = &m->timings.bt;
 	if (bt->interlaced)
 		return -EINVAL; /* only progressive modes are advertised */
 	new_w = bt->width;
@@ -576,6 +579,12 @@ int hws_vidioc_g_input(struct file *file, void *priv, unsigned int *index)
 int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 {
 	return i ? -EINVAL : 0;
+}
+
+int vidioc_log_status(struct file *file, void *priv)
+{
+	/* Skip verbose ctrl dump to keep the kernel log quiet. */
+	return 0;
 }
 
 int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *param)
