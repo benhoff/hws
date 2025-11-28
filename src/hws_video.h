@@ -9,7 +9,7 @@ void hws_video_unregister(struct hws_pcie_dev *dev);
 void hws_enable_video_capture(struct hws_pcie_dev *hws,
 			      unsigned int chan,
 			      bool on);
-void hws_prime_next_locked(struct hws_video *vid, bool ring_mode);
+void hws_prime_next_locked(struct hws_video *vid);
 
 int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch);
 void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch);

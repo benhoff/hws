@@ -56,8 +56,6 @@ struct hwsvideo_buffer {
 	int slot;		/* for two-buffer approach */
 };
 
-static inline bool hws_use_ring(struct hws_video *vid);
-
 struct hws_video {
 	/* ───── linkage ───── */
 	struct hws_pcie_dev *parent;	/* parent device */
@@ -102,21 +100,17 @@ struct hws_video {
 	u8 last_buf_half_toggle;
 	bool half_seen;
 	u32 sequence_number;
+	u32 queued_count;
 
 	/* ───── timeout and error handling ───── */
 	u32 timeout_count;
 	u32 error_count;
 
-	/* ───── two-buffer approach ───── */
-	dma_addr_t ring_dma;
-	void *ring_cpu;
-	size_t ring_size;
-	u32 ring_toggle_prev;
-	u32 ring_toggle_hw;
-	bool ring_first_half_copied;
-	unsigned long ring_last_toggle_jiffies;
-	u32 queued_count;
-	bool prefer_ring;
+	/* ───── hostbuf DMA state ───── */
+	void *hostbuf_cpu;
+	dma_addr_t hostbuf_dma;
+	size_t hostbuf_size;
+	bool hostbuf_mode;
 	bool window_valid;
 	u32 last_dma_hi;
 	u32 last_dma_page;
@@ -126,14 +120,6 @@ struct hws_video {
 	/* ───── misc counters ───── */
 	int signal_loss_cnt;
 };
-
-static inline bool hws_use_ring(struct hws_video *vid)
-{
-	if (!vid)
-		return false;
-
-	return READ_ONCE(vid->prefer_ring);
-}
 
 static inline void hws_set_current_dv_timings(struct hws_video *vid,
 					      u32 width, u32 height,

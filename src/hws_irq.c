@@ -4,6 +4,8 @@
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/minmax.h>
+#include <linux/string.h>
 
 #include <sound/pcm.h>
 #include <media/videobuf2-dma-contig.h>
@@ -87,7 +89,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): programmed buffer %p\n", ch,
 		buf);
 	spin_lock_irqsave(&v->irq_lock, flags);
-	hws_prime_next_locked(v, hws_use_ring(v));
+	hws_prime_next_locked(v);
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 	return 0;
 }
@@ -99,7 +101,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hwsvideo_buffer *done;
 	unsigned long flags;
 	bool promoted = false;
-	bool ring_mode;
+	bool hostbuf_mode;
 
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): stop=%d cap=%d active=%p\n",
@@ -117,7 +119,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
 		return;
 
-	ring_mode = hws_use_ring(v);
+	hostbuf_mode = READ_ONCE(v->hostbuf_mode);
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	done = v->active;
@@ -131,18 +133,28 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	/* 1) Complete the buffer the HW just finished (if any) */
 	if (done) {
 		struct vb2_v4l2_buffer *vb2v = &done->vb;
-		size_t payload = vb2_get_plane_payload(&vb2v->vb2_buf, 0);
 		size_t expected = v->pix.sizeimage;
-		if (payload < expected) {
-			dev_warn_ratelimited(&hws->pdev->dev,
-					     "bh_video(ch=%u): short payload %zu < %zu, dropping seq=%u\n",
-					     ch, payload, expected,
-					     v->sequence_number + 1);
-			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
-			goto arm_next;
-		}
-		if (payload > expected)
+
+		if (hostbuf_mode && v->hostbuf_cpu) {
+			void *dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+
+			if (dst)
+				memcpy(dst, v->hostbuf_cpu, expected);
 			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
+		} else {
+			size_t payload = vb2_get_plane_payload(&vb2v->vb2_buf, 0);
+
+			if (payload < expected) {
+				dev_warn_ratelimited(&hws->pdev->dev,
+						     "bh_video(ch=%u): short payload %zu < %zu, dropping seq=%u\n",
+						     ch, payload, expected,
+						     v->sequence_number + 1);
+				vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
+				goto arm_next;
+			}
+			if (payload > expected)
+				vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
+		}
 
 		dma_rmb();	/* device writes visible before userspace sees it */
 
@@ -158,6 +170,25 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
+	if (hostbuf_mode) {
+		/* Keep DMA pointed at hostbuf; just rotate active buffer. */
+		spin_lock_irqsave(&v->irq_lock, flags);
+		if (!list_empty(&v->capture_queue)) {
+			struct hwsvideo_buffer *next;
+
+			next = list_first_entry(&v->capture_queue,
+						struct hwsvideo_buffer, list);
+			list_del_init(&next->list);
+			if (v->queued_count)
+				v->queued_count--;
+			v->active = next;
+		} else {
+			v->active = NULL;
+		}
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return;
+	}
+
 	if (unlikely(READ_ONCE(hws->suspended)))
 		return;
 
@@ -166,7 +197,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			"bh_video(ch=%u): promoted pre-armed buffer active=%p\n",
 			ch, v->active);
 		spin_lock_irqsave(&v->irq_lock, flags);
-		hws_prime_next_locked(v, ring_mode);
+		hws_prime_next_locked(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		return;
 	}
