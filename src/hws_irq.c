@@ -131,6 +131,18 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	/* 1) Complete the buffer the HW just finished (if any) */
 	if (done) {
 		struct vb2_v4l2_buffer *vb2v = &done->vb;
+		size_t payload = vb2_get_plane_payload(&vb2v->vb2_buf, 0);
+		size_t expected = v->pix.sizeimage;
+		if (payload < expected) {
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "bh_video(ch=%u): short payload %zu < %zu, dropping seq=%u\n",
+					     ch, payload, expected,
+					     v->sequence_number + 1);
+			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
+			goto arm_next;
+		}
+		if (payload > expected)
+			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
 
 		dma_rmb();	/* device writes visible before userspace sees it */
 
@@ -159,6 +171,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		return;
 	}
 
+arm_next:
 	/* 2) Immediately arm the next queued buffer (if present) */
 	ret = hws_arm_next(hws, ch);
 	if (ret == -EAGAIN) {
