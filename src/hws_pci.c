@@ -641,6 +641,9 @@ static int hws_pm_resume(struct device *dev)
 
 	/* Reinitialize chip-side capabilities / registers */
 	read_chip_id(hws);
+	/* Re-seed BAR remaps/DMA windows and restart the capture core */
+	hws_seed_all_channels(hws);
+	hws_init_video_sys(hws, true);
 
 	/* IRQs can be re-enabled now that MMIO is sane */
 	if (hws->irq >= 0)
