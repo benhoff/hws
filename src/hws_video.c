@@ -23,15 +23,8 @@
 #include "hws.h"
 #include "hws_reg.h"
 #include "hws_video.h"
-#include "hws_audio.h"
 #include "hws_irq.h"
 #include "hws_v4l2_ioctl.h"
-
-#include <sound/core.h>
-#include <sound/control.h>
-#include <sound/pcm.h>
-#include <sound/rawmidi.h>
-#include <sound/initval.h>
 
 #define HWS_REMAP_SLOT_OFF(ch)   (0x208 + (ch) * 8)	/* one 64-bit slot per ch */
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
@@ -711,7 +704,6 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 		for (i = 0; i < hws->max_channels; i++) {
 			/* helpers to arm/disable capture engines */
 			hws_enable_video_capture(hws, i, false);
-			hws_enable_audio_capture(hws, i, false);
 		}
 	}
 

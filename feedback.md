@@ -6,6 +6,5 @@ drivers/media/pci/hws/
 ├── hws-irq.c           # ISR/ threaded handler, status/ack, work handling
 ├── hws-video.c         # V4L2 device/node, vb2 queue, formats, controls, ioctls
 ├── hws-queue.c         # (optional) vb2 ops and DMA engine helpers if large
-├── hws-audio.c         # (optional) ALSA side if present; else drop
 ├── hws-regs.h          # register definitions, bitfields, masks (SPDX header!)
 ├── hws.h               # shared driver structs, enums, helpers

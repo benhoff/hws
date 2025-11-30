@@ -4,8 +4,7 @@ HwsCapture-objs := \
 	 hws_pci.o \
 	 hws_irq.o \
 	 hws_video.o \
-	 hws_v4l2_ioctl.o \
-	 hws_audio.o 
+	 hws_v4l2_ioctl.o 
 
 src := $(CURDIR)
 
@@ -60,4 +59,3 @@ ifdef HAVE_CLANG_TIDY
 else
 	@echo ">> clang-tidy not available, skipping tidy checks"
 endif
-

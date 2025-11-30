@@ -7,13 +7,11 @@
 #include <linux/minmax.h>
 #include <linux/string.h>
 
-#include <sound/pcm.h>
 #include <media/videobuf2-dma-contig.h>
 
 #include "hws_irq.h"
 #include "hws_reg.h"
 #include "hws_video.h"
-#include "hws_audio.h"
 
 #define MAX_INT_LOOPS 100
 
@@ -283,61 +281,6 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			}
 
 			writel(vbit, pdx->bar0_base + HWS_REG_INT_STATUS);
-			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
-		}
-
-		for (unsigned int ch = 0; ch < pdx->cur_max_linein_ch; ++ch) {
-			u32 abit = HWS_INT_ADONE_BIT(ch);
-
-			if (!(int_state & abit))
-				continue;
-
-			/* Only service running streams */
-			if (!READ_ONCE(pdx->audio[ch].cap_active) ||
-			    !READ_ONCE(pdx->audio[ch].stream_running)) {
-				writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
-				(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
-				continue;
-			}
-
-			if (unlikely(hws_toggle_debug))
-				pdx->audio[ch].last_period_toggle =
-				    readl_relaxed(pdx->bar0_base +
-						  HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-
-			/* Make device writes visible before notifying ALSA */
-			dma_rmb();
-			/* Period accounting + rearm + notify ALSA. */
-			{
-				struct hws_audio *a = &pdx->audio[ch];
-				struct snd_pcm_substream *ss;
-				struct snd_pcm_runtime *rt;
-				snd_pcm_uframes_t pos;
-
-				ss = READ_ONCE(a->pcm_substream);
-				if (!ss)
-					goto ack_audio;
-
-				rt = READ_ONCE(ss->runtime);
-				if (!rt)
-					goto ack_audio;
-
-				/* Advance write pointer by exactly one period (frames). */
-				pos = READ_ONCE(a->ring_wpos_byframes);
-				pos += rt->period_size;
-				if (pos >= rt->buffer_size)
-					pos -= rt->buffer_size;
-				WRITE_ONCE(a->ring_wpos_byframes, pos);
-
-				/* Program the period the HW will fill next. */
-				if (likely(!READ_ONCE(a->stop_requested)))
-					hws_audio_program_next_period(pdx, ch);
-
-				/* Notify ALSA now that the hardware advanced. */
-				snd_pcm_period_elapsed(ss);
-			}
-ack_audio:
-			writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
 			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
 
