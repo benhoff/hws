@@ -692,3 +692,4 @@ MODULE_DESCRIPTION(DRV_NAME);
 MODULE_AUTHOR("Ben Hoff <hoff.benjamin.k@gmail.com>");
 MODULE_AUTHOR("Sales <sales@avmatrix.com>");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("DMA_BUF");

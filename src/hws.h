@@ -49,6 +49,10 @@ struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
 	int slot;		/* for two-buffer approach */
+	int hostbuf_idx;	/* staging buffer index when hostbuf_mode is used */
+	void *mapped_vaddr;	/* cached kernel mapping for DMABUF-backed buffers */
+	void *mapped_vaddr_base; /* base pointer returned by dma_buf_vmap */
+	struct dma_buf *mapped_dbuf;
 };
 
 struct hws_video {
@@ -102,10 +106,15 @@ struct hws_video {
 	u32 error_count;
 
 	/* ───── hostbuf DMA state ───── */
-	void *hostbuf_cpu;
-	dma_addr_t hostbuf_dma;
+	void *hostbuf_cpu[2];
+	dma_addr_t hostbuf_dma[2];
 	size_t hostbuf_size;
+	int hostbuf_count;
 	bool hostbuf_mode;
+	int hostbuf_write_idx;	/* which host buffer is armed for DMA */
+	struct work_struct hostbuf_work;
+	struct list_head hostbuf_copy_list;
+	spinlock_t hostbuf_copy_lock;
 	bool window_valid;
 	u32 last_dma_hi;
 	u32 last_dma_page;

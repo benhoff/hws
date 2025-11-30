@@ -10,6 +10,9 @@
 #include <linux/interrupt.h>
 #include <linux/moduleparam.h>
 #include <linux/sysfs.h>
+#include <linux/workqueue.h>
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -37,6 +40,8 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch);
 static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch);
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced);
+static void hws_hostbuf_work(struct work_struct *work);
+static void hws_hostbuf_release(struct hws_video *vid);
 
 static bool hws_prefer_hostbuf;
 module_param_named(prefer_hostbuf, hws_prefer_hostbuf, bool, 0644);
@@ -44,8 +49,8 @@ MODULE_PARM_DESC(prefer_hostbuf,
 		 "Use driver-allocated host double buffer and copy into vb2 buffers");
 
 /* DMA helper functions */
-static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
-			     dma_addr_t dma, const char *tag);
+void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
+			  dma_addr_t dma, const char *tag);
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
 hws_take_queued_buffer_locked(struct hws_video *vid);
@@ -108,8 +113,8 @@ module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
 MODULE_PARM_DESC(dma_window_verify,
 		 "Read back DMA window registers after programming (debug)");
 
-static void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
-				 dma_addr_t dma, const char *tag)
+void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
+			  dma_addr_t dma, const char *tag)
 {
 	iowrite32(lower_32_bits(dma), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
 	dev_dbg(&hws->pdev->dev, "dma_doorbell ch%u: dma=0x%llx tag=%s\n", ch,
@@ -241,30 +246,159 @@ static int hws_hostbuf_setup(struct hws_video *vid)
 {
 	struct hws_pcie_dev *hws = vid->parent;
 	size_t need;
-
-	if (vid->hostbuf_cpu)
-		return 0;
+	int i;
 
 	need = PAGE_ALIGN(vid->pix.sizeimage);
-	vid->hostbuf_cpu =
-	    dma_alloc_coherent(&hws->pdev->dev, need, &vid->hostbuf_dma,
-			       GFP_KERNEL);
-	if (!vid->hostbuf_cpu)
-		return -ENOMEM;
+
+	/* Grow the host buffer if the format size increased. */
+	if (vid->hostbuf_count && need > vid->hostbuf_size)
+		hws_hostbuf_release(vid);
+
+	if (vid->hostbuf_count == 2 && vid->hostbuf_size >= need) {
+		vid->hostbuf_write_idx = 0;
+		return 0;
+	}
+
+	for (i = 0; i < 2; i++) {
+		vid->hostbuf_cpu[i] =
+		    dma_alloc_coherent(&hws->pdev->dev, need,
+				       &vid->hostbuf_dma[i], GFP_KERNEL);
+		if (!vid->hostbuf_cpu[i])
+			goto fail;
+	}
+	vid->hostbuf_count = 2;
 	vid->hostbuf_size = need;
+	vid->hostbuf_write_idx = 0;
 	return 0;
+
+fail:
+	for (i = 0; i < 2; i++) {
+		if (vid->hostbuf_cpu[i]) {
+			dma_free_coherent(&hws->pdev->dev, need,
+					  vid->hostbuf_cpu[i],
+					  vid->hostbuf_dma[i]);
+			vid->hostbuf_cpu[i] = NULL;
+			vid->hostbuf_dma[i] = 0;
+		}
+	}
+	vid->hostbuf_count = 0;
+	vid->hostbuf_size = 0;
+	return -ENOMEM;
 }
 
 static void hws_hostbuf_release(struct hws_video *vid)
 {
 	struct hws_pcie_dev *hws = vid->parent;
+	unsigned long flags;
+	int i;
+	struct hwsvideo_buffer *b, *tmp;
+	LIST_HEAD(copy_flush);
 
-	if (vid->hostbuf_cpu) {
-		dma_free_coherent(&hws->pdev->dev, vid->hostbuf_size,
-				  vid->hostbuf_cpu, vid->hostbuf_dma);
-		vid->hostbuf_cpu = NULL;
-		vid->hostbuf_dma = 0;
-		vid->hostbuf_size = 0;
+	cancel_work_sync(&vid->hostbuf_work);
+
+	spin_lock_irqsave(&vid->hostbuf_copy_lock, flags);
+	/*
+	 * Flush any pending hostbuf completions with error so callers
+	 * aren't left hanging if we tear down the channel mid-stream.
+	 */
+	list_splice_init(&vid->hostbuf_copy_list, &copy_flush);
+	spin_unlock_irqrestore(&vid->hostbuf_copy_lock, flags);
+
+	list_for_each_entry_safe(b, tmp, &copy_flush, list) {
+		list_del_init(&b->list);
+		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+	}
+
+	for (i = 0; i < 2; i++) {
+		if (vid->hostbuf_cpu[i]) {
+			dma_free_coherent(&hws->pdev->dev, vid->hostbuf_size,
+					  vid->hostbuf_cpu[i],
+					  vid->hostbuf_dma[i]);
+			vid->hostbuf_cpu[i] = NULL;
+			vid->hostbuf_dma[i] = 0;
+		}
+	}
+	vid->hostbuf_count = 0;
+	vid->hostbuf_size = 0;
+	vid->hostbuf_write_idx = 0;
+	INIT_LIST_HEAD(&vid->hostbuf_copy_list);
+}
+
+static void hws_hostbuf_work(struct work_struct *work)
+{
+	struct hws_video *v =
+	    container_of(work, struct hws_video, hostbuf_work);
+	struct hws_pcie_dev *hws = v->parent;
+	struct hwsvideo_buffer *buf;
+	unsigned long flags;
+
+	for (;;) {
+		struct vb2_v4l2_buffer *vb2v;
+		size_t expected;
+		int idx;
+		enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
+		void *dst;
+
+		spin_lock_irqsave(&v->hostbuf_copy_lock, flags);
+		if (list_empty(&v->hostbuf_copy_list)) {
+			spin_unlock_irqrestore(&v->hostbuf_copy_lock, flags);
+			break;
+		}
+		buf = list_first_entry(&v->hostbuf_copy_list,
+				       struct hwsvideo_buffer, list);
+		list_del_init(&buf->list);
+		spin_unlock_irqrestore(&v->hostbuf_copy_lock, flags);
+
+		vb2v = &buf->vb;
+		expected = v->pix.sizeimage;
+		idx = buf->hostbuf_idx;
+
+		if (idx < 0 || idx >= v->hostbuf_count ||
+		    !v->hostbuf_cpu[idx]) {
+			state = VB2_BUF_STATE_ERROR;
+		} else {
+			dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+			if (!dst && buf->mapped_vaddr)
+				dst = buf->mapped_vaddr;
+			if (!dst) {
+				struct dma_buf *dbuf =
+				    vb2v->vb2_buf.planes[0].dbuf;
+
+		if (dbuf) {
+					struct iosys_map map;
+					int r = dma_buf_vmap(dbuf, &map);
+
+					if (!r && map.vaddr) {
+						void *dst_map = map.vaddr +
+						    vb2v->vb2_buf.planes[0].data_offset;
+
+						memcpy(dst_map, v->hostbuf_cpu[idx], expected);
+						dma_buf_vunmap(dbuf, &map);
+						vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
+					} else {
+						dev_warn(&hws->pdev->dev,
+							 "hostbuf copy: vmap failed for dmabuf buffer %p idx=%d\n",
+							 vb2v, idx);
+						state = VB2_BUF_STATE_ERROR;
+					}
+				} else {
+					dev_warn(&hws->pdev->dev,
+						 "hostbuf copy: no vaddr for buffer %p idx=%d\n",
+						 vb2v, idx);
+					state = VB2_BUF_STATE_ERROR;
+				}
+			} else {
+				memcpy(dst, v->hostbuf_cpu[idx], expected);
+				vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
+			}
+		}
+
+		spin_lock_irqsave(&v->irq_lock, flags);
+		vb2v->sequence = ++v->sequence_number;
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+
+		vb2v->vb2_buf.timestamp = ktime_get_ns();
+		vb2_buffer_done(&vb2v->vb2_buf, state);
 	}
 }
 
@@ -412,10 +546,17 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 	/* Host buffer initialization */
 	vid->queued_count = 0;
-	vid->hostbuf_cpu = NULL;
-	vid->hostbuf_dma = 0;
+	vid->hostbuf_cpu[0] = NULL;
+	vid->hostbuf_cpu[1] = NULL;
+	vid->hostbuf_dma[0] = 0;
+	vid->hostbuf_dma[1] = 0;
 	vid->hostbuf_size = 0;
+	vid->hostbuf_count = 0;
 	vid->hostbuf_mode = hws_prefer_hostbuf;
+	vid->hostbuf_write_idx = 0;
+	INIT_LIST_HEAD(&vid->hostbuf_copy_list);
+	spin_lock_init(&vid->hostbuf_copy_lock);
+	INIT_WORK(&vid->hostbuf_work, hws_hostbuf_work);
 	vid->window_valid = false;
 
 	/* default format (adjust to your HW) */
@@ -548,6 +689,9 @@ static int hws_buf_init(struct vb2_buffer *vb)
 	struct hwsvideo_buffer *b = to_hwsbuf(vb);
 
 	INIT_LIST_HEAD(&b->list);
+	b->mapped_vaddr = NULL;
+	b->mapped_vaddr_base = NULL;
+	b->mapped_dbuf = NULL;
 	return 0;
 }
 
@@ -560,9 +704,23 @@ static void hws_buf_finish(struct vb2_buffer *vb)
 static void hws_buf_cleanup(struct vb2_buffer *vb)
 {
 	struct hwsvideo_buffer *b = to_hwsbuf(vb);
+	struct hws_video *vid = vb->vb2_queue->drv_priv;
+	struct hws_pcie_dev *hws = vid->parent;
 
 	if (!list_empty(&b->list))
 		list_del_init(&b->list);
+
+	if (b->mapped_dbuf && b->mapped_vaddr_base) {
+		dma_buf_vunmap(b->mapped_dbuf, b->mapped_vaddr_base);
+		b->mapped_vaddr = NULL;
+		b->mapped_vaddr_base = NULL;
+		b->mapped_dbuf = NULL;
+	} else if (b->mapped_vaddr || b->mapped_vaddr_base) {
+		dev_warn(&hws->pdev->dev,
+			 "buf_cleanup: mapped_vaddr set without dmabuf\n");
+		b->mapped_vaddr = NULL;
+		b->mapped_vaddr_base = NULL;
+	}
 }
 
 void hws_program_dma_for_addr(struct hws_pcie_dev *hws, unsigned int ch,
@@ -905,6 +1063,8 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	unsigned long flags;
 	u32 new_size;
 	bool reenable = false;
+	bool hostbuf_mode;
+	struct hwsvideo_buffer *buf = NULL;
 
 	if (!pdx || !pdx->bar0_base)
 		return;
@@ -945,6 +1105,9 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
+	cancel_work_sync(&v->hostbuf_work);
+	INIT_LIST_HEAD(&v->hostbuf_copy_list);
+
 	/* Update software pixel state */
 	v->pix.width = w;
 	v->pix.height = h;
@@ -964,6 +1127,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	new_size = hws_calc_sizeimage(v, w, h, interlaced);
 	v->window_valid = false;
+	hostbuf_mode = READ_ONCE(v->hostbuf_mode);
 
 	/* Notify listeners that the resolution changed whenever we have
 	 * an active queue, regardless of whether we can continue streaming
@@ -1002,23 +1166,45 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	/* Re-prime first VB2 buffer if present */
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (!list_empty(&v->capture_queue)) {
-		struct hwsvideo_buffer *buf;
-		dma_addr_t dma;
-
 		buf = list_first_entry(&v->capture_queue,
 				       struct hwsvideo_buffer, list);
 		v->active = buf;
 		list_del_init(&v->active->list);
-		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		hws_program_dma_for_addr(pdx, ch, dma);
-		iowrite32(lower_32_bits(dma),
-			  pdx->bar0_base + HWS_REG_DMA_ADDR(ch));
+		if (v->queued_count)
+			v->queued_count--;
 		reenable = true;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	if (!reenable)
 		return;
+
+	if (hostbuf_mode) {
+		int ret = hws_hostbuf_setup(v);
+
+		if (ret) {
+			dev_warn(&pdx->pdev->dev,
+				 "mode_change: ch%u hostbuf alloc failed (%d), using direct DMA\n",
+				 ch, ret);
+			hostbuf_mode = false;
+			WRITE_ONCE(v->hostbuf_mode, false);
+		} else {
+			dma_addr_t dma = v->hostbuf_dma[v->hostbuf_write_idx];
+
+			hws_program_dma_for_addr(pdx, ch, dma);
+			iowrite32(lower_32_bits(dma),
+				  pdx->bar0_base + HWS_REG_DMA_ADDR(ch));
+		}
+	}
+
+	if (!hostbuf_mode) {
+		dma_addr_t dma;
+
+		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+		hws_program_dma_for_addr(pdx, ch, dma);
+		iowrite32(lower_32_bits(dma),
+			  pdx->bar0_base + HWS_REG_DMA_ADDR(ch));
+	}
 
 	WRITE_ONCE(v->stop_requested, false);
 	WRITE_ONCE(v->cap_active, true);
@@ -1180,6 +1366,7 @@ static int hws_buffer_prepare(struct vb2_buffer *vb)
 {
 	struct hws_video *vid = vb->vb2_queue->drv_priv;
 	struct hws_pcie_dev *hws = vid->parent;
+	struct hwsvideo_buffer *b = to_hwsbuf(vb);
 	size_t need = vid->pix.sizeimage;
 	dma_addr_t dma_addr;
 
@@ -1193,6 +1380,23 @@ static int hws_buffer_prepare(struct vb2_buffer *vb)
 			"Buffer DMA address 0x%llx not 64-byte aligned\n",
 			(unsigned long long)dma_addr);
 		return -EINVAL;
+	}
+
+	/* Cache a vmap for DMABUF-backed buffers if hostbuf_mode will need it. */
+	if (vid->hostbuf_mode && !vb2_plane_vaddr(vb, 0) &&
+	    !b->mapped_vaddr && vb->planes[0].dbuf) {
+		struct iosys_map map;
+		int r = dma_buf_vmap(vb->planes[0].dbuf, &map);
+
+		if (!r && map.vaddr) {
+			b->mapped_vaddr_base = map.vaddr;
+			b->mapped_vaddr = map.vaddr + vb->planes[0].data_offset;
+			b->mapped_dbuf = vb->planes[0].dbuf;
+		} else {
+			dev_warn(&hws->pdev->dev,
+				 "buffer_prepare: vmap failed for dmabuf vb=%p\n",
+				 vb);
+		}
 	}
 
 	vb2_set_plane_payload(vb, 0, need);
@@ -1219,34 +1423,36 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	vid->queued_count++;
 
 	/* If streaming and no in-flight buffer, prime HW immediately */
-	if (READ_ONCE(vid->cap_active) && !vid->active) {
-		dma_addr_t dma_addr;
+		if (READ_ONCE(vid->cap_active) && !vid->active) {
+			dma_addr_t dma_addr;
 
-		dev_dbg(&hws->pdev->dev,
-			"buffer_queue(ch=%u): priming first vb=%p\n",
-			vid->channel_index, &buf->vb.vb2_buf);
+			dev_dbg(&hws->pdev->dev,
+				"buffer_queue(ch=%u): priming first vb=%p\n",
+				vid->channel_index, &buf->vb.vb2_buf);
 		list_del_init(&buf->list);
 		vid->queued_count--;
 		vid->active = buf;
 
-		if (vid->hostbuf_mode) {
-			if (!vid->hostbuf_cpu) {
-				if (hws_hostbuf_setup(vid)) {
-					dev_warn(&hws->pdev->dev,
-						 "buffer_queue(ch=%u): hostbuf alloc failed, using direct DMA\n",
-						 vid->channel_index);
-					vid->hostbuf_mode = false;
+			if (vid->hostbuf_mode) {
+				if (!vid->hostbuf_count) {
+					if (hws_hostbuf_setup(vid)) {
+						dev_warn(&hws->pdev->dev,
+							 "buffer_queue(ch=%u): hostbuf alloc failed, using direct DMA\n",
+							 vid->channel_index);
+						vid->hostbuf_mode = false;
+					}
+				}
+				if (vid->hostbuf_mode) {
+					dma_addr_t dma = vid->hostbuf_dma[vid->hostbuf_write_idx];
+
+					hws_program_dma_for_addr(vid->parent,
+								 vid->channel_index,
+								 dma);
+					iowrite32(lower_32_bits(dma),
+						  hws->bar0_base +
+						  HWS_REG_DMA_ADDR(vid->channel_index));
 				}
 			}
-			if (vid->hostbuf_mode) {
-				hws_program_dma_for_addr(vid->parent,
-							 vid->channel_index,
-							 vid->hostbuf_dma);
-				iowrite32(lower_32_bits(vid->hostbuf_dma),
-					  hws->bar0_base +
-					  HWS_REG_DMA_ADDR(vid->channel_index));
-			}
-		}
 
 		if (!vid->hostbuf_mode) {
 			dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf,
@@ -1327,15 +1533,16 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 				hostbuf_mode = false;
 				v->hostbuf_mode = false;
 			} else {
+				dma_addr_t dma = v->hostbuf_dma[v->hostbuf_write_idx];
+
 				hws_program_dma_for_addr(hws, v->channel_index,
-							 v->hostbuf_dma);
-				iowrite32(lower_32_bits(v->hostbuf_dma),
+							 dma);
+				iowrite32(lower_32_bits(dma),
 					  hws->bar0_base +
 					  HWS_REG_DMA_ADDR(v->channel_index));
 				dev_dbg(&hws->pdev->dev,
 					"start_streaming: ch=%u hostbuf dma=0x%08x\n",
-					v->channel_index,
-					lower_32_bits(v->hostbuf_dma));
+					v->channel_index, lower_32_bits(dma));
 			}
 		}
 
