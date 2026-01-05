@@ -568,7 +568,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->pix.field = V4L2_FIELD_NONE;
 	vid->pix.colorspace = V4L2_COLORSPACE_REC709;
 	vid->pix.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
-	vid->pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	vid->pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	vid->pix.xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	vid->pix.interlaced = false;
 	vid->pix.half_size = vid->pix.sizeimage / 2;	/* if HW uses halves */

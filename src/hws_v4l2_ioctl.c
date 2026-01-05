@@ -197,7 +197,7 @@ static inline void hws_set_colorimetry_state(struct hws_pix_state *p)
 
 	p->colorspace   = sd ? V4L2_COLORSPACE_SMPTE170M : V4L2_COLORSPACE_REC709;
 	p->ycbcr_enc    = V4L2_YCBCR_ENC_DEFAULT;
-	p->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	p->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	p->xfer_func    = V4L2_XFER_FUNC_DEFAULT;
 }
 
@@ -403,7 +403,7 @@ static inline void hws_set_colorimetry_fmt(struct v4l2_pix_format *p)
 
 	p->colorspace   = sd ? V4L2_COLORSPACE_SMPTE170M : V4L2_COLORSPACE_REC709;
 	p->ycbcr_enc    = V4L2_YCBCR_ENC_DEFAULT;
-	p->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	p->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	p->xfer_func    = V4L2_XFER_FUNC_DEFAULT;
 }
 
