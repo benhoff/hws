@@ -6,7 +6,6 @@
 #include <linux/interrupt.h>
 #include <linux/minmax.h>
 #include <linux/string.h>
-#include <linux/workqueue.h>
 
 #include <media/videobuf2-dma-contig.h>
 
@@ -101,8 +100,6 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hwsvideo_buffer *done;
 	unsigned long flags;
 	bool promoted = false;
-	bool hostbuf_mode;
-	int completed_hostbuf = -1;
 
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): stop=%d cap=%d active=%p\n",
@@ -120,8 +117,6 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
 		return;
 
-	hostbuf_mode = READ_ONCE(v->hostbuf_mode);
-
 	spin_lock_irqsave(&v->irq_lock, flags);
 	done = v->active;
 	if (done && v->next_prepared) {
@@ -135,94 +130,31 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (done) {
 		struct vb2_v4l2_buffer *vb2v = &done->vb;
 		size_t expected = v->pix.sizeimage;
+		size_t payload = vb2_get_plane_payload(&vb2v->vb2_buf, 0);
 
-		if (hostbuf_mode) {
-			if (v->hostbuf_count)
-				completed_hostbuf = READ_ONCE(v->hostbuf_write_idx);
-			if (completed_hostbuf < 0 ||
-			    completed_hostbuf >= v->hostbuf_count) {
-				dev_warn_ratelimited(&hws->pdev->dev,
-						     "bh_video(ch=%u): hostbuf idx invalid %d\n",
-						     ch, completed_hostbuf);
-				vb2_buffer_done(&vb2v->vb2_buf,
-						VB2_BUF_STATE_ERROR);
-				goto hostbuf_rearm;
-			}
-
+		if (payload < expected) {
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "bh_video(ch=%u): short payload %zu < %zu, dropping seq=%u\n",
+					     ch, payload, expected,
+					     v->sequence_number + 1);
+			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
+			goto arm_next;
+		}
+		if (payload > expected)
 			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
-			done->hostbuf_idx = completed_hostbuf;
 
-			dma_rmb();	/* device writes visible before userspace sees it */
+		dma_rmb();	/* device writes visible before userspace sees it */
 
-			spin_lock_irqsave(&v->hostbuf_copy_lock, flags);
-			list_add_tail(&done->list, &v->hostbuf_copy_list);
-			spin_unlock_irqrestore(&v->hostbuf_copy_lock, flags);
-			schedule_work(&v->hostbuf_work);
-			if (!promoted)
-				WRITE_ONCE(v->active, NULL);
-		} else {
-			size_t payload = vb2_get_plane_payload(&vb2v->vb2_buf, 0);
+		vb2v->sequence = ++v->sequence_number;	/* BH-only increment */
+		vb2v->vb2_buf.timestamp = ktime_get_ns();
+		dev_dbg(&hws->pdev->dev,
+			"bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
+			ch, done, vb2v->sequence, v->half_seen,
+			v->last_buf_half_toggle);
 
-			if (payload < expected) {
-				dev_warn_ratelimited(&hws->pdev->dev,
-						     "bh_video(ch=%u): short payload %zu < %zu, dropping seq=%u\n",
-						     ch, payload, expected,
-						     v->sequence_number + 1);
-				vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
-				goto arm_next;
-			}
-			if (payload > expected)
-				vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
-
-			dma_rmb();	/* device writes visible before userspace sees it */
-
-			vb2v->sequence = ++v->sequence_number;	/* BH-only increment */
-			vb2v->vb2_buf.timestamp = ktime_get_ns();
-			dev_dbg(&hws->pdev->dev,
-				"bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
-				ch, done, vb2v->sequence, v->half_seen,
-				v->last_buf_half_toggle);
-
-			if (!promoted)
-				v->active = NULL;	/* channel no longer owns this buffer */
-			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
-		}
-	}
-
-	if (hostbuf_mode) {
-		/* Flip DMA to the other host buffer and rotate active buffer. */
-hostbuf_rearm:
-		if (v->hostbuf_count) {
-			int next_idx;
-			dma_addr_t dma;
-
-			if (completed_hostbuf < 0)
-				completed_hostbuf = READ_ONCE(v->hostbuf_write_idx);
-			next_idx = (v->hostbuf_count > 1) ?
-			    (completed_hostbuf ^ 1) : completed_hostbuf;
-			dma = v->hostbuf_dma[next_idx];
-			hws_program_dma_for_addr(hws, ch, dma);
-			hws_set_dma_doorbell(hws, ch, dma, "hostbuf_toggle");
-			WRITE_ONCE(v->hostbuf_write_idx, next_idx);
-		}
-
-		spin_lock_irqsave(&v->irq_lock, flags);
-		if (v->active) {
-			/* next_prepared already promoted above */
-		} else if (!list_empty(&v->capture_queue)) {
-			struct hwsvideo_buffer *next;
-
-			next = list_first_entry(&v->capture_queue,
-						struct hwsvideo_buffer, list);
-			list_del_init(&next->list);
-			if (v->queued_count)
-				v->queued_count--;
-			v->active = next;
-		} else if (!v->active) {
-			v->active = NULL;
-		}
-		spin_unlock_irqrestore(&v->irq_lock, flags);
-		return;
+		if (!promoted)
+			v->active = NULL;	/* channel no longer owns this buffer */
+		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
 	if (unlikely(READ_ONCE(hws->suspended)))
