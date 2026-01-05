@@ -200,10 +200,17 @@ static int main_ks_thread_handle(void *data)
 
 static void hws_stop_kthread_action(void *data)
 {
-	struct task_struct *t = data;
+	struct hws_pcie_dev *hws = data;
+	struct task_struct *t;
 
-	if (!IS_ERR_OR_NULL(t))
+	if (!hws)
+		return;
+
+	t = READ_ONCE(hws->main_task);
+	if (!IS_ERR_OR_NULL(t)) {
+		WRITE_ONCE(hws->main_task, NULL);
 		kthread_stop(t);
+	}
 }
 
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
@@ -446,7 +453,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_err(&pdev->dev, "kthread_run: %d\n", ret);
 		goto err_unregister_va;
 	}
-	ret = devm_add_action_or_reset(&pdev->dev, hws_stop_kthread_action, hws->main_task);
+	ret = devm_add_action_or_reset(&pdev->dev, hws_stop_kthread_action, hws);
 	if (ret) {
 		dev_err(&pdev->dev, "devm_add_action kthread_stop: %d\n", ret);
 		goto err_unregister_va; /* reset already stopped the thread */
@@ -578,6 +585,10 @@ static void hws_remove(struct pci_dev *pdev)
 
 	if (!hws)
 		return;
+
+	/* Stop the monitor thread before tearing down V4L2/vb2 objects. */
+	WRITE_ONCE(hws->suspended, true);
+	hws_stop_kthread_action(hws);
 
 	/* Stop hardware / capture cleanly (your helper) */
 	hws_stop_device(hws);

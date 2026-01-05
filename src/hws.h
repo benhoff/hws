@@ -83,7 +83,6 @@ struct hws_video {
 	struct v4l2_ctrl *ctrl_saturation;
 	struct v4l2_ctrl *ctrl_hue;
 	/* ───── capture queue status ───── */
-	// FIXME: https://chatgpt.com/s/t_68aaabb351b48191b791152813d52e9a
 	struct hws_pix_state pix;
 	struct v4l2_dv_timings cur_dv_timings; /* last configured DV timings */
 	u32 current_fps; /* Hz, derived from mode or HW rate reg */
