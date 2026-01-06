@@ -855,6 +855,13 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	    (interlaced && (h * 2) > MAX_VIDEO_HW_H))
 		return;
 
+	if (!mutex_trylock(&v->qlock))
+		return;
+	if (!mutex_trylock(&v->state_lock)) {
+		mutex_unlock(&v->qlock);
+		return;
+	}
+
 	WRITE_ONCE(v->stop_requested, true);
 	WRITE_ONCE(v->cap_active, false);
 	/* Publish software stop first so the IRQ completion path sees the stop
@@ -922,7 +929,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		 */
 		if (new_size > v->alloc_sizeimage) {
 			vb2_queue_error(&v->buffer_queue);
-			return;
+			goto out_unlock;
 		}
 	}
 
@@ -953,7 +960,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	if (!reenable)
-		return;
+		goto out_unlock;
 	{
 		dma_addr_t dma;
 
@@ -972,6 +979,10 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	wmb(); /* ensure DMA window/address writes visible before enable */
 	hws_enable_video_capture(pdx, ch, true);
 	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+
+out_unlock:
+	mutex_unlock(&v->state_lock);
+	mutex_unlock(&v->qlock);
 }
 
 static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch)

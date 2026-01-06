@@ -230,7 +230,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	new_h = bt->height;
 	interlaced = false;
 
-    lockdep_assert_held(&vid->qlock);
+	lockdep_assert_held(&vid->state_lock);
 
 	/* If vb2 has active buffers and size would change, reject. */
 	was_busy = vb2_is_busy(&vid->buffer_queue);
