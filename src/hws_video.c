@@ -274,7 +274,7 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 		if (dst)
 			memset(dst, 0x10, v->pix.sizeimage);
 		vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
-		vb2v->sequence = ++v->sequence_number;
+		vb2v->sequence = (u32)atomic_inc_return(&v->sequence_number);
 		vb2v->vb2_buf.timestamp = ktime_get_ns();
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
@@ -354,7 +354,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	mutex_init(&vid->qlock);
 	spin_lock_init(&vid->irq_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
-	vid->sequence_number = 0;
+	atomic_set(&vid->sequence_number, 0);
 	vid->active = NULL;
 
 	/* DMA watchdog removed; retain counters for diagnostics */
@@ -956,7 +956,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	/* Reset per-channel toggles/counters */
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
-	v->sequence_number = 0;
+	atomic_set(&v->sequence_number, 0);
 
 	/* Re-prime first VB2 buffer if present */
 	spin_lock_irqsave(&v->irq_lock, flags);

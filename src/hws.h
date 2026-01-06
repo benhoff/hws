@@ -10,6 +10,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/sizes.h>
+#include <linux/atomic.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -93,7 +94,7 @@ struct hws_video {
 	bool stop_requested;
 	u8 last_buf_half_toggle;
 	bool half_seen;
-	u32 sequence_number;
+	atomic_t sequence_number;
 	u32 queued_count;
 
 	/* ───── timeout and error handling ───── */
