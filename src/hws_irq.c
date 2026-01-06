@@ -130,18 +130,17 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (done) {
 		struct vb2_v4l2_buffer *vb2v = &done->vb;
 		size_t expected = v->pix.sizeimage;
-		size_t payload = vb2_get_plane_payload(&vb2v->vb2_buf, 0);
+		size_t plane_size = vb2_plane_size(&vb2v->vb2_buf, 0);
 
-		if (payload < expected) {
+		if (unlikely(expected > plane_size)) {
 			dev_warn_ratelimited(&hws->pdev->dev,
-					     "bh_video(ch=%u): short payload %zu < %zu, dropping seq=%u\n",
-					     ch, payload, expected,
+					     "bh_video(ch=%u): sizeimage %zu > plane %zu, dropping seq=%u\n",
+					     ch, expected, plane_size,
 					     v->sequence_number + 1);
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
 			goto arm_next;
 		}
-		if (payload > expected)
-			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
+		vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
 
 		dma_rmb();	/* device writes visible before userspace sees it */
 

@@ -46,6 +46,14 @@ static const size_t hws_dv_modes_cnt = ARRAY_SIZE(hws_dv_modes);
 /* YUYV: 16 bpp; align to 64 as you did elsewhere */
 static inline u32 hws_calc_bpl_yuyv(u32 w)     { return ALIGN(w * 2, 64); }
 static inline u32 hws_calc_size_yuyv(u32 w, u32 h) { return hws_calc_bpl_yuyv(w) * h; }
+static inline u32 hws_calc_half_size(u32 sizeimage)
+{
+	u32 half = ALIGN_DOWN(sizeimage / 2, 2048);
+
+	if (!half || half >= sizeimage)
+		half = sizeimage / 2;
+	return half;
+}
 
 static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,
 				     u8 br, u8 co, u8 hu, u8 sa)
@@ -254,6 +262,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	/* Recompute stride/sizeimage/half_size using your helper */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
 	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
+	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->cur_dv_timings   = m->timings;
 	vid->current_fps      = m->refresh_hz;
 	if (!was_busy)
@@ -514,7 +523,7 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	/* Update sizes (use helper if you prefer strict alignment math) */
     vid->pix.bytesperline = f->fmt.pix.bytesperline;          /* aligned */
     vid->pix.sizeimage    = f->fmt.pix.sizeimage;             /* logical */
-	vid->pix.half_size    = vid->pix.sizeimage / 2;
+	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->pix.interlaced   = false;
 	hws_set_current_dv_timings(vid, vid->pix.width, vid->pix.height,
 				   vid->pix.interlaced);
