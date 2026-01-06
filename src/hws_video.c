@@ -1113,8 +1113,10 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 	need_alloc = PAGE_ALIGN(vid->pix.sizeimage);
 
 	if (*nplanes) {
-		if (sizes[0] < need_alloc)
+		if (sizes[0] < vid->pix.sizeimage)
 			return -EINVAL;
+		if (sizes[0] < need_alloc)
+			sizes[0] = need_alloc;
 	} else {
 		*nplanes = 1;
 		sizes[0] = need_alloc;	// page-aligned requirement
