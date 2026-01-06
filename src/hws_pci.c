@@ -335,6 +335,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	int i, ret, nvec, irq;
 	unsigned long irqf = 0;
 	bool has_msix_cap, has_msi_cap, using_msi;
+	bool v4l2_registered = false;
 
 	/* devres-backed device object */
 	hws = devm_kzalloc(&pdev->dev, sizeof(*hws), GFP_KERNEL);
@@ -442,6 +443,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_err(&pdev->dev, "video_register: %d\n", ret);
 		goto err_unwind_channels;
 	}
+	v4l2_registered = true;
 
 	/* 12) Background monitor thread (managed) */
 	hws->main_task = kthread_run(main_ks_thread_handle, hws, "hws-mon");
@@ -465,10 +467,12 @@ err_unregister_va:
 	hws_stop_device(hws);
 	hws_video_unregister(hws);
 	hws_free_seed_buffers(hws);
+	return ret;
 err_unwind_channels:
 	hws_free_seed_buffers(hws);
-	while (--i >= 0) {
-		hws_video_cleanup_channel(hws, i);
+	if (!v4l2_registered) {
+		while (--i >= 0)
+			hws_video_cleanup_channel(hws, i);
 	}
 	return ret;
 }
@@ -579,7 +583,6 @@ out:
 static void hws_remove(struct pci_dev *pdev)
 {
 	struct hws_pcie_dev *hws = pci_get_drvdata(pdev);
-	int i;
 
 	if (!hws)
 		return;
@@ -593,11 +596,6 @@ static void hws_remove(struct pci_dev *pdev)
 
 	/* Unregister subsystems you registered */
 	hws_video_unregister(hws);
-
-	/* Per-channel teardown */
-	for (i = 0; i < hws->max_channels; i++) {
-		hws_video_cleanup_channel(hws, i);
-	}
 
 	/* Release seeded DMA buffers */
 	hws_free_seed_buffers(hws);
