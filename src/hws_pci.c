@@ -21,8 +21,6 @@
 #include "hws_v4l2_ioctl.h"
 
 #define DRV_NAME "hws"
-#define HWS_REG_DEVICE_INFO 0x0000
-#define HWS_REG_DEC_MODE 0x0004
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
 
