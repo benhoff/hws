@@ -699,9 +699,12 @@ void check_video_format(struct hws_pcie_dev *pdx)
 
 	for (i = 0; i < pdx->cur_max_video_ch; i++) {
 		if (!hws_update_active_interlace(pdx, i)) {
-			// return 1;                         /* no active video */
+			/* No active video; optionally feed neutral frames to keep streaming. */
 			if (pdx->video[i].signal_loss_cnt == 0)
 				pdx->video[i].signal_loss_cnt = 1;
+			if (pdx->video[i].cap_active)
+				hws_force_no_signal_frame(&pdx->video[i],
+							  "monitor_nosignal");
 		} else {
 			if (pdx->hw_ver > 0)
 				handle_hwv2_path(pdx, i);
@@ -711,15 +714,6 @@ void check_video_format(struct hws_pcie_dev *pdx)
 
 			update_live_resolution(pdx, i);
 			pdx->video[i].signal_loss_cnt = 0;
-		}
-
-		/* If we just detected a loss on an active capture channel… */
-		if (pdx->video[i].signal_loss_cnt == 1 &&
-		    pdx->video[i].cap_active) {
-			/* Use the two-buffer approach for signal loss handling */
-			hws_force_no_signal_frame(&pdx->video[i],
-						  "monitor_nosignal");
-			pdx->video[i].signal_loss_cnt = 2;
 		}
 	}
 }
