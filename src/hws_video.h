@@ -18,8 +18,8 @@ int hws_check_card_status(struct hws_pcie_dev *hws);
 void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable);
 
 void hws_program_dma_for_addr(struct hws_pcie_dev *hws,
-		       unsigned int ch,
-		       dma_addr_t dma);
+			      unsigned int ch,
+			      dma_addr_t dma);
 void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 			  dma_addr_t dma, const char *tag);
 

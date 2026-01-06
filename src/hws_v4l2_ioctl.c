@@ -24,21 +24,161 @@ static const struct hws_dv_mode *
 hws_find_dv_by_wh(u32 w, u32 h, bool interlaced);
 
 static const struct hws_dv_mode hws_dv_modes[] = {
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1920, .height = 1080, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  720, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  720, .height =  480, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  720, .height =  576, .interlaced = 0 } }, 50 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  800, .height =  600, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width =  640, .height =  480, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1024, .height =  768, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  768, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height =  800, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1280, .height = 1024, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1360, .height =  768, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1440, .height =  900, .interlaced = 0 } }, 60 },
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1680, .height = 1050, .interlaced = 0 } }, 60 },
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1920,
+				.height = 1080,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1280,
+				.height = 720,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 720,
+				.height = 480,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 720,
+				.height = 576,
+				.interlaced = 0,
+			},
+		},
+		50,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 800,
+				.height = 600,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 640,
+				.height = 480,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1024,
+				.height = 768,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1280,
+				.height = 768,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1280,
+				.height = 800,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1280,
+				.height = 1024,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1360,
+				.height = 768,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1440,
+				.height = 900,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1680,
+				.height = 1050,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
 	/* Portrait */
-	{ { .type = V4L2_DV_BT_656_1120, .bt = { .width = 1080, .height = 1920, .interlaced = 0 } }, 60 },
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1080,
+				.height = 1920,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
 };
 
 static const size_t hws_dv_modes_cnt = ARRAY_SIZE(hws_dv_modes);
@@ -432,10 +572,14 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	/* Defaults then clamp */
 	w = (req_w ? req_w : 640);
 	h = (req_h ? req_h : 480);
-	if (w > MAX_VIDEO_HW_W) w = MAX_VIDEO_HW_W;
-	if (h > MAX_VIDEO_HW_H) h = MAX_VIDEO_HW_H;
-	if (!w) w = 640;  /* hard fallback in case macros are odd */
-	if (!h) h = 480;
+	if (w > MAX_VIDEO_HW_W)
+		w = MAX_VIDEO_HW_W;
+	if (h > MAX_VIDEO_HW_H)
+		h = MAX_VIDEO_HW_H;
+	if (!w)
+		w = 640; /* hard fallback in case macros are odd */
+	if (!h)
+		h = 480;
 
 	/* Field policy */
 	pix->field = V4L2_FIELD_NONE;
@@ -445,17 +589,19 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 
 	/* Bound requested bpl to something sane, then align */
 	bpl = pix->bytesperline;
-	if (bpl < min_bpl)
+	if (bpl < min_bpl) {
 		bpl = min_bpl;
-	else {
+	} else {
 		/* Cap at 16x width to avoid silly values that overflow sizeimage */
 		u32 max_bpl = ALIGN(w * 2 * 16, 64);
+
 		if (bpl > max_bpl)
 			bpl = max_bpl;
 		bpl = ALIGN(bpl, 64);
 	}
 	if (h && max_frame) {
 		size_t max_bpl_hw = max_frame / h;
+
 		if (max_bpl_hw < min_bpl)
 			return -ERANGE;
 		max_bpl_hw = rounddown(max_bpl_hw, 64);
@@ -486,7 +632,6 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 			pix->sizeimage, pix->field);
 	return 0;
 }
-
 
 int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
@@ -521,8 +666,8 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	vid->pix.xfer_func    = f->fmt.pix.xfer_func;
 
 	/* Update sizes (use helper if you prefer strict alignment math) */
-    vid->pix.bytesperline = f->fmt.pix.bytesperline;          /* aligned */
-    vid->pix.sizeimage    = f->fmt.pix.sizeimage;             /* logical */
+	vid->pix.bytesperline = f->fmt.pix.bytesperline; /* aligned */
+	vid->pix.sizeimage    = f->fmt.pix.sizeimage;    /* logical */
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->pix.interlaced   = false;
 	hws_set_current_dv_timings(vid, vid->pix.width, vid->pix.height,

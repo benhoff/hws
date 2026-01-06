@@ -225,7 +225,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 				continue;
 
 			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
-			     !READ_ONCE(pdx->video[ch].stop_requested))) {
+				   !READ_ONCE(pdx->video[ch].stop_requested))) {
 				if (unlikely(hws_toggle_debug)) {
 					u32 toggle =
 					    readl_relaxed(pdx->bar0_base +

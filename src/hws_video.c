@@ -39,8 +39,6 @@ static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced);
 
 /* DMA helper functions */
-void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
-			  dma_addr_t dma, const char *tag);
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
 hws_take_queued_buffer_locked(struct hws_video *vid);
@@ -285,7 +283,7 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 		    vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
 		hws_program_dma_for_addr(hws, v->channel_index, dma);
 		hws_set_dma_doorbell(hws, v->channel_index, dma,
-			     tag ? tag : "nosignal_zero");
+				     tag ? tag : "nosignal_zero");
 		doorbell = true;
 	}
 	if (doorbell) {
@@ -709,7 +707,7 @@ void check_video_format(struct hws_pcie_dev *pdx)
 			if (pdx->hw_ver > 0)
 				handle_hwv2_path(pdx, i);
 			else
-				// FIXME: legacy struct names in subfunction
+				/* Legacy path stub; see handle_legacy_path() comment. */
 				handle_legacy_path(pdx, i);
 
 			update_live_resolution(pdx, i);
@@ -821,7 +819,21 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 
 static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	/* No-op by default. If you introduce a SW FPS accumulator, map it here.
+	/*
+	 * Legacy (hw_ver == 0) expected behavior:
+	 * - A per-channel SW FPS accumulator incremented on each VDONE.
+	 * - A once-per-second poll mapped the count to discrete FPS:
+	 *   >55*2 => 60, >45*2 => 50, >25*2 => 30, >20*2 => 25, else 60,
+	 *   then reset the accumulator to 0.
+	 * - The *2 factor assumed VDONE fired per-field; if legacy VDONE is
+	 *   per-frame, drop the factor.
+	 *
+	 * Current code keeps this path as a no-op; vid->current_fps stays at the
+	 * default or mode-derived value. If accurate legacy FPS reporting is
+	 * needed (V4L2 g_parm/timeperframe), reintroduce the accumulator in the
+	 * IRQ path and perform the mapping/reset here.
+	 *
+	 * No-op by default. If you introduce a SW FPS accumulator, map it here.
 	 *
 	 * Example skeleton:
 	 *
