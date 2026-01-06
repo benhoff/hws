@@ -529,7 +529,7 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	writel(status, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 
-	hws->video[chan].cap_active = on;
+	WRITE_ONCE(hws->video[chan].cap_active, on);
 
 	dev_dbg(&hws->pdev->dev, "vcap %s ch%u (reg=0x%08x)\n",
 		on ? "ON" : "OFF", chan, status);
@@ -700,7 +700,7 @@ void check_video_format(struct hws_pcie_dev *pdx)
 			/* No active video; optionally feed neutral frames to keep streaming. */
 			if (pdx->video[i].signal_loss_cnt == 0)
 				pdx->video[i].signal_loss_cnt = 1;
-			if (pdx->video[i].cap_active)
+			if (READ_ONCE(pdx->video[i].cap_active))
 				hws_force_no_signal_frame(&pdx->video[i],
 							  "monitor_nosignal");
 		} else {
