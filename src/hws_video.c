@@ -376,11 +376,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	vid->pix.xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	vid->pix.interlaced = false;
-	/* Hardware expects half-length aligned to 2048 bytes. */
 	vid->pix.half_size = vid->pix.sizeimage / 2;
-	vid->pix.half_size = ALIGN_DOWN(vid->pix.half_size, 2048);
-	if (!vid->pix.half_size || vid->pix.half_size >= vid->pix.sizeimage)
-		vid->pix.half_size = vid->pix.sizeimage / 2;
 	vid->alloc_sizeimage = vid->pix.sizeimage;
 	hws_set_current_dv_timings(vid, vid->pix.width,
 				   vid->pix.height, vid->pix.interlaced);
@@ -1107,10 +1103,7 @@ static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 	v->pix.bytesperline = bytesperline;
 	sizeimage = bytesperline * lines;
 
-	/* Hardware expects half-length aligned to 2048 bytes. */
-	half0 = ALIGN_DOWN(sizeimage / 2, 2048);
-	if (!half0 || half0 >= sizeimage)
-		half0 = sizeimage / 2;
+	half0 = sizeimage / 2;
 
 	v->pix.sizeimage = sizeimage;
 	v->pix.half_size = half0;	/* first half; second = sizeimage - half0 */
