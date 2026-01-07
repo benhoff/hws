@@ -861,6 +861,8 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	u32 new_size;
 	bool reenable = false;
 	struct hwsvideo_buffer *buf = NULL;
+	struct list_head done;
+	struct hwsvideo_buffer *b, *tmp;
 
 	if (!pdx || !pdx->bar0_base)
 		return;
@@ -871,12 +873,10 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	    (interlaced && (h * 2) > MAX_VIDEO_HW_H))
 		return;
 
-	if (!mutex_trylock(&v->qlock))
-		return;
 	if (!mutex_trylock(&v->state_lock)) {
-		mutex_unlock(&v->qlock);
 		return;
 	}
+	INIT_LIST_HEAD(&done);
 
 	WRITE_ONCE(v->stop_requested, true);
 	WRITE_ONCE(v->cap_active, false);
@@ -895,16 +895,14 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->active) {
-		vb2_buffer_done(&v->active->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+		INIT_LIST_HEAD(&v->active->list);
+		list_add_tail(&v->active->list, &done);
 		v->active = NULL;
 	}
 	while (!list_empty(&v->capture_queue)) {
-		struct hwsvideo_buffer *b = list_first_entry(&v->capture_queue,
-							     struct
-							     hwsvideo_buffer,
-							     list);
-		list_del_init(&b->list);
-		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+		b = list_first_entry(&v->capture_queue, struct hwsvideo_buffer,
+				     list);
+		list_move_tail(&b->list, &done);
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
@@ -998,7 +996,11 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 out_unlock:
 	mutex_unlock(&v->state_lock);
-	mutex_unlock(&v->qlock);
+
+	list_for_each_entry_safe(b, tmp, &done, list) {
+		list_del_init(&b->list);
+		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+	}
 }
 
 static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch)
