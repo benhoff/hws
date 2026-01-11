@@ -18,7 +18,6 @@ int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *setfp
 int hws_vidioc_enum_input(struct file *file, void *priv, struct v4l2_input *i);
 int hws_vidioc_g_input(struct file *file, void *priv, unsigned int *i);
 int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i);
-int vidioc_log_status(struct file *file, void *priv);
 int hws_vidioc_g_ctrl(struct file *file, void *fh, struct v4l2_control *a);
 int hws_vidioc_s_ctrl(struct file *file, void *fh, struct v4l2_control *a);
 int hws_vidioc_dv_timings_cap(struct file *file, void *fh,

@@ -1024,15 +1024,10 @@ static int hws_open(struct file *file)
 	return v4l2_fh_open(file);
 }
 
-static int hws_release(struct file *file)
-{
-	return vb2_fop_release(file);
-}
-
 static const struct v4l2_file_operations hws_fops = {
 	.owner = THIS_MODULE,
 	.open = hws_open,
-	.release = hws_release,
+	.release = vb2_fop_release,
 	.poll = vb2_fop_poll,
 	.unlocked_ioctl = video_ioctl2,
 	.mmap = vb2_fop_mmap,
@@ -1084,7 +1079,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_s_dv_timings = hws_vidioc_s_dv_timings,
 	.vidioc_dv_timings_cap = hws_vidioc_dv_timings_cap,
 
-	.vidioc_log_status = vidioc_log_status,
+	.vidioc_log_status = v4l2_ctrl_log_status,
 	.vidioc_subscribe_event = hws_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 	.vidioc_g_parm = hws_vidioc_g_parm,

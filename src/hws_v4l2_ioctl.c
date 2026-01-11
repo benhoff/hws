@@ -508,7 +508,8 @@ int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *c
 	int vi_index = vid->channel_index + 1; /* keep it simple */
 
 	strscpy(cap->driver, KBUILD_MODNAME, sizeof(cap->driver));
-	snprintf(cap->card, sizeof(cap->card), "%s %d", KBUILD_MODNAME, vi_index);
+	snprintf(cap->card, sizeof(cap->card),
+		 "AVMatrix HWS Capture %d", vi_index);
 	snprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s", dev_name(&pdev->pdev->dev));
 
 	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
@@ -729,12 +730,6 @@ int hws_vidioc_g_input(struct file *file, void *priv, unsigned int *index)
 int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 {
 	return i ? -EINVAL : 0;
-}
-
-int vidioc_log_status(struct file *file, void *priv)
-{
-	/* Skip verbose ctrl dump to keep the kernel log quiet. */
-	return 0;
 }
 
 int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *param)
