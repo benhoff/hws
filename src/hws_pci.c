@@ -38,19 +38,39 @@
 	  .subdevice = (__subdev),                                  \
 	  .driver_data = (unsigned long)(__configptr) }
 
+/*
+ * PCI IDs for HWS family cards.
+ *
+ * The subsystem IDs are fixed at 0x8888:0x0007 for this family. Some boards
+ * enumerate with vendor ID 0x8888 or 0x1f33. Exact SKU names are not fully
+ * pinned down yet; update these comments when vendor documentation or INF
+ * strings are available.
+ */
 static const struct pci_device_id hws_pci_table[] = {
+	/* HWS family, SKU unknown. */
 	MAKE_ENTRY(0x8888, 0x9534, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x1F33, 0x8534, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x1F33, 0x8554, 0x8888, 0x0007, NULL),
+
+	/* HWS 2x2 HDMI family. */
 	MAKE_ENTRY(0x8888, 0x8524, 0x8888, 0x0007, NULL),
+	/* HWS 2x2 SDI family. */
 	MAKE_ENTRY(0x1F33, 0x6524, 0x8888, 0x0007, NULL),
+
+	/* HWS X4 HDMI family. */
 	MAKE_ENTRY(0x8888, 0x8504, 0x8888, 0x0007, NULL),
+	/* HWS X4 SDI family. */
 	MAKE_ENTRY(0x8888, 0x6504, 0x8888, 0x0007, NULL),
+
+	/* HWS family, SKU unknown. */
 	MAKE_ENTRY(0x8888, 0x8532, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x8888, 0x8512, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x8888, 0x8501, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x1F33, 0x6502, 0x8888, 0x0007, NULL),
+
+	/* HWS X4 HDMI family (alternate vendor ID). */
 	MAKE_ENTRY(0x1F33, 0x8504, 0x8888, 0x0007, NULL),
+	/* HWS 2x2 HDMI family (alternate vendor ID). */
 	MAKE_ENTRY(0x1F33, 0x8524, 0x8888, 0x0007, NULL),
 
 	{}
