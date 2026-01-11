@@ -16,7 +16,6 @@
 #include <media/v4l2-dev.h>
 #include <media/v4l2-event.h>
 #include <media/videobuf2-v4l2.h>
-#include <media/videobuf2-core.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-dma-contig.h>
 
@@ -1112,7 +1111,6 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 			   struct device *alloc_devs[])
 {
 	struct hws_video *vid = q->drv_priv;
-	size_t need_alloc;
 
 	(void)num_buffers;
 	(void)alloc_devs;
@@ -1121,19 +1119,15 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 		vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
 		vid->pix.sizeimage = vid->pix.bytesperline * vid->pix.height;
 	}
-	need_alloc = PAGE_ALIGN(vid->pix.sizeimage);
-
 	if (*nplanes) {
 		if (sizes[0] < vid->pix.sizeimage)
 			return -EINVAL;
-		if (sizes[0] < need_alloc)
-			sizes[0] = need_alloc;
 	} else {
 		*nplanes = 1;
-		sizes[0] = need_alloc;	// page-aligned requirement
+		sizes[0] = PAGE_ALIGN(vid->pix.sizeimage);
 	}
 
-	vid->alloc_sizeimage = need_alloc;
+	vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
 	return 0;
 }
 
@@ -1218,8 +1212,33 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		v->channel_index, count);
 
 	ret = hws_check_card_status(hws);
-	if (ret)
+	if (ret) {
+		struct hwsvideo_buffer *b, *tmp;
+		unsigned long f;
+		LIST_HEAD(queued);
+
+		spin_lock_irqsave(&v->irq_lock, f);
+		if (v->active) {
+			list_add_tail(&v->active->list, &queued);
+			v->active = NULL;
+		}
+		if (v->next_prepared) {
+			list_add_tail(&v->next_prepared->list, &queued);
+			v->next_prepared = NULL;
+		}
+		while (!list_empty(&v->capture_queue)) {
+			b = list_first_entry(&v->capture_queue,
+					     struct hwsvideo_buffer, list);
+			list_move_tail(&b->list, &queued);
+		}
+		spin_unlock_irqrestore(&v->irq_lock, f);
+
+		list_for_each_entry_safe(b, tmp, &queued, list) {
+			list_del_init(&b->list);
+			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
+		}
 		return ret;
+	}
 	(void)hws_update_active_interlace(hws, v->channel_index);
 
 	mutex_lock(&v->state_lock);
@@ -1355,8 +1374,6 @@ static const struct vb2_ops hwspcie_video_qops = {
 	.buf_cleanup = hws_buf_cleanup,
 	// .buf_finish = hws_buffer_finish,
 	.buf_queue = hws_buffer_queue,
-	.wait_prepare = vb2_ops_wait_prepare,
-	.wait_finish = vb2_ops_wait_finish,
 	.start_streaming = hws_start_streaming,
 	.stop_streaming = hws_stop_streaming,
 };
