@@ -14,6 +14,7 @@
 #include "hws.h"
 #include "hws_reg.h"
 #include "hws_video.h"
+#include "hws_v4l2_ioctl.h"
 
 struct hws_dv_mode {
 	struct v4l2_dv_timings timings;
@@ -283,7 +284,7 @@ int hws_vidioc_query_dv_timings(struct file *file, void *fh,
 	struct hws_video *vid = video_drvdata(file);
 	const struct hws_dv_mode *m;
 	u32 w, h;
-	bool interlace, live_ok;
+	bool interlace;
 
 	if (!timings)
 		return -EINVAL;
@@ -291,7 +292,7 @@ int hws_vidioc_query_dv_timings(struct file *file, void *fh,
 	w = vid->pix.width;
 	h = vid->pix.height;
 	interlace = vid->pix.interlaced;
-	live_ok = hws_get_live_dv_geometry(vid, &w, &h, &interlace);
+	(void)hws_get_live_dv_geometry(vid, &w, &h, &interlace);
 	/* Map current (live if available, otherwise cached) WxH/interlace
 	 * to one of our supported modes.
 	 */

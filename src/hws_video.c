@@ -333,7 +333,6 @@ static int hws_ctrls_init(struct hws_video *vid)
 int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 {
 	struct hws_video *vid;
-	struct v4l2_ctrl_handler *hdl;
 
 	/* basic sanity */
 	if (!pdev || ch < 0 || ch >= pdev->max_channels)
@@ -1419,8 +1418,10 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		vdev->ctrl_handler = &ch->control_handler;
 		vdev->vfl_dir = VFL_DIR_RX;
 		vdev->release = video_device_release;
-		if (ch->control_handler.error)
+		if (ch->control_handler.error) {
+			ret = ch->control_handler.error;
 			goto err_unwind;
+		}
 		video_set_drvdata(vdev, ch);
 
 		/* vb2 queue init (dma-contig) */

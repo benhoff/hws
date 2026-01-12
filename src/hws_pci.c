@@ -165,30 +165,6 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	return 0;
 }
 
-static void hws_free_irq_vectors_action(void *data)
-{
-	pci_free_irq_vectors((struct pci_dev *)data);
-}
-
-static bool hws_any_capture_active(const struct hws_pcie_dev *pdx)
-{
-	unsigned int ch, max;
-
-	if (!pdx)
-		return false;
-
-	max = READ_ONCE(pdx->cur_max_video_ch);
-	if (max > pdx->max_channels)
-		max = pdx->max_channels;
-
-	for (ch = 0; ch < max; ch++) {
-		if (READ_ONCE(pdx->video[ch].cap_active))
-			return true;
-	}
-
-	return false;
-}
-
 static int main_ks_thread_handle(void *data)
 {
 	struct hws_pcie_dev *pdx = data;
@@ -352,9 +328,8 @@ static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 {
 	struct hws_pcie_dev *hws;
-	int i, ret, nvec, irq;
+	int i, ret, irq;
 	unsigned long irqf = 0;
-	bool has_msix_cap, has_msi_cap, using_msi;
 	bool v4l2_registered = false;
 
 	/* devres-backed device object */
