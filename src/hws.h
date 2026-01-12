@@ -65,7 +65,6 @@ struct hws_video {
 	/* ───── locking ───── */
 	struct mutex state_lock;	/* primary state */
 	spinlock_t irq_lock;	/* ISR-side */
-	struct mutex qlock;
 
 	/* ───── indices ───── */
 	int channel_index;

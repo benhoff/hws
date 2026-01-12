@@ -350,7 +350,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 	/* locks & lists */
 	mutex_init(&vid->state_lock);
-	mutex_init(&vid->qlock);
 	spin_lock_init(&vid->irq_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
 	atomic_set(&vid->sequence_number, 0);
@@ -470,7 +469,6 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 
 	/* 8) Reset simple state (don’t memset the whole struct here) */
 	mutex_destroy(&vid->state_lock);
-	mutex_destroy(&vid->qlock);
 	INIT_LIST_HEAD(&vid->capture_queue);
 	vid->active = NULL;
 	vid->stop_requested = false;
@@ -1241,13 +1239,12 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 	(void)hws_update_active_interlace(hws, v->channel_index);
 
-	mutex_lock(&v->state_lock);
+	lockdep_assert_held(&v->state_lock);
 	/* init per-stream state */
 	WRITE_ONCE(v->stop_requested, false);
 	WRITE_ONCE(v->cap_active, true);
 	WRITE_ONCE(v->half_seen, false);
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
-	mutex_unlock(&v->state_lock);
 
 	/* Try to prime a buffer, but it's OK if none are queued yet */
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -1314,10 +1311,9 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	LIST_HEAD(done);
 
 	/* 1) Quiesce SW/HW first */
-	mutex_lock(&v->state_lock);
+	lockdep_assert_held(&v->state_lock);
 	WRITE_ONCE(v->cap_active, false);
 	WRITE_ONCE(v->stop_requested, true);
-	mutex_unlock(&v->state_lock);
 
 	hws_enable_video_capture(v->parent, v->channel_index, false);
 
@@ -1437,7 +1433,7 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q->ops = &hwspcie_video_qops;	/* your vb2_ops */
 		q->mem_ops = &vb2_dma_contig_memops;
 		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-		q->lock = &ch->qlock;
+		q->lock = &ch->state_lock;
 		q->min_queued_buffers = 1;
 		q->dev = &dev->pdev->dev;
 
