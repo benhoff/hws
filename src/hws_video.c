@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/bits.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/interrupt.h>
 #include <linux/moduleparam.h>
 #include <linux/sysfs.h>
@@ -1302,12 +1303,48 @@ static inline bool list_node_unlinked(const struct list_head *n)
 	return n->next == LIST_POISON1 || n->prev == LIST_POISON2;
 }
 
+static void hws_log_video_shutdown_state(struct hws_video *v, const char *tag)
+{
+	struct hws_pcie_dev *hws = v->parent;
+	unsigned long flags;
+	unsigned int queued = 0;
+	unsigned int tracked = 0;
+	unsigned int seq = 0;
+	struct hwsvideo_buffer *b;
+	bool streaming = vb2_is_streaming(&v->buffer_queue);
+	bool cap_active;
+	bool stop_requested;
+	struct hwsvideo_buffer *active;
+	struct hwsvideo_buffer *next_prepared;
+
+	spin_lock_irqsave(&v->irq_lock, flags);
+	list_for_each_entry(b, &v->capture_queue, list)
+		queued++;
+	cap_active = READ_ONCE(v->cap_active);
+	stop_requested = READ_ONCE(v->stop_requested);
+	active = v->active;
+	next_prepared = v->next_prepared;
+	tracked = v->queued_count;
+	seq = (u32)atomic_read(&v->sequence_number);
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+
+	dev_info(&hws->pdev->dev,
+		 "shutdown:%s ch=%u streaming=%d cap=%d stop=%d active=%p next=%p queued=%u tracked=%u seq=%u\n",
+		 tag, v->channel_index, streaming, cap_active, stop_requested, active,
+		 next_prepared, queued, tracked, seq);
+}
+
 static void hws_stop_streaming(struct vb2_queue *q)
 {
 	struct hws_video *v = q->drv_priv;
+	struct hws_pcie_dev *hws = v->parent;
 	unsigned long flags;
 	struct hwsvideo_buffer *b, *tmp;
 	LIST_HEAD(done);
+	unsigned int done_cnt = 0;
+	u64 start_ns = ktime_get_mono_fast_ns();
+
+	hws_log_video_shutdown_state(v, "stop_streaming.begin");
 
 	/* 1) Quiesce SW/HW first */
 	lockdep_assert_held(&v->state_lock);
@@ -1358,7 +1395,13 @@ static void hws_stop_streaming(struct vb2_queue *q)
 		/* Unlink from 'done' before completing */
 		list_del_init(&b->list);
 		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+		done_cnt++;
 	}
+	dev_info(&hws->pdev->dev,
+		 "shutdown:stop_streaming.done ch=%u completed=%u (%lluus)\n",
+		 v->channel_index, done_cnt,
+		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+	hws_log_video_shutdown_state(v, "stop_streaming.end");
 }
 
 static const struct vb2_ops hwspcie_video_qops = {
@@ -1518,21 +1561,45 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 int hws_video_pm_suspend(struct hws_pcie_dev *hws)
 {
 	int i, ret = 0;
+	u64 start_ns = ktime_get_mono_fast_ns();
 
+	dev_info(&hws->pdev->dev, "shutdown:video_pm_suspend begin channels=%u\n",
+		 hws->cur_max_video_ch);
 	for (i = 0; i < hws->cur_max_video_ch; i++) {
 		struct hws_video *vid = &hws->video[i];
 		struct vb2_queue *q = &vid->buffer_queue;
+		u64 ch_start_ns = ktime_get_mono_fast_ns();
+		bool streaming;
 
-		if (!q || !q->ops)
+		if (!q || !q->ops) {
+			dev_info(&hws->pdev->dev,
+				 "shutdown:video_pm_suspend ch=%d skipped (queue unavailable)\n",
+				 i);
 			continue;
-		if (vb2_is_streaming(q)) {
+		}
+
+		streaming = vb2_is_streaming(q);
+		hws_log_video_shutdown_state(vid, "video_pm_suspend.channel");
+		if (streaming) {
 			/* Stop via vb2 (runs your .stop_streaming) */
 			int r = vb2_streamoff(q, q->type);
 
+			dev_info(&hws->pdev->dev,
+				 "shutdown:video_pm_suspend ch=%d streamoff ret=%d (%lluus)\n",
+				 i, r, (unsigned long long)
+				 ((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
 			if (r && !ret)
 				ret = r;
+		} else {
+			dev_info(&hws->pdev->dev,
+				 "shutdown:video_pm_suspend ch=%d idle (%lluus)\n",
+				 i, (unsigned long long)
+				 ((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
 		}
 	}
+	dev_info(&hws->pdev->dev,
+		 "shutdown:video_pm_suspend done ret=%d (%lluus)\n", ret,
+		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
 	return ret;
 }
 
