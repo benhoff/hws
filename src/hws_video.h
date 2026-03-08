@@ -2,6 +2,8 @@
 #ifndef HWS_VIDEO_H
 #define HWS_VIDEO_H
 
+#include <linux/types.h>
+
 struct hws_video;
 
 int hws_video_register(struct hws_pcie_dev *dev);
@@ -25,5 +27,7 @@ void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 
 int hws_video_pm_suspend(struct hws_pcie_dev *hws);
 void hws_video_pm_resume(struct hws_pcie_dev *hws);
+bool hws_any_queue_busy(struct hws_video *vid);
+void hws_set_all_queues_error(struct hws_video *vid);
 
 #endif // HWS_VIDEO_H

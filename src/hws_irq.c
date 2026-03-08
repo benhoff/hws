@@ -93,6 +93,91 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	return 0;
 }
 
+static struct hwsvideo_buffer *
+hws_pop_ctx_buffer(struct hws_vfh_ctx *ctx)
+{
+	struct hwsvideo_buffer *buf = NULL;
+	unsigned long flags;
+
+	if (!ctx)
+		return NULL;
+
+	spin_lock_irqsave(&ctx->qlock, flags);
+	if (!list_empty(&ctx->buf_queue)) {
+		buf = list_first_entry(&ctx->buf_queue,
+				       struct hwsvideo_buffer, list);
+		list_del_init(&buf->list);
+	}
+	spin_unlock_irqrestore(&ctx->qlock, flags);
+	return buf;
+}
+
+static void hws_video_handle_vdone_fanout(struct hws_video *v)
+{
+	struct hws_pcie_dev *hws = v->parent;
+	unsigned int ch = v->channel_index;
+	struct hws_vfh_ctx *ctx;
+	unsigned long flags;
+	size_t expected;
+	u64 ts;
+	u32 frame_seq = 0;
+	bool have_seq = false;
+
+	if (unlikely(READ_ONCE(hws->suspended)))
+		return;
+	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
+		return;
+	if (!READ_ONCE(v->fanout_cpu))
+		return;
+
+	expected = READ_ONCE(v->pix.sizeimage);
+	ts = ktime_get_ns();
+	dma_rmb();
+
+	spin_lock_irqsave(&v->consumers_lock, flags);
+	list_for_each_entry(ctx, &v->consumers, node) {
+		struct hwsvideo_buffer *buf;
+		struct vb2_v4l2_buffer *vb2v;
+		void *dst;
+
+		if (!ctx->streaming)
+			continue;
+		buf = hws_pop_ctx_buffer(ctx);
+		if (!buf)
+			continue;
+
+		spin_unlock_irqrestore(&v->consumers_lock, flags);
+		vb2v = &buf->vb;
+		dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+		if (!dst || vb2_plane_size(&vb2v->vb2_buf, 0) < expected) {
+			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
+		} else {
+			if (!have_seq) {
+				frame_seq = (u32)atomic_inc_return(&v->sequence_number);
+				have_seq = true;
+			}
+			memcpy(dst, v->fanout_cpu, expected);
+			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
+			vb2v->sequence = frame_seq;
+			vb2v->vb2_buf.timestamp = ts;
+			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
+		}
+		spin_lock_irqsave(&v->consumers_lock, flags);
+	}
+	spin_unlock_irqrestore(&v->consumers_lock, flags);
+
+	if (!READ_ONCE(v->cap_active))
+		return;
+
+	{
+		dma_addr_t dma_addr = READ_ONCE(v->fanout_dma);
+
+		hws_program_dma_for_addr(hws, ch, dma_addr);
+		iowrite32(lower_32_bits(dma_addr),
+			  hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+	}
+}
+
 static void hws_video_handle_vdone(struct hws_video *v)
 {
 	struct hws_pcie_dev *hws = v->parent;
@@ -224,26 +309,31 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			if (!(int_state & vbit))
 				continue;
 
-			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
-				   !READ_ONCE(pdx->video[ch].stop_requested))) {
-				if (unlikely(hws_toggle_debug)) {
-					u32 toggle =
-					    readl_relaxed(pdx->bar0_base +
-						  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-					WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
-						   toggle);
-				}
-				dma_rmb();
-				WRITE_ONCE(pdx->video[ch].half_seen, true);
-				dev_dbg(&pdx->pdev->dev,
-					"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
-					ch,
-					READ_ONCE(pdx->video[ch].last_buf_half_toggle),
-					READ_ONCE(pdx->video[ch].cap_active));
-				hws_video_handle_vdone(&pdx->video[ch]);
-			} else {
-				dev_dbg(&pdx->pdev->dev,
-					"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
+				if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
+					   !READ_ONCE(pdx->video[ch].stop_requested))) {
+					if (READ_ONCE(pdx->video[ch].capture_mode) ==
+					    HWS_CAPTURE_MODE_FANOUT) {
+						hws_video_handle_vdone_fanout(&pdx->video[ch]);
+					} else {
+						if (unlikely(hws_toggle_debug)) {
+							u32 toggle =
+							    readl_relaxed(pdx->bar0_base +
+									  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+							WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
+								   toggle);
+						}
+						dma_rmb();
+						WRITE_ONCE(pdx->video[ch].half_seen, true);
+						dev_dbg(&pdx->pdev->dev,
+							"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
+							ch,
+							READ_ONCE(pdx->video[ch].last_buf_half_toggle),
+							READ_ONCE(pdx->video[ch].cap_active));
+						hws_video_handle_vdone(&pdx->video[ch]);
+					}
+				} else {
+					dev_dbg(&pdx->pdev->dev,
+						"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
 					ch,
 					READ_ONCE(pdx->video[ch].cap_active),
 					READ_ONCE(pdx->video[ch].stop_requested));

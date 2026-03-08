@@ -377,7 +377,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	lockdep_assert_held(&vid->state_lock);
 
 	/* If vb2 has active buffers and size would change, reject. */
-	was_busy = vb2_is_busy(&vid->buffer_queue);
+	was_busy = hws_any_queue_busy(vid);
 	if (was_busy &&
 	    (new_w != vid->pix.width || new_h != vid->pix.height ||
 	     interlaced != vid->pix.interlaced)) {
@@ -644,7 +644,7 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 		return ret;
 
 	/* Don’t allow size changes while buffers are queued */
-	if (vb2_is_busy(&vid->buffer_queue)) {
+	if (hws_any_queue_busy(vid)) {
 		if (f->fmt.pix.width       != vid->pix.width  ||
 		    f->fmt.pix.height      != vid->pix.height ||
 		    f->fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
@@ -677,7 +677,7 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	 */
 
 	/* Refresh vb2 watermark when idle */
-	if (!vb2_is_busy(&vid->buffer_queue))
+	if (!hws_any_queue_busy(vid))
 		vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
 	dev_dbg(&vid->parent->pdev->dev,
 		"s_fmt:   w=%u h=%u bpl=%u size=%u alloc=%u\n",

@@ -15,6 +15,7 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-dv-timings.h>
+#include <media/v4l2-fh.h>
 #include <media/videobuf2-dma-sg.h>
 
 #include "hws_reg.h"
@@ -45,11 +46,28 @@ struct hws_pix_state {
 struct hws_pcie_dev;
 struct hws_adapter;
 struct hws_video;
+struct hws_vfh_ctx;
+
+enum hws_capture_mode {
+	HWS_CAPTURE_MODE_NONE = 0,
+	HWS_CAPTURE_MODE_DIRECT = 1,
+	HWS_CAPTURE_MODE_FANOUT = 2,
+};
 
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
 	int slot;		/* for two-buffer approach */
+};
+
+struct hws_vfh_ctx {
+	struct v4l2_fh fh;
+	struct vb2_queue vbq;
+	struct list_head buf_queue;
+	spinlock_t qlock;
+	bool streaming;
+	struct hws_video *video;
+	struct list_head node;
 };
 
 struct hws_video {
@@ -64,7 +82,9 @@ struct hws_video {
 
 	/* ───── locking ───── */
 	struct mutex state_lock;	/* primary state */
+	struct mutex ioctl_lock;	/* route ioctl/poll/mmap to per-file queue */
 	spinlock_t irq_lock;	/* ISR-side */
+	spinlock_t consumers_lock;	/* protects consumers list and mode pointers */
 
 	/* ───── indices ───── */
 	int channel_index;
@@ -95,6 +115,12 @@ struct hws_video {
 	bool half_seen;
 	atomic_t sequence_number;
 	u32 queued_count;
+	enum hws_capture_mode capture_mode;
+	struct hws_vfh_ctx *direct_owner;
+	struct list_head consumers;
+	void *fanout_cpu;
+	dma_addr_t fanout_dma;
+	size_t fanout_size;
 
 	/* ───── timeout and error handling ───── */
 	u32 timeout_count;
