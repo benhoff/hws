@@ -53,6 +53,8 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 
 	buf = list_first_entry(&v->capture_queue, struct hwsvideo_buffer, list);
 	list_del_init(&buf->list);	/* keep buffer safe for later cleanup */
+	if (v->queued_count)
+		v->queued_count--;
 	v->active = buf;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): picked buffer %p\n", ch,
@@ -70,6 +72,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 		spin_lock_irqsave(&v->irq_lock, f);
 		if (v->active) {
 			list_add(&buf->list, &v->capture_queue);
+			v->queued_count++;
 			v->active = NULL;
 		}
 		spin_unlock_irqrestore(&v->irq_lock, f);

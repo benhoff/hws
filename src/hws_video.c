@@ -1303,7 +1303,8 @@ static inline bool list_node_unlinked(const struct list_head *n)
 	return n->next == LIST_POISON1 || n->prev == LIST_POISON2;
 }
 
-static void hws_log_video_shutdown_state(struct hws_video *v, const char *tag)
+static void hws_log_video_state(struct hws_video *v, const char *action,
+				const char *phase)
 {
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned long flags;
@@ -1328,10 +1329,10 @@ static void hws_log_video_shutdown_state(struct hws_video *v, const char *tag)
 	seq = (u32)atomic_read(&v->sequence_number);
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
-	dev_info(&hws->pdev->dev,
-		 "shutdown:%s ch=%u streaming=%d cap=%d stop=%d active=%p next=%p queued=%u tracked=%u seq=%u\n",
-		 tag, v->channel_index, streaming, cap_active, stop_requested, active,
-		 next_prepared, queued, tracked, seq);
+	dev_dbg(&hws->pdev->dev,
+		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d active=%p next=%p queued=%u tracked=%u seq=%u\n",
+		action, phase, v->channel_index, streaming, cap_active,
+		stop_requested, active, next_prepared, queued, tracked, seq);
 }
 
 static void hws_stop_streaming(struct vb2_queue *q)
@@ -1344,7 +1345,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	unsigned int done_cnt = 0;
 	u64 start_ns = ktime_get_mono_fast_ns();
 
-	hws_log_video_shutdown_state(v, "stop_streaming.begin");
+	hws_log_video_state(v, "streamoff", "begin");
 
 	/* 1) Quiesce SW/HW first */
 	lockdep_assert_held(&v->state_lock);
@@ -1397,11 +1398,11 @@ static void hws_stop_streaming(struct vb2_queue *q)
 		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 		done_cnt++;
 	}
-	dev_info(&hws->pdev->dev,
-		 "shutdown:stop_streaming.done ch=%u completed=%u (%lluus)\n",
-		 v->channel_index, done_cnt,
-		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
-	hws_log_video_shutdown_state(v, "stop_streaming.end");
+	dev_dbg(&hws->pdev->dev,
+		"video:streamoff:done ch=%u completed=%u (%lluus)\n",
+		v->channel_index, done_cnt,
+		(unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+	hws_log_video_state(v, "streamoff", "end");
 }
 
 static const struct vb2_ops hwspcie_video_qops = {
@@ -1558,13 +1559,13 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 	v4l2_device_unregister(&dev->v4l2_device);
 }
 
-int hws_video_pm_suspend(struct hws_pcie_dev *hws)
+int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
 {
 	int i, ret = 0;
 	u64 start_ns = ktime_get_mono_fast_ns();
 
-	dev_info(&hws->pdev->dev, "shutdown:video_pm_suspend begin channels=%u\n",
-		 hws->cur_max_video_ch);
+	dev_dbg(&hws->pdev->dev, "video:%s:begin channels=%u\n", reason,
+		hws->cur_max_video_ch);
 	for (i = 0; i < hws->cur_max_video_ch; i++) {
 		struct hws_video *vid = &hws->video[i];
 		struct vb2_queue *q = &vid->buffer_queue;
@@ -1572,34 +1573,34 @@ int hws_video_pm_suspend(struct hws_pcie_dev *hws)
 		bool streaming;
 
 		if (!q || !q->ops) {
-			dev_info(&hws->pdev->dev,
-				 "shutdown:video_pm_suspend ch=%d skipped (queue unavailable)\n",
-				 i);
+			dev_dbg(&hws->pdev->dev,
+				"video:%s:ch=%d skipped queue-unavailable\n",
+				reason, i);
 			continue;
 		}
 
 		streaming = vb2_is_streaming(q);
-		hws_log_video_shutdown_state(vid, "video_pm_suspend.channel");
+		hws_log_video_state(vid, reason, "channel");
 		if (streaming) {
 			/* Stop via vb2 (runs your .stop_streaming) */
 			int r = vb2_streamoff(q, q->type);
 
-			dev_info(&hws->pdev->dev,
-				 "shutdown:video_pm_suspend ch=%d streamoff ret=%d (%lluus)\n",
-				 i, r, (unsigned long long)
-				 ((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
+			dev_dbg(&hws->pdev->dev,
+				"video:%s:ch=%d streamoff ret=%d (%lluus)\n",
+				reason, i, r, (unsigned long long)
+				((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
 			if (r && !ret)
 				ret = r;
 		} else {
-			dev_info(&hws->pdev->dev,
-				 "shutdown:video_pm_suspend ch=%d idle (%lluus)\n",
-				 i, (unsigned long long)
-				 ((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
+			dev_dbg(&hws->pdev->dev,
+				"video:%s:ch=%d idle (%lluus)\n",
+				reason, i, (unsigned long long)
+				((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
 		}
 	}
-	dev_info(&hws->pdev->dev,
-		 "shutdown:video_pm_suspend done ret=%d (%lluus)\n", ret,
-		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+	dev_dbg(&hws->pdev->dev, "video:%s:done ret=%d (%lluus)\n", reason,
+		ret,
+		(unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
 	return ret;
 }
 
