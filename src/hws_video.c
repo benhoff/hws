@@ -153,7 +153,7 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 
 	vid->window_valid = true;
 
-	if (unlikely(dma_window_verify) && wrote) {
+	if (dma_window_verify && wrote) {
 		u32 r_hi =
 		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
 		u32 r_lo =
@@ -668,7 +668,7 @@ int hws_check_card_status(struct hws_pcie_dev *hws)
 	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 
 	/* Common “device missing” pattern */
-	if (unlikely(status == 0xFFFFFFFF)) {
+	if (status == 0xFFFFFFFF) {
 		hws->pci_lost = true;
 		dev_err(&hws->pdev->dev, "PCIe device not responding\n");
 		return -ENODEV;
@@ -726,7 +726,7 @@ static inline void hws_write_if_diff(struct hws_pcie_dev *hws, u32 reg_off,
 
 	old = readl(addr);
 	/* Treat all-ones as device gone; avoid writing garbage. */
-	if (unlikely(old == 0xFFFFFFFF)) {
+	if (old == 0xFFFFFFFF) {
 		hws->pci_lost = true;
 		return;
 	}
@@ -1411,7 +1411,6 @@ static const struct vb2_ops hwspcie_video_qops = {
 	.buf_init = hws_buf_init,
 	.buf_finish = hws_buf_finish,
 	.buf_cleanup = hws_buf_cleanup,
-	// .buf_finish = hws_buffer_finish,
 	.buf_queue = hws_buffer_queue,
 	.start_streaming = hws_start_streaming,
 	.stop_streaming = hws_stop_streaming,

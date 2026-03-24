@@ -505,16 +505,11 @@ const struct v4l2_ctrl_ops hws_ctrl_ops = {
 int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap)
 {
 	struct hws_video *vid = video_drvdata(file);
-	struct hws_pcie_dev *pdev = vid->parent;
 	int vi_index = vid->channel_index + 1; /* keep it simple */
 
 	strscpy(cap->driver, KBUILD_MODNAME, sizeof(cap->driver));
 	snprintf(cap->card, sizeof(cap->card),
 		 "AVMatrix HWS Capture %d", vi_index);
-	snprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s", dev_name(&pdev->pdev->dev));
-
-	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
-	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	return 0;
 }
 
@@ -648,7 +643,7 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	if (vb2_is_busy(&vid->buffer_queue)) {
 		if (f->fmt.pix.width       != vid->pix.width  ||
 		    f->fmt.pix.height      != vid->pix.height ||
-		    f->fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
+		    f->fmt.pix.bytesperline != vid->pix.bytesperline) {
 			return -EBUSY;
 		}
 	}

@@ -32,12 +32,12 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
 		!list_empty(&v->capture_queue));
 
-	if (unlikely(READ_ONCE(hws->suspended))) {
+	if (READ_ONCE(hws->suspended)) {
 		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): suspended\n", ch);
 		return -EBUSY;
 	}
 
-	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))) {
+	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)) {
 		dev_dbg(&hws->pdev->dev,
 			"arm_next(ch=%u): stop=%d cap=%d -> cancel\n", ch,
 			v->stop_requested, v->cap_active);
@@ -64,7 +64,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	wmb();
 
 	/* Avoid MMIO during suspend */
-	if (unlikely(READ_ONCE(hws->suspended))) {
+	if (READ_ONCE(hws->suspended)) {
 		unsigned long f;
 
 		dev_dbg(&hws->pdev->dev,
@@ -114,10 +114,10 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): entry stop=%d cap=%d\n", ch,
 		v->stop_requested, v->cap_active);
-	if (unlikely(READ_ONCE(hws->suspended)))
+	if (READ_ONCE(hws->suspended))
 		return;
 
-	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
+	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
 		return;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -135,7 +135,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		size_t expected = v->pix.sizeimage;
 		size_t plane_size = vb2_plane_size(&vb2v->vb2_buf, 0);
 
-		if (unlikely(expected > plane_size)) {
+		if (expected > plane_size) {
 			dev_warn_ratelimited(&hws->pdev->dev,
 					     "bh_video(ch=%u): sizeimage %zu > plane %zu, dropping seq=%u\n",
 					     ch, expected, plane_size,
@@ -159,7 +159,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
-	if (unlikely(READ_ONCE(hws->suspended)))
+	if (READ_ONCE(hws->suspended))
 		return;
 
 	if (promoted) {
@@ -192,7 +192,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	u32 int_state;
 
 	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
-	if (likely(pdx->bar0_base)) {
+	if (pdx->bar0_base) {
 		dev_dbg(&pdx->pdev->dev,
 			"irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
 			readl(pdx->bar0_base + INT_EN_REG_BASE),
@@ -200,7 +200,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	}
 
 	/* Fast path: if suspended, quietly ack and exit */
-	if (unlikely(READ_ONCE(pdx->suspended))) {
+	if (READ_ONCE(pdx->suspended)) {
 		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		if (int_state) {
 			writel(int_state, pdx->bar0_base + HWS_REG_INT_STATUS);
@@ -227,9 +227,9 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			if (!(int_state & vbit))
 				continue;
 
-			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
-				   !READ_ONCE(pdx->video[ch].stop_requested))) {
-				if (unlikely(hws_toggle_debug)) {
+			if (READ_ONCE(pdx->video[ch].cap_active) &&
+			    !READ_ONCE(pdx->video[ch].stop_requested)) {
+				if (hws_toggle_debug) {
 					u32 toggle =
 					    readl_relaxed(pdx->bar0_base +
 						  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
