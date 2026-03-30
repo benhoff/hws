@@ -30,9 +30,10 @@
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
 #define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
 
-static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch);
-static bool hws_update_active_interlace(struct hws_pcie_dev *pdx,
-					unsigned int ch);
+static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch,
+				   bool interlace);
+static bool hws_read_active_state(struct hws_pcie_dev *pdx, unsigned int ch,
+				  bool *interlace);
 static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch);
 static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch);
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
@@ -693,7 +694,9 @@ void check_video_format(struct hws_pcie_dev *pdx)
 	int i;
 
 	for (i = 0; i < pdx->cur_max_video_ch; i++) {
-		if (!hws_update_active_interlace(pdx, i)) {
+		bool interlace = false;
+
+		if (!hws_read_active_state(pdx, i, &interlace)) {
 			/* No active video; optionally feed neutral frames to keep streaming. */
 			if (pdx->video[i].signal_loss_cnt == 0)
 				pdx->video[i].signal_loss_cnt = 1;
@@ -707,7 +710,7 @@ void check_video_format(struct hws_pcie_dev *pdx)
 				/* Legacy path stub; see handle_legacy_path() comment. */
 				handle_legacy_path(pdx, i);
 
-			update_live_resolution(pdx, i);
+			update_live_resolution(pdx, i, interlace);
 			pdx->video[i].signal_loss_cnt = 0;
 		}
 	}
@@ -738,20 +741,19 @@ static inline void hws_write_if_diff(struct hws_pcie_dev *hws, u32 reg_off,
 	}
 }
 
-static bool hws_update_active_interlace(struct hws_pcie_dev *pdx,
-					unsigned int ch)
+static bool hws_read_active_state(struct hws_pcie_dev *pdx, unsigned int ch,
+				  bool *interlace)
 {
 	u32 reg;
-	bool active, interlace;
+	bool active;
 
 	if (ch >= pdx->cur_max_video_ch)
 		return false;
 
 	reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
 	active = !!(reg & BIT(ch));
-	interlace = !!(reg & BIT(8 + ch));
-
-	WRITE_ONCE(pdx->video[ch].pix.interlaced, interlace);
+	if (interlace)
+		*interlace = !!(reg & BIT(8 + ch));
 	return active;
 }
 
@@ -770,9 +772,8 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 
 	/* 1) Input frame rate (read-only; log or export via debugfs if wanted) */
 	in_fps = readl(hws->bar0_base + HWS_REG_FRAME_RATE(ch));
-	if (in_fps)
-		vid->current_fps = in_fps;
 	/* dev_dbg(&hws->pdev->dev, "ch%u input fps=%u\n", ch, in_fps); */
+	(void)in_fps;
 
 	/* 2) Output resolution programming
 	 * If your HW expects a separate “scaled” size, add fields to track it.
@@ -847,12 +848,13 @@ static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch)
 
 static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 					unsigned int ch, u16 w, u16 h,
-					bool interlaced)
+					bool interlaced, u32 fps)
 {
 	struct hws_video *v = &pdx->video[ch];
 	unsigned long flags;
 	u32 new_size;
 	bool reenable = false;
+	bool geometry_changed;
 	struct hwsvideo_buffer *buf = NULL;
 	struct list_head done;
 	struct hwsvideo_buffer *b, *tmp;
@@ -865,6 +867,36 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	    (!interlaced && h > MAX_VIDEO_HW_H) ||
 	    (interlaced && (h * 2) > MAX_VIDEO_HW_H))
 		return;
+	if (!fps || fps == 0xFFFFFFFF || fps > 240)
+		fps = (h == 576) ? 50 : 60;
+
+	geometry_changed = w != v->pix.width || h != v->pix.height ||
+		interlaced != v->pix.interlaced;
+	if (!geometry_changed && fps == v->current_fps)
+		return;
+
+	if (!geometry_changed) {
+		/* FPS-only updates are small state changes. Block briefly so
+		 * userspace polling does not cause us to skip the source-change
+		 * notification entirely.
+		 */
+		mutex_lock(&v->state_lock);
+		v->pix.interlaced = interlaced;
+		v->pix.field = interlaced ? V4L2_FIELD_INTERLACED :
+					    V4L2_FIELD_NONE;
+		hws_set_current_dv_timings(v, w, h, interlaced);
+		v->current_fps = fps;
+		if (vb2_is_busy(&v->buffer_queue)) {
+			struct v4l2_event ev = {
+				.type = V4L2_EVENT_SOURCE_CHANGE,
+			};
+
+			ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
+			v4l2_event_queue(v->video_device, &ev);
+		}
+		mutex_unlock(&v->state_lock);
+		return;
+	}
 
 	if (!mutex_trylock(&v->state_lock)) {
 		return;
@@ -904,17 +936,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	v->pix.height = h;
 	v->pix.interlaced = interlaced;
 	hws_set_current_dv_timings(v, w, h, interlaced);
-	/* Try to reflect the live frame rate if HW reports it; otherwise default
-	 * to common rates (50 Hz for 576p, else 60 Hz).
-	 */
-	{
-		u32 fps = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(ch));
-
-		if (fps)
-			v->current_fps = fps;
-		else
-			v->current_fps = (h == 576) ? 50 : 60;
-	}
+	v->current_fps = fps;
 
 	new_size = hws_calc_sizeimage(v, w, h, interlaced);
 	v->window_valid = false;
@@ -996,12 +1018,16 @@ out_unlock:
 	}
 }
 
-static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch)
+static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch,
+				   bool interlace)
 {
 	u32 reg = readl(pdx->bar0_base + HWS_REG_IN_RES(ch));
+	u32 fps = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(ch));
 	u16 res_w = reg & 0xFFFF;
 	u16 res_h = (reg >> 16) & 0xFFFF;
-	bool interlace = READ_ONCE(pdx->video[ch].pix.interlaced);
+	struct hws_video *vid = &pdx->video[ch];
+	bool geometry_changed;
+	bool fps_changed;
 
 	bool within_hw = (res_w <= MAX_VIDEO_HW_W) &&
 	    ((!interlace && res_h <= MAX_VIDEO_HW_H) ||
@@ -1010,10 +1036,15 @@ static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch)
 	if (!within_hw)
 		return;
 
-	if (res_w != pdx->video[ch].pix.width ||
-	    res_h != pdx->video[ch].pix.height) {
-		hws_video_apply_mode_change(pdx, ch, res_w, res_h, interlace);
-	}
+	geometry_changed = res_w != vid->pix.width ||
+		res_h != vid->pix.height ||
+		interlace != vid->pix.interlaced;
+	fps_changed = fps && fps != 0xFFFFFFFF && fps <= 240 &&
+		fps != vid->current_fps;
+
+	if (geometry_changed || fps_changed)
+		hws_video_apply_mode_change(pdx, ch, res_w, res_h, interlace,
+					    fps);
 }
 
 static int hws_open(struct file *file)
@@ -1237,7 +1268,8 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		}
 		return ret;
 	}
-	(void)hws_update_active_interlace(hws, v->channel_index);
+	(void)hws_read_active_state(hws, v->channel_index,
+				       &v->pix.interlaced);
 
 	lockdep_assert_held(&v->state_lock);
 	/* init per-stream state */
