@@ -74,14 +74,6 @@
  *  in ReadChipId() we also write 0x00 and 0x10 here for chip-ID sequencing.
  */
 
-/* per-pipe base: 0x4000, stride 0x800 ------------------------------------ */
-#define HWS_REG_PIPE_BASE(n)   (CVBS_IN_BASE + ((n) * 0x800))
-#define HWS_REG_HPD(n)         (HWS_REG_PIPE_BASE(n) + 0x14)  /* +5 V & HPD */
-
-/* handy bit masks */
-#define HWS_HPD_BIT            BIT(0)      /* hot-plug detect */
-#define HWS_5V_BIT             BIT(3)      /* cable +5-volt */
-
 /* Per-channel done flags. */
 #define HWS_REG_INT_STATUS            (CVBS_IN_BASE +  1 * PCIE_BARADDROFSIZE)
 #define HWS_SYS_BUSY_BIT          BIT(2)      /* matches old 0x04 test   */

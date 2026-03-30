@@ -8,13 +8,11 @@
 #include <linux/kthread.h>
 #include <linux/interrupt.h>
 #include <linux/dma-mapping.h>
-#include <linux/debugfs.h>
 #include <linux/err.h>
 #include <linux/ktime.h>
 #include <linux/pm.h>
 #include <linux/freezer.h>
 #include <linux/pci_regs.h>
-#include <linux/seq_file.h>
 
 #include <media/v4l2-ctrls.h>
 
@@ -27,156 +25,6 @@
 #define DRV_NAME "hws"
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
-
-#if IS_ENABLED(CONFIG_DEBUG_FS)
-static struct dentry *hws_debugfs_root;
-
-static void hws_debugfs_emit_res(struct seq_file *s, const char *name,
-				 u32 offset, u32 value)
-{
-	u16 width = value & 0xFFFF;
-	u16 height = value >> 16;
-
-	seq_printf(s, "%s offset=0x%04x value=0x%08x width=%u height=%u\n",
-		   name, offset, value, width, height);
-}
-
-static void hws_debugfs_emit_bchs(struct seq_file *s, u32 offset, u32 value)
-{
-	seq_printf(s,
-		   "BCHS offset=0x%04x value=0x%08x brightness=%u contrast=%u hue=%u saturation=%u\n",
-		   offset, value, value & 0xFF, (value >> 8) & 0xFF,
-		   (value >> 16) & 0xFF, (value >> 24) & 0xFF);
-}
-
-static void hws_debugfs_emit_fps(struct seq_file *s, const char *name,
-				 u32 offset, u32 value)
-{
-	seq_printf(s, "%s offset=0x%04x value=0x%08x fps=%u\n",
-		   name, offset, value, value);
-}
-
-static int hws_debugfs_bar0_snapshot_show(struct seq_file *s, void *unused)
-{
-	struct hws_pcie_dev *hws = s->private;
-	u32 active_status, hdcp_status, int_status, int_gate, sys_status;
-	unsigned int ch;
-
-	if (!hws || !hws->pdev) {
-		seq_puts(s, "device unavailable\n");
-		return 0;
-	}
-
-	seq_printf(s, "device=%s\n", pci_name(hws->pdev));
-	seq_printf(s, "suspended=%d pci_lost=%d irq=%d cur_max_video_ch=%u\n",
-		   READ_ONCE(hws->suspended), hws->pci_lost, hws->irq,
-		   hws->cur_max_video_ch);
-	if (!hws->bar0_base) {
-		seq_puts(s, "BAR0 unmapped\n");
-		return 0;
-	}
-
-	int_gate = readl(hws->bar0_base + INT_EN_REG_BASE);
-	int_status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-	sys_status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
-	active_status = readl(hws->bar0_base + HWS_REG_ACTIVE_STATUS);
-	hdcp_status = readl(hws->bar0_base + HWS_REG_HDCP_STATUS);
-
-	seq_printf(s, "INT_EN_GATE offset=0x%04x value=0x%08x\n",
-		   INT_EN_REG_BASE, int_gate);
-	seq_printf(s, "INT_STATUS offset=0x%04x value=0x%08x\n",
-		   HWS_REG_INT_STATUS, int_status);
-	seq_printf(s, "SYS_STATUS offset=0x%04x value=0x%08x\n",
-		   HWS_REG_SYS_STATUS, sys_status);
-	seq_printf(s, "ACTIVE_STATUS offset=0x%04x value=0x%08x\n",
-		   HWS_REG_ACTIVE_STATUS, active_status);
-	seq_printf(s, "HDCP_STATUS offset=0x%04x value=0x%08x\n",
-		   HWS_REG_HDCP_STATUS, hdcp_status);
-
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
-		u32 hpd = readl(hws->bar0_base + HWS_REG_HPD(ch));
-		u32 in_res = readl(hws->bar0_base + HWS_REG_IN_RES(ch));
-		u32 bchs = readl(hws->bar0_base + HWS_REG_BCHS(ch));
-		u32 in_fps = readl(hws->bar0_base + HWS_REG_FRAME_RATE(ch));
-		u32 out_res = readl(hws->bar0_base + HWS_REG_OUT_RES(ch));
-		u32 out_fps = readl(hws->bar0_base + HWS_REG_OUT_FRAME_RATE(ch));
-
-		seq_printf(s,
-			   "ch%u signal_present=%u interlaced=%u hdcp=%u hpd=%u cable_5v=%u\n",
-			   ch, !!(active_status & BIT(ch)),
-			   !!(active_status & BIT(8 + ch)),
-			   !!(hdcp_status & BIT(ch)), !!(hpd & HWS_HPD_BIT),
-			   !!(hpd & HWS_5V_BIT));
-		seq_printf(s, "HPD offset=0x%04x value=0x%08x\n",
-			   HWS_REG_HPD(ch), hpd);
-		hws_debugfs_emit_res(s, "IN_RES", HWS_REG_IN_RES(ch), in_res);
-		hws_debugfs_emit_bchs(s, HWS_REG_BCHS(ch), bchs);
-		hws_debugfs_emit_fps(s, "FRAME_RATE", HWS_REG_FRAME_RATE(ch),
-				     in_fps);
-		hws_debugfs_emit_res(s, "OUT_RES", HWS_REG_OUT_RES(ch), out_res);
-		hws_debugfs_emit_fps(s, "OUT_FRAME_RATE",
-				     HWS_REG_OUT_FRAME_RATE(ch), out_fps);
-	}
-
-	return 0;
-}
-
-static int hws_debugfs_bar0_snapshot_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, hws_debugfs_bar0_snapshot_show,
-			   inode->i_private);
-}
-
-static const struct file_operations hws_debugfs_bar0_snapshot_fops = {
-	.owner = THIS_MODULE,
-	.open = hws_debugfs_bar0_snapshot_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-static void hws_debugfs_remove_action(void *data)
-{
-	struct hws_pcie_dev *hws = data;
-
-	debugfs_remove_recursive(hws->debugfs_dir);
-	hws->debugfs_dir = NULL;
-}
-
-static void hws_debugfs_init_device(struct hws_pcie_dev *hws)
-{
-	struct dentry *dir, *file;
-	int ret;
-
-	if (IS_ERR_OR_NULL(hws_debugfs_root))
-		return;
-
-	dir = debugfs_create_dir(pci_name(hws->pdev), hws_debugfs_root);
-	if (IS_ERR_OR_NULL(dir))
-		return;
-
-	file = debugfs_create_file("bar0_snapshot", 0400, dir, hws,
-				   &hws_debugfs_bar0_snapshot_fops);
-	if (IS_ERR_OR_NULL(file)) {
-		debugfs_remove_recursive(dir);
-		return;
-	}
-
-	hws->debugfs_dir = dir;
-	ret = devm_add_action_or_reset(&hws->pdev->dev,
-				       hws_debugfs_remove_action, hws);
-	if (ret)
-		dev_warn(&hws->pdev->dev,
-			 "debugfs cleanup action registration failed: %d\n",
-			 ret);
-}
-#else
-static struct dentry *hws_debugfs_root;
-
-static void hws_debugfs_init_device(struct hws_pcie_dev *hws)
-{
-}
-#endif
 
 /* register layout inside HWS_REG_DEVICE_INFO */
 #define DEVINFO_VER GENMASK(7, 0)
@@ -583,7 +431,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	/* 4) Identify chip & capabilities */
 	read_chip_id(hws);
-	hws_debugfs_init_device(hws);
 	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n",
 		 pdev->vendor, pdev->device);
 	hws_init_video_sys(hws, false);
@@ -768,7 +615,7 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 
 static void hws_stop_device(struct hws_pcie_dev *hws)
 {
-	u32 status = readl(hws->bar0_base + HWS_REG_PIPE_BASE(0));
+	u32 status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 	u64 start_ns = ktime_get_mono_fast_ns();
 	bool live = status != 0xFFFFFFFF;
 
@@ -999,27 +846,12 @@ MODULE_DEVICE_TABLE(pci, hws_pci_table);
 
 static int __init pcie_hws_init(void)
 {
-	int ret;
-
-	hws_debugfs_root = debugfs_create_dir(DRV_NAME, NULL);
-	if (IS_ERR(hws_debugfs_root))
-		hws_debugfs_root = NULL;
-
-	ret = pci_register_driver(&hws_pci_driver);
-	if (ret) {
-		debugfs_remove_recursive(hws_debugfs_root);
-		hws_debugfs_root = NULL;
-		return ret;
-	}
-
-	return 0;
+	return pci_register_driver(&hws_pci_driver);
 }
 
 static void __exit pcie_hws_exit(void)
 {
 	pci_unregister_driver(&hws_pci_driver);
-	debugfs_remove_recursive(hws_debugfs_root);
-	hws_debugfs_root = NULL;
 }
 
 module_init(pcie_hws_init);

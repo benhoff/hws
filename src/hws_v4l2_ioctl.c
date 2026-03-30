@@ -27,6 +27,7 @@ hws_find_dv_by_wh(u32 w, u32 h, bool interlaced);
 static const struct hws_dv_mode *
 hws_find_dv_by_wh_fps(u32 w, u32 h, bool interlaced, u32 fps);
 static u32 hws_get_live_fps(struct hws_video *vid);
+static u32 hws_input_status(struct hws_video *vid);
 static int hws_fill_dv_timings(u32 w, u32 h, bool interlace, u32 fps,
 			       struct v4l2_dv_timings *timings);
 
@@ -389,6 +390,25 @@ static int hws_fill_dv_timings(u32 w, u32 h, bool interlace, u32 fps,
 
 	*timings = m->timings;
 	return 0;
+}
+
+static u32 hws_input_status(struct hws_video *vid)
+{
+	struct hws_pcie_dev *pdx;
+	u32 reg;
+
+	if (!vid)
+		return V4L2_IN_ST_NO_SIGNAL;
+
+	pdx = vid->parent;
+	if (!pdx || !pdx->bar0_base)
+		return V4L2_IN_ST_NO_SIGNAL;
+
+	reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+	if (reg == 0xffffffff)
+		return V4L2_IN_ST_NO_SIGNAL;
+
+	return (reg & BIT(vid->channel_index)) ? 0 : V4L2_IN_ST_NO_SIGNAL;
 }
 
 /* Query the *current detected* DV timings on the input.
@@ -866,8 +886,8 @@ int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *param
 	if (!fps)
 		fps = vid->current_fps ? vid->current_fps : 60;
 
-	/* Report cached frame rate; expose timeperframe capability */
-	param->parm.capture.capability           = V4L2_CAP_TIMEPERFRAME;
+	/* HDMI receivers report the detected frame period, they don't set it. */
+	param->parm.capture.capability           = 0;
 	param->parm.capture.capturemode          = 0;
 	param->parm.capture.timeperframe.numerator   = 1;
 	param->parm.capture.timeperframe.denominator = fps;
@@ -880,12 +900,14 @@ int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *param
 int hws_vidioc_enum_input(struct file *file, void *priv,
 			  struct v4l2_input *input)
 {
+	struct hws_video *vid = video_drvdata(file);
+
 	if (input->index)
 		return -EINVAL;
 	input->type         = V4L2_INPUT_TYPE_CAMERA;
 	strscpy(input->name, KBUILD_MODNAME, sizeof(input->name));
 	input->capabilities = V4L2_IN_CAP_DV_TIMINGS;
-	input->status       = 0;
+	input->status       = hws_input_status(vid);
 
 	return 0;
 }
@@ -899,28 +921,4 @@ int hws_vidioc_g_input(struct file *file, void *priv, unsigned int *index)
 int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 {
 	return i ? -EINVAL : 0;
-}
-
-int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *param)
-{
-	struct hws_video *vid = video_drvdata(file);
-	struct v4l2_captureparm *cap;
-	u32 fps;
-
-	if (param->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
-	cap = &param->parm.capture;
-
-	fps = hws_get_live_fps(vid);
-	if (!fps)
-		fps = vid->current_fps ? vid->current_fps : 60;
-	cap->timeperframe.denominator = fps;
-	cap->timeperframe.numerator   = 1;
-	cap->capability               = V4L2_CAP_TIMEPERFRAME;
-	cap->capturemode              = 0;
-	cap->extendedmode             = 0;
-	/* readbuffers left unchanged or zero; vb2 handles queue depth */
-
-	return 0;
 }

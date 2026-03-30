@@ -25,7 +25,6 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 			    struct v4l2_dv_timings *timings);
 
 int hws_vidioc_queryctrl(struct file *file, void *fh, struct v4l2_queryctrl *a);
-int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a);
 int hws_vidioc_g_dv_timings(struct file *file, void *fh,
 			    struct v4l2_dv_timings *timings);
 int hws_vidioc_enum_dv_timings(struct file *file, void *fh,

@@ -249,7 +249,7 @@ static int hws_ctrls_init(struct hws_video *vid)
 {
 	struct v4l2_ctrl_handler *hdl = &vid->control_handler;
 
-	/* Create BCHS + one DV status control */
+	/* Create BCHS controls. */
 	v4l2_ctrl_handler_init(hdl, 4);
 
 	vid->ctrl_brightness = v4l2_ctrl_new_std(hdl, &hws_ctrl_ops,
@@ -273,7 +273,6 @@ static int hws_ctrls_init(struct hws_video *vid)
 					  MIN_VAMP_HUE_UNITS,
 					  MAX_VAMP_HUE_UNITS, 1,
 					  HWS_HUE_DEFAULT);
-
 	if (hdl->error) {
 		int err = hdl->error;
 
@@ -1037,7 +1036,6 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_subscribe_event = hws_subscribe_event,
 	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
 	.vidioc_g_parm = hws_vidioc_g_parm,
-	.vidioc_s_parm = hws_vidioc_s_parm,
 };
 
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
