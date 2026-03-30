@@ -639,13 +639,12 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	if (ret)
 		return ret;
 
-	/* Don’t allow size changes while buffers are queued */
+	/* Don't allow buffer layout changes while buffers are queued. */
 	if (vb2_is_busy(&vid->buffer_queue)) {
-		if (f->fmt.pix.width       != vid->pix.width  ||
-		    f->fmt.pix.height      != vid->pix.height ||
-		    f->fmt.pix.bytesperline != vid->pix.bytesperline) {
+		if (f->fmt.pix.width  != vid->pix.width  ||
+		    f->fmt.pix.height != vid->pix.height ||
+		    f->fmt.pix.bytesperline != vid->pix.bytesperline)
 			return -EBUSY;
-		}
 	}
 
 	/* Apply to driver state */
