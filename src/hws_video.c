@@ -856,9 +856,8 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		return;
 
 	if (!geometry_changed) {
-		/* FPS-only updates are small state changes. Block briefly so
-		 * userspace polling does not cause us to skip the source-change
-		 * notification entirely.
+		/* Refresh cached live timing state, but don't emit a resolution
+		 * change event when only the frame rate changes.
 		 */
 		mutex_lock(&v->state_lock);
 		v->pix.interlaced = interlaced;
@@ -866,14 +865,6 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 					    V4L2_FIELD_NONE;
 		hws_set_current_dv_timings(v, w, h, interlaced);
 		v->current_fps = fps;
-		if (vb2_is_busy(&v->buffer_queue)) {
-			struct v4l2_event ev = {
-				.type = V4L2_EVENT_SOURCE_CHANGE,
-			};
-
-			ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
-			v4l2_event_queue(v->video_device, &ev);
-		}
 		mutex_unlock(&v->state_lock);
 		return;
 	}

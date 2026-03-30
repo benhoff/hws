@@ -836,11 +836,9 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	vid->pix.sizeimage    = f->fmt.pix.sizeimage;    /* logical */
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->pix.interlaced   = false;
-	hws_set_current_dv_timings(vid, vid->pix.width, vid->pix.height,
-				   vid->pix.interlaced);
-	vid->current_fps = hws_pick_fps_from_mode(vid->pix.width,
-						  vid->pix.height,
-						  vid->pix.interlaced);
+	/* S_FMT negotiates buffer layout only. Keep detector-owned DV timing
+	 * state unchanged so a harmless restart cannot clobber the live FPS.
+	 */
 	/* Or:
 	 * hws_calc_sizeimage(vid, vid->pix.width, vid->pix.height, false);
 	 */
