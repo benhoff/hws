@@ -45,6 +45,7 @@ struct hws_pix_state {
 struct hws_pcie_dev;
 struct hws_adapter;
 struct hws_video;
+struct dentry;
 
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
@@ -140,6 +141,7 @@ struct hws_pcie_dev {
 
 	/* ───── BAR & workqueues ───── */
 	void __iomem *bar0_base;
+	struct dentry *debugfs_dir;
 
 	/* ───── device identity / capabilities ───── */
 	u16 vendor_id;
