@@ -10,7 +10,6 @@
 #include <linux/ktime.h>
 #include <linux/interrupt.h>
 #include <linux/moduleparam.h>
-#include <linux/sysfs.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-ctrls.h>
@@ -44,58 +43,10 @@ static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
 hws_take_queued_buffer_locked(struct hws_video *vid);
 
-#if IS_ENABLED(CONFIG_SYSFS)
-static ssize_t resolution_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
+static inline bool list_node_unlinked(const struct list_head *n)
 {
-	struct video_device *vdev = to_video_device(dev);
-	struct hws_video *vid = video_get_drvdata(vdev);
-	struct hws_pcie_dev *hws;
-	u32 res_reg;
-	u16 w, h;
-	bool interlaced;
-
-	if (!vid)
-		return -ENODEV;
-
-	hws = vid->parent;
-	if (!hws || !hws->bar0_base)
-		return sysfs_emit(buf, "unknown\n");
-
-	res_reg = readl(hws->bar0_base + HWS_REG_IN_RES(vid->channel_index));
-	if (!res_reg || res_reg == 0xFFFFFFFF)
-		return sysfs_emit(buf, "unknown\n");
-
-	w = res_reg & 0xFFFF;
-	h = (res_reg >> 16) & 0xFFFF;
-
-	interlaced =
-	    !!(readl(hws->bar0_base + HWS_REG_ACTIVE_STATUS) &
-	       BIT(8 + vid->channel_index));
-
-	return sysfs_emit(buf, "%ux%u%s\n", w, h, interlaced ? "i" : "p");
+	return n->next == LIST_POISON1 || n->prev == LIST_POISON2;
 }
-static DEVICE_ATTR_RO(resolution);
-
-static inline int hws_resolution_create(struct video_device *vdev)
-{
-	return device_create_file(&vdev->dev, &dev_attr_resolution);
-}
-
-static inline void hws_resolution_remove(struct video_device *vdev)
-{
-	device_remove_file(&vdev->dev, &dev_attr_resolution);
-}
-#else
-static inline int hws_resolution_create(struct video_device *vdev)
-{
-	return 0;
-}
-
-static inline void hws_resolution_remove(struct video_device *vdev)
-{
-}
-#endif
 
 static bool dma_window_verify;
 module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
@@ -427,6 +378,58 @@ static void hws_video_drain_queue_locked(struct hws_video *vid)
 	}
 }
 
+static void hws_video_release_registration(struct hws_video *vid)
+{
+	if (vid->buffer_queue.ops) {
+		vb2_queue_release(&vid->buffer_queue);
+		vid->buffer_queue.ops = NULL;
+	}
+
+	if (!vid->video_device)
+		return;
+
+	if (video_is_registered(vid->video_device)) {
+		vb2_video_unregister_device(vid->video_device);
+	} else {
+		video_device_release(vid->video_device);
+	}
+	vid->video_device = NULL;
+}
+
+static void hws_video_collect_done_locked(struct hws_video *vid,
+					  struct list_head *done)
+{
+	struct hwsvideo_buffer *b;
+
+	if (vid->active) {
+		if (!list_node_unlinked(&vid->active->list))
+			list_move_tail(&vid->active->list, done);
+		else {
+			INIT_LIST_HEAD(&vid->active->list);
+			list_add_tail(&vid->active->list, done);
+		}
+		vid->active = NULL;
+	}
+
+	if (vid->next_prepared) {
+		if (!list_node_unlinked(&vid->next_prepared->list))
+			list_move_tail(&vid->next_prepared->list, done);
+		else {
+			INIT_LIST_HEAD(&vid->next_prepared->list);
+			list_add_tail(&vid->next_prepared->list, done);
+		}
+		vid->next_prepared = NULL;
+	}
+
+	while (!list_empty(&vid->capture_queue)) {
+		b = list_first_entry(&vid->capture_queue, struct hwsvideo_buffer,
+				     list);
+		list_move_tail(&b->list, done);
+	}
+
+	vid->queued_count = 0;
+}
+
 void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 {
 	struct hws_video *vid;
@@ -454,19 +457,10 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 
 	/* 5) Release VB2 queue if initialized */
-	if (vid->buffer_queue.ops)
-		vb2_queue_release(&vid->buffer_queue);
+	hws_video_release_registration(vid);
 
 	/* 6) Free V4L2 controls */
 	v4l2_ctrl_handler_free(&vid->control_handler);
-
-	/* 7) Unregister the video_device if we own it */
-	if (vid->video_device && video_is_registered(vid->video_device))
-		video_unregister_device(vid->video_device);
-	/* If you allocated it with video_device_alloc(), release it here:
-	 * video_device_release(vid->video_device);
-	 */
-	vid->video_device = NULL;
 
 	/* 8) Reset simple state (don’t memset the whole struct here) */
 	mutex_destroy(&vid->state_lock);
@@ -548,23 +542,10 @@ static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
 		hws->cur_max_video_ch = hws->max_channels;
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++, table += 8) {
-		/* 1) Ensure a tiny, valid DMA buf exists (1 page is plenty) */
-		if (!hws->scratch_vid[ch].cpu) {
-			hws->scratch_vid[ch].size = PAGE_SIZE;
-			hws->scratch_vid[ch].cpu =
-			    dma_alloc_coherent(&hws->pdev->dev,
-					       hws->scratch_vid[ch].size,
-					       &hws->scratch_vid[ch].dma,
-					       GFP_KERNEL);
-			if (!hws->scratch_vid[ch].cpu) {
-				dev_warn(&hws->pdev->dev,
-					 "ch%u: scratch DMA alloc failed, skipping seed\n",
-					 ch);
-				continue;
-			}
-		}
+		if (!hws->scratch_vid[ch].cpu)
+			continue;
 
-		/* 2) Program 64-bit BAR remap entry for this channel */
+		/* Program 64-bit BAR remap entry for this channel */
 		{
 			dma_addr_t p = hws->scratch_vid[ch].dma;
 			u32 lo = lower_32_bits(p) & addr_mask;
@@ -578,20 +559,20 @@ static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
 				       hws->bar0_base + PCI_ADDR_TABLE_BASE +
 				       table + PCIE_BARADDROFSIZE);
 
-			/* 3) Per-channel AXI base + PCI low */
+			/* Per-channel AXI base + PCI low */
 			writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE +
 				       pci_addr_low,
 				       hws->bar0_base + CVBS_IN_BUF_BASE +
 				       ch * PCIE_BARADDROFSIZE);
 
-			/* 4) Half-frame length in /16 units.
+			/* Half-frame length in /16 units.
 			 * Prefer the current channel’s computed half_size if available.
-			 * Fall back to PAGE_SIZE/2.
+			 * Fall back to half of the probe-owned scratch buffer.
 			 */
 			{
 				u32 half_bytes = hws->video[ch].pix.half_size ?
 				    hws->video[ch].pix.half_size :
-				    (PAGE_SIZE / 2);
+				    (u32)(hws->scratch_vid[ch].size / 2);
 				writel_relaxed(half_bytes / 16,
 					       hws->bar0_base +
 					       CVBS_IN_BUF_BASE2 +
@@ -853,9 +834,8 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	struct hws_video *v = &pdx->video[ch];
 	unsigned long flags;
 	u32 new_size;
-	bool reenable = false;
+	bool queue_busy;
 	bool geometry_changed;
-	struct hwsvideo_buffer *buf = NULL;
 	struct list_head done;
 	struct hwsvideo_buffer *b, *tmp;
 
@@ -898,10 +878,11 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		return;
 	}
 
-	if (!mutex_trylock(&v->state_lock)) {
+	if (!mutex_trylock(&v->state_lock))
 		return;
-	}
+
 	INIT_LIST_HEAD(&done);
+	queue_busy = vb2_is_busy(&v->buffer_queue);
 
 	WRITE_ONCE(v->stop_requested, true);
 	WRITE_ONCE(v->cap_active, false);
@@ -919,16 +900,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		synchronize_irq(v->parent->irq);
 
 	spin_lock_irqsave(&v->irq_lock, flags);
-	if (v->active) {
-		INIT_LIST_HEAD(&v->active->list);
-		list_add_tail(&v->active->list, &done);
-		v->active = NULL;
-	}
-	while (!list_empty(&v->capture_queue)) {
-		b = list_first_entry(&v->capture_queue, struct hwsvideo_buffer,
-				     list);
-		list_move_tail(&b->list, &done);
-	}
+	hws_video_collect_done_locked(v, &done);
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	/* Update software pixel state */
@@ -941,25 +913,22 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	new_size = hws_calc_sizeimage(v, w, h, interlaced);
 	v->window_valid = false;
 
-	/* Notify listeners that the resolution changed whenever we have
-	 * an active queue, regardless of whether we can continue streaming
-	 * with the existing buffers. This ensures user space sees a source
-	 * change event instead of an empty queue (VIDIOC_DQEVENT -> -ENOENT).
+	/* Geometry changes require userspace renegotiation once buffers exist.
+	 * Emit SOURCE_CHANGE, mark the queue in error, and let userspace
+	 * STREAMOFF/REQBUFS/STREAMON rather than trying to restart capture
+	 * with partially drained in-flight state.
 	 */
-	if (vb2_is_busy(&v->buffer_queue)) {
+	if (queue_busy) {
 		struct v4l2_event ev = {
 			.type = V4L2_EVENT_SOURCE_CHANGE,
 		};
+
 		ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
 		v4l2_event_queue(v->video_device, &ev);
-
-		/* If buffers are smaller than new requirement, error the queue
-		 * so users re-request buffers before we restart streaming.
-		 */
-		if (new_size > v->alloc_sizeimage) {
-			vb2_queue_error(&v->buffer_queue);
-			goto out_unlock;
-		}
+		vb2_queue_error(&v->buffer_queue);
+	} else {
+		v->alloc_sizeimage = PAGE_ALIGN(new_size);
+		WRITE_ONCE(v->stop_requested, false);
 	}
 
 	/* Program HW with new resolution */
@@ -974,40 +943,6 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	/* Reset per-channel toggles/counters */
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
 	atomic_set(&v->sequence_number, 0);
-
-	/* Re-prime first VB2 buffer if present */
-	spin_lock_irqsave(&v->irq_lock, flags);
-	if (!list_empty(&v->capture_queue)) {
-		buf = list_first_entry(&v->capture_queue,
-				       struct hwsvideo_buffer, list);
-		v->active = buf;
-		list_del_init(&v->active->list);
-		if (v->queued_count)
-			v->queued_count--;
-		reenable = true;
-	}
-	spin_unlock_irqrestore(&v->irq_lock, flags);
-
-	if (!reenable)
-		goto out_unlock;
-	{
-		dma_addr_t dma;
-
-		dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		hws_program_dma_for_addr(pdx, ch, dma);
-		iowrite32(lower_32_bits(dma),
-			  pdx->bar0_base + HWS_REG_DMA_ADDR(ch));
-	}
-
-	WRITE_ONCE(v->stop_requested, false);
-	WRITE_ONCE(v->cap_active, true);
-	/* Publish stop_requested/cap_active before HW disable; pairs with
-	 * BH/ISR reads in the VDONE handler/hws_arm_next.
-	 */
-	smp_wmb();
-	wmb(); /* ensure DMA window/address writes visible before enable */
-	hws_enable_video_capture(pdx, ch, true);
-	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
 
 out_unlock:
 	mutex_unlock(&v->state_lock);
@@ -1330,11 +1265,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 }
 
-static inline bool list_node_unlinked(const struct list_head *n)
-{
-	return n->next == LIST_POISON1 || n->prev == LIST_POISON2;
-}
-
 static void hws_log_video_state(struct hws_video *v, const char *action,
 				const char *phase)
 {
@@ -1388,39 +1318,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 
 	/* 2) Collect in-flight + queued under the IRQ lock */
 	spin_lock_irqsave(&v->irq_lock, flags);
-
-	if (v->active) {
-		/*
-		 * v->active may not be on any list (only referenced by v->active).
-		 * Only move it if its list node is still linked somewhere.
-		 */
-		if (!list_node_unlinked(&v->active->list)) {
-			/* Move directly to 'done' in one safe op */
-			list_move_tail(&v->active->list, &done);
-		} else {
-			/* Not on a list: put list node into a known state for later reuse */
-			INIT_LIST_HEAD(&v->active->list);
-			/*
-			 * We'll complete it below without relying on list pointers.
-			 * To unify flow, push it via a temporary single-element list.
-			 */
-			list_add_tail(&v->active->list, &done);
-		}
-		v->active = NULL;
-	}
-
-	if (v->next_prepared) {
-		list_add_tail(&v->next_prepared->list, &done);
-		v->next_prepared = NULL;
-	}
-
-	while (!list_empty(&v->capture_queue)) {
-		b = list_first_entry(&v->capture_queue, struct hwsvideo_buffer,
-				     list);
-		/* Move (not del+add) to preserve invariants and avoid touching poisons */
-		list_move_tail(&b->list, &done);
-	}
-
+	hws_video_collect_done_locked(v, &done);
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	/* 3) Complete outside the lock */
@@ -1537,33 +1435,15 @@ int hws_video_register(struct hws_pcie_dev *dev)
 			goto err_unwind;
 		}
 
-		ret = hws_resolution_create(vdev);
-		if (ret) {
-			dev_err(&dev->pdev->dev,
-				"device_create_file(resolution) ch%u failed: %d\n",
-				i, ret);
-			video_unregister_device(vdev);
-			goto err_unwind;
-		}
 	}
 
 	return 0;
 
 err_unwind:
-	for (i = i - 1; i >= 0; i--) {
+	for (; i >= 0; i--) {
 		struct hws_video *ch = &dev->video[i];
 
-		if (video_is_registered(ch->video_device))
-			hws_resolution_remove(ch->video_device);
-		if (video_is_registered(ch->video_device))
-			vb2_video_unregister_device(ch->video_device);
-		v4l2_ctrl_handler_free(&ch->control_handler);
-		if (ch->video_device) {
-			/* If not registered, we must free the alloc’d vdev ourselves */
-			if (!video_is_registered(ch->video_device))
-				video_device_release(ch->video_device);
-			ch->video_device = NULL;
-		}
+		hws_video_release_registration(ch);
 	}
 	v4l2_device_unregister(&dev->v4l2_device);
 	return ret;
@@ -1579,12 +1459,7 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
 
-		if (ch->video_device)
-			hws_resolution_remove(ch->video_device);
-		if (ch->video_device) {
-			vb2_video_unregister_device(ch->video_device);
-			ch->video_device = NULL;
-		}
+		hws_video_release_registration(ch);
 		v4l2_ctrl_handler_free(&ch->control_handler);
 	}
 	v4l2_device_unregister(&dev->v4l2_device);

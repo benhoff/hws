@@ -22,18 +22,21 @@ out-of-tree module".
   Every successful probe can leak coherent DMA memory. That is a real bug,
   not just an upstream style concern.
 - Current status:
-  Still present in current `master`.
+  Fixed in current `master`. Scratch allocation now has a single owner in
+  probe via `hws_alloc_seed_buffers()`, and `hws_seed_dma_windows()` no
+  longer allocates fallback coherent buffers when `scratch_vid[ch].cpu` is
+  `NULL`.
 - Baseline branch status:
   Not present in `baseline`. There, probe allocates DMA once in
   `DmaMemAllocPool()` before `InitVideoSys()` runs
   (`baseline:src/hws_video.c:5831`, `baseline:src/hws_video.c:5837`), and
   `SetDMAAddress()` only programs registers from already allocated buffers
   (`baseline:src/hws_video.c:4993`).
-- Fix direction:
-  Keep a single allocation path. The cleanest option is to allocate scratch
-  buffers exactly once in probe, then make the seed helper only program
-  registers. If possible, switch the allocations to `dmam_alloc_coherent()`
-  so teardown is simpler and lifetime is tied to the device.
+- Resolution:
+  The driver now keeps a single allocation path: probe allocates scratch
+  buffers exactly once, and the seed helper only programs registers from the
+  already-owned buffers. A future cleanup could still switch this to
+  `dmam_alloc_coherent()` to simplify lifetime management further.
 - How to test the current bug:
   1. Load the driver with hardware present.
   2. Repeatedly unload and reload it.
@@ -63,20 +66,20 @@ out-of-tree module".
   A late registration failure can produce a double-free or use-after-free in
   probe cleanup.
 - Current status:
-  Still present in current `master`.
+  Fixed in current `master`. Registration-owned teardown is now separate from
+  full channel teardown, so a failed `hws_video_register()` no longer frees
+  control handlers that probe cleanup will free again.
 - Baseline branch status:
   Not present in the same form in `baseline`. The old
   `hws_video_register()` owned its own unwind
   (`baseline:src/hws_video.c:3285`), and probe did not perform a second
   per-channel cleanup after a failed register path
   (`baseline:src/hws_video.c:5849`, `baseline:src/hws_video.c:5856`).
-- Fix direction:
-  Make one layer own teardown. Either:
-  1. Let `hws_video_register()` fully unwind its own partial work and have
-     probe avoid calling `hws_video_cleanup_channel()` after a failed
-     register attempt, or
-  2. Split channel init, channel register, and channel teardown into clearly
-     separate phases with flags indicating ownership.
+- Resolution:
+  The driver now splits registration teardown from full channel teardown.
+  `hws_video_register()` unwinds only registration-owned state, while
+  `hws_video_cleanup_channel()` and normal unregister continue to own control
+  handler teardown.
 - How to test the current bug:
   1. Force a late failure inside `hws_video_register()`.
   2. The most practical way is a temporary debug knob that fails after N
@@ -102,7 +105,11 @@ out-of-tree module".
   A live input mode change can stall streaming instead of recovering or
   failing in a controlled, documented way.
 - Current status:
-  Still present in current `master`.
+  Fixed in current `master`. Geometry changes now take the explicit
+  renegotiation path: the driver emits `V4L2_EVENT_SOURCE_CHANGE`, marks the
+  queue in error when buffers are present, drains in-flight buffers, and
+  leaves restart to userspace instead of trying to re-prime from an empty
+  queue.
 - Baseline branch status:
   Not present in `baseline` as this exact bug. The old `ChangeVideoSize()`
   path only updated cached geometry and reprogrammed the half-size register
@@ -110,13 +117,10 @@ out-of-tree module".
   queueing model there was different and fed userspace from an internal
   hardware buffer pool via `video_data_process()`
   (`baseline:src/hws_video.c:2844`).
-- Fix direction:
-  Pick one policy and implement it consistently:
-  1. Transparent recovery: keep or requeue at least one buffer so the driver
-     can re-prime hardware after the mode change, or
-  2. Explicit renegotiation: emit the source-change event, mark the queue in
-     error when buffers are no longer valid, and require userspace to
-     re-request buffers and restart streaming.
+- Resolution:
+  The driver now consistently uses explicit renegotiation for geometry
+  changes. It no longer attempts a partial restart after draining the active
+  queue state.
 - How to test the current bug:
   1. Start streaming with at least two queued buffers.
   2. Change the live HDMI source resolution, for example from 1920x1080 to
