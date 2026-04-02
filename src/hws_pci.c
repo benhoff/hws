@@ -427,7 +427,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	irq = pdev->irq;
 	hws->irq = irq;
 	dev_info(&pdev->dev,
-		 "IRQ mode: legacy INTx (shared, threaded fanout), irq=%d\n",
+		 "IRQ mode: legacy INTx (shared, threaded capture work), irq=%d\n",
 		 irq);
 
 	/* B) Mask the device's global/bridge gate (INT_EN_REG_BASE) */

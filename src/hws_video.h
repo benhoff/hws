@@ -4,16 +4,14 @@
 
 #include <linux/types.h>
 
+struct hws_pcie_dev;
 struct hws_video;
-struct hwsvideo_buffer;
 
 int hws_video_register(struct hws_pcie_dev *dev);
 void hws_video_unregister(struct hws_pcie_dev *dev);
 void hws_enable_video_capture(struct hws_pcie_dev *hws,
-			      unsigned int chan,
-			      bool on);
-void hws_prime_next_locked(struct hws_video *vid);
-struct hwsvideo_buffer *hws_take_direct_buffer_locked(struct hws_video *vid);
+				      unsigned int chan,
+				      bool on);
 
 int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch);
 void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch);

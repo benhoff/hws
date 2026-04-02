@@ -57,12 +57,13 @@ The companion test script is:
 
 ## Edge Cases and Expected Behavior
 
-1. Stream mode transitions may drop in-flight buffers
+1. Stream mode transitions are deferred to frame boundaries
 - Path: internal recompute when streamer count changes (`1 <-> 2+`).
 - Expected:
   - queued buffers stay on their owning file handle and are not drained just because the mode changed.
-  - an in-flight direct-path buffer can still be returned with error during the transition to or from `FANOUT`.
-  - clients should still tolerate occasional `DQBUF` error around transition boundaries.
+  - normal `DIRECT -> FANOUT` and `FANOUT -> DIRECT` transitions are deferred until a safe frame boundary.
+  - all consumers that receive a fanout-delivered frame should still see identical sequence/timestamp metadata for that frame.
+  - special case: if the current direct owner is the handle being stopped or closed, the branch still forces an immediate direct-path restart so that streamoff/release does not leave that handle holding in-flight DMA buffers.
 
 2. Slow or stalled consumer in fan-out mode
 - Expected:
@@ -84,12 +85,18 @@ The companion test script is:
   - size-changing `S_FMT` should fail if any queue is busy.
   - once all queues are idle, format change is allowed.
 
-6. Suspend/resume during active capture
+6. Live input resolution change while buffers stay large enough
+- Expected:
+  - the engine is reprogrammed without draining or erroring active queues when the new `sizeimage` still fits existing allocations.
+  - direct mode may temporarily stop pre-arming the next buffer while the channel is being reconfigured, but queued buffers remain owned by their original file handle.
+  - if the new `sizeimage` exceeds `alloc_sizeimage`, the queues are marked in error and userspace must recover with `STREAMOFF/REQBUFS/STREAMON`.
+
+7. Suspend/resume during active capture
 - Expected:
   - suspend path stops engine and marks queues in error.
   - user space should restart streaming after resume.
 
-7. No-signal input source
+8. No-signal input source
 - Expected:
   - behavior depends on existing no-signal handling path.
   - frame content validity is not guaranteed by this test suite; only stream liveness/non-empty output is checked.

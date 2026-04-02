@@ -1,10 +1,11 @@
 obj-m = HwsCapture.o
 
 HwsCapture-objs := \
-	 hws_pci.o \
-	 hws_irq.o \
-	 hws_video.o \
-	 hws_v4l2_ioctl.o 
+		 hws_pci.o \
+		 hws_irq.o \
+		 hws_capture.o \
+		 hws_video.o \
+		 hws_v4l2_ioctl.o 
 
 src := $(CURDIR)
 

@@ -76,6 +76,9 @@ struct hws_capture_engine {
 	atomic_t sequence_number;
 	enum hws_capture_mode mode;
 	struct hws_vfh_ctx *direct_owner;
+	enum hws_capture_mode pending_mode;
+	struct hws_vfh_ctx *pending_direct_owner;
+	bool mode_pending;
 	void *fanout_cpu;
 	dma_addr_t fanout_dma;
 	size_t fanout_size;
@@ -196,7 +199,7 @@ struct hws_pcie_dev {
 
 	bool suspended;
 	int irq;
-	unsigned long fanout_pending_mask;
+	unsigned long capture_work_mask;
 
 	/* ───── error flags ───── */
 	int pci_lost;

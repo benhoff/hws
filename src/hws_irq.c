@@ -4,12 +4,14 @@
 #include <linux/io.h>
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
+#include <linux/mutex.h>
 #include <linux/minmax.h>
 #include <linux/string.h>
 
 #include <media/videobuf2-dma-contig.h>
 
 #include "hws_irq.h"
+#include "hws_capture.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws.h"
@@ -122,7 +124,7 @@ hws_pop_ctx_buffer(struct hws_vfh_ctx *ctx)
 	return buf;
 }
 
-static void hws_video_handle_vdone_fanout(struct hws_video *v)
+static bool hws_video_handle_vdone_fanout(struct hws_video *v)
 {
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
@@ -134,11 +136,11 @@ static void hws_video_handle_vdone_fanout(struct hws_video *v)
 	bool have_seq = false;
 
 	if (unlikely(READ_ONCE(hws->suspended)))
-		return;
+		return false;
 	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
-		return;
+		return false;
 	if (!READ_ONCE(v->engine.fanout_cpu))
-		return;
+		return false;
 
 	expected = READ_ONCE(v->pix.sizeimage);
 	ts = ktime_get_ns();
@@ -178,7 +180,10 @@ static void hws_video_handle_vdone_fanout(struct hws_video *v)
 	spin_unlock_irqrestore(&v->consumers_lock, flags);
 
 	if (!READ_ONCE(v->cap_active))
-		return;
+		return false;
+
+	if (hws_capture_has_pending(v))
+		return true;
 
 	{
 		dma_addr_t dma_addr = READ_ONCE(v->engine.fanout_dma);
@@ -187,9 +192,10 @@ static void hws_video_handle_vdone_fanout(struct hws_video *v)
 		iowrite32(lower_32_bits(dma_addr),
 			  hws->bar0_base + HWS_REG_DMA_ADDR(ch));
 	}
+	return false;
 }
 
-static void hws_video_handle_vdone(struct hws_video *v)
+static bool hws_video_handle_vdone(struct hws_video *v)
 {
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
@@ -208,10 +214,10 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		"bh_video(ch=%u): entry stop=%d cap=%d\n", ch,
 		v->stop_requested, v->cap_active);
 	if (unlikely(READ_ONCE(hws->suspended)))
-		return;
+		return false;
 
 	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
-		return;
+		return false;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	done = v->engine.active;
@@ -254,30 +260,36 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	}
 
 	if (unlikely(READ_ONCE(hws->suspended)))
-		return;
+		return false;
 
 	if (promoted) {
+		if (hws_capture_has_pending(v))
+			return true;
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): promoted pre-armed buffer active=%p\n",
 			ch, v->engine.active);
 		spin_lock_irqsave(&v->irq_lock, flags);
 		hws_prime_next_locked(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
-		return;
+		return false;
 	}
 
 arm_next:
+	if (hws_capture_has_pending(v))
+		return true;
+
 	/* 2) Immediately arm the next queued buffer (if present) */
 	ret = hws_arm_next(hws, ch);
 	if (ret == -EAGAIN) {
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): no queued buffer to arm\n", ch);
-		return;
+		return false;
 	}
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): armed next buffer, active=%p\n", ch,
 		v->engine.active);
 	/* On success the engine now points at engine.active’s DMA address */
+	return false;
 }
 
 irqreturn_t hws_irq_handler(int irq, void *info)
@@ -324,12 +336,12 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
 				   !READ_ONCE(pdx->video[ch].stop_requested))) {
-				if (READ_ONCE(pdx->video[ch].engine.mode) ==
-				    HWS_CAPTURE_MODE_FANOUT) {
-					set_bit(ch, &pdx->fanout_pending_mask);
-					wake_thread = true;
-				} else {
-					if (unlikely(hws_toggle_debug)) {
+					if (READ_ONCE(pdx->video[ch].engine.mode) ==
+					    HWS_CAPTURE_MODE_FANOUT) {
+						set_bit(ch, &pdx->capture_work_mask);
+						wake_thread = true;
+					} else {
+						if (unlikely(hws_toggle_debug)) {
 						u32 toggle =
 						    readl_relaxed(pdx->bar0_base +
 								  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
@@ -338,14 +350,17 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 					}
 					dma_rmb();
 					WRITE_ONCE(pdx->video[ch].half_seen, true);
-					dev_dbg(&pdx->pdev->dev,
-						"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
-						ch,
-						READ_ONCE(pdx->video[ch].last_buf_half_toggle),
-						READ_ONCE(pdx->video[ch].cap_active));
-					hws_video_handle_vdone(&pdx->video[ch]);
-				}
-			} else {
+						dev_dbg(&pdx->pdev->dev,
+							"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
+							ch,
+							READ_ONCE(pdx->video[ch].last_buf_half_toggle),
+							READ_ONCE(pdx->video[ch].cap_active));
+						if (hws_video_handle_vdone(&pdx->video[ch])) {
+							set_bit(ch, &pdx->capture_work_mask);
+							wake_thread = true;
+						}
+					}
+				} else {
 				dev_dbg(&pdx->pdev->dev,
 					"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
 					ch,
@@ -376,20 +391,31 @@ irqreturn_t hws_irq_thread(int irq, void *info)
 	struct hws_pcie_dev *pdx = info;
 	unsigned int ch;
 
-	(void)irq;
+		(void)irq;
 	for (ch = 0; ch < pdx->cur_max_video_ch; ch++) {
 		struct hws_video *v = &pdx->video[ch];
+		bool apply_pending = false;
 
-		if (!test_and_clear_bit(ch, &pdx->fanout_pending_mask))
+		if (!test_and_clear_bit(ch, &pdx->capture_work_mask))
 			continue;
 		if (unlikely(READ_ONCE(pdx->suspended)))
 			continue;
-		if (unlikely(READ_ONCE(v->stop_requested) ||
-			     !READ_ONCE(v->cap_active)))
+
+		if (READ_ONCE(v->engine.mode) == HWS_CAPTURE_MODE_FANOUT) {
+			if (unlikely(READ_ONCE(v->stop_requested) ||
+				     !READ_ONCE(v->cap_active)))
+				continue;
+			apply_pending = hws_video_handle_vdone_fanout(v);
+		} else {
+			apply_pending = hws_capture_has_pending(v);
+		}
+
+		if (!apply_pending && !hws_capture_has_pending(v))
 			continue;
-		if (READ_ONCE(v->engine.mode) != HWS_CAPTURE_MODE_FANOUT)
-			continue;
-		hws_video_handle_vdone_fanout(v);
+
+		mutex_lock(&v->state_lock);
+		(void)hws_capture_apply_pending_locked(v);
+		mutex_unlock(&v->state_lock);
 	}
 
 	return IRQ_HANDLED;
