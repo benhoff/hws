@@ -284,6 +284,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 {
 	struct hws_pcie_dev *pdx = info;
 	u32 int_state;
+	bool wake_thread = false;
 
 	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
 	if (likely(pdx->bar0_base)) {
@@ -325,7 +326,8 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 				   !READ_ONCE(pdx->video[ch].stop_requested))) {
 				if (READ_ONCE(pdx->video[ch].engine.mode) ==
 				    HWS_CAPTURE_MODE_FANOUT) {
-					hws_video_handle_vdone_fanout(&pdx->video[ch]);
+					set_bit(ch, &pdx->fanout_pending_mask);
+					wake_thread = true;
 				} else {
 					if (unlikely(hws_toggle_debug)) {
 						u32 toggle =
@@ -364,6 +366,30 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			dev_warn_ratelimited(&pdx->pdev->dev,
 					     "IRQ storm? status=0x%08x\n",
 					     int_state);
+	}
+
+	return wake_thread ? IRQ_WAKE_THREAD : IRQ_HANDLED;
+}
+
+irqreturn_t hws_irq_thread(int irq, void *info)
+{
+	struct hws_pcie_dev *pdx = info;
+	unsigned int ch;
+
+	(void)irq;
+	for (ch = 0; ch < pdx->cur_max_video_ch; ch++) {
+		struct hws_video *v = &pdx->video[ch];
+
+		if (!test_and_clear_bit(ch, &pdx->fanout_pending_mask))
+			continue;
+		if (unlikely(READ_ONCE(pdx->suspended)))
+			continue;
+		if (unlikely(READ_ONCE(v->stop_requested) ||
+			     !READ_ONCE(v->cap_active)))
+			continue;
+		if (READ_ONCE(v->engine.mode) != HWS_CAPTURE_MODE_FANOUT)
+			continue;
+		hws_video_handle_vdone_fanout(v);
 	}
 
 	return IRQ_HANDLED;

@@ -3,9 +3,10 @@
 This document describes edge cases for the hybrid capture implementation:
 
 - `DIRECT` mode: one streaming consumer, DMA writes directly into that consumer's queued buffers.
-- `FANOUT` mode: two or more streaming consumers, DMA writes into an internal staging buffer and the ISR copies to each consumer buffer.
+- `FANOUT` mode: two or more streaming consumers, DMA writes into an internal staging buffer and a threaded IRQ handler copies to each consumer buffer.
 - Per-file queues remain authoritative. The channel engine borrows a direct owner's buffers for DMA, but queued buffers stay attached to their stream context instead of being migrated into a channel-global software queue.
 - `FANOUT` is currently `MMAP`-only. `DMABUF` capture remains supported for `DIRECT` mode, but the branch rejects entering `FANOUT` until multi-consumer destination mapping rules are implemented explicitly.
+- The hard IRQ now only acknowledges fanout completions and wakes the threaded handler. Fanout memcpy work no longer runs in hard IRQ context.
 
 The companion test script is:
 

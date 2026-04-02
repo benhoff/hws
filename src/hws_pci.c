@@ -421,12 +421,14 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	/* 7) Start-run sequence (like InitVideoSys) */
 	hws_init_video_sys(hws, false);
 
-	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
+	/* A) Force legacy INTx; use a threaded handler for fanout completions */
 	pci_intx(pdev, 1);
-	irqf = IRQF_SHARED;
+	irqf = IRQF_SHARED | IRQF_ONESHOT;
 	irq = pdev->irq;
 	hws->irq = irq;
-	dev_info(&pdev->dev, "IRQ mode: legacy INTx (shared), irq=%d\n", irq);
+	dev_info(&pdev->dev,
+		 "IRQ mode: legacy INTx (shared, threaded fanout), irq=%d\n",
+		 irq);
 
 	/* B) Mask the device's global/bridge gate (INT_EN_REG_BASE) */
 	hws_irq_mask_gate(hws);
@@ -435,10 +437,14 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws_irq_clear_pending(hws);
 
 	/* D) Request the legacy shared interrupt line (no vectors/MSI/MSI-X) */
-	ret = devm_request_irq(&pdev->dev, irq, hws_irq_handler, irqf,
-			       dev_name(&pdev->dev), hws);
+	ret = devm_request_threaded_irq(&pdev->dev, irq,
+					hws_irq_handler,
+					hws_irq_thread,
+					irqf,
+					dev_name(&pdev->dev), hws);
 	if (ret) {
-		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n", irq, ret);
+		dev_err(&pdev->dev,
+			"request_threaded_irq(%d) failed: %d\n", irq, ret);
 		goto err_unwind_channels;
 	}
 

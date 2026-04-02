@@ -196,6 +196,7 @@ struct hws_pcie_dev {
 
 	bool suspended;
 	int irq;
+	unsigned long fanout_pending_mask;
 
 	/* ───── error flags ───── */
 	int pci_lost;
