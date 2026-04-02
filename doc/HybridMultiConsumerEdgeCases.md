@@ -4,6 +4,8 @@ This document describes edge cases for the hybrid capture implementation:
 
 - `DIRECT` mode: one streaming consumer, DMA writes directly into that consumer's queued buffers.
 - `FANOUT` mode: two or more streaming consumers, DMA writes into an internal staging buffer and the ISR copies to each consumer buffer.
+- Per-file queues remain authoritative. The channel engine borrows a direct owner's buffers for DMA, but queued buffers stay attached to their stream context instead of being migrated into a channel-global software queue.
+- `FANOUT` is currently `MMAP`-only. `DMABUF` capture remains supported for `DIRECT` mode, but the branch rejects entering `FANOUT` until multi-consumer destination mapping rules are implemented explicitly.
 
 The companion test script is:
 
@@ -57,8 +59,9 @@ The companion test script is:
 1. Stream mode transitions may drop in-flight buffers
 - Path: internal recompute when streamer count changes (`1 <-> 2+`).
 - Expected:
-  - in-flight direct-path buffers can be returned with error during re-arm.
-  - clients should tolerate occasional `DQBUF` error around transition boundaries.
+  - queued buffers stay on their owning file handle and are not drained just because the mode changed.
+  - an in-flight direct-path buffer can still be returned with error during the transition to or from `FANOUT`.
+  - clients should still tolerate occasional `DQBUF` error around transition boundaries.
 
 2. Slow or stalled consumer in fan-out mode
 - Expected:
@@ -153,7 +156,8 @@ These are common scenarios not fully covered by the current scripted suite and s
 - Scenario:
   - one consumer uses `MMAP`, second uses `DMABUF` (and different queue depths)
 - Goal:
-  - verify mixed queue types and sizes do not break fan-out transitions
+  - currently unsupported for `FANOUT`
+  - future work: verify mixed queue types and sizes do not break fan-out transitions once that policy is implemented
 
 6. Sequence/timestamp monotonicity across transitions
 - Scenario:

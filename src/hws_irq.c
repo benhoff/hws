@@ -26,11 +26,12 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	struct hws_video *v = &hws->video[ch];
 	unsigned long flags;
 	struct hwsvideo_buffer *buf;
+	struct hws_vfh_ctx *owner;
 
 	dev_dbg(&hws->pdev->dev,
-		"arm_next(ch=%u): stop=%d cap=%d queued=%d\n",
+		"arm_next(ch=%u): stop=%d cap=%d owner=%p active=%p\n",
 		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
-		!list_empty(&v->capture_queue));
+		READ_ONCE(v->engine.direct_owner), v->engine.active);
 
 	if (unlikely(READ_ONCE(hws->suspended))) {
 		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): suspended\n", ch);
@@ -43,17 +44,19 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 			v->stop_requested, v->cap_active);
 		return -ECANCELED;
 	}
+	if (READ_ONCE(v->engine.mode) != HWS_CAPTURE_MODE_DIRECT)
+		return -EAGAIN;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
-	if (list_empty(&v->capture_queue)) {
+	buf = hws_take_direct_buffer_locked(v);
+	if (!buf) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
-		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): queue empty\n", ch);
+		dev_dbg(&hws->pdev->dev,
+			"arm_next(ch=%u): owner queue empty\n", ch);
 		return -EAGAIN;
 	}
 
-	buf = list_first_entry(&v->capture_queue, struct hwsvideo_buffer, list);
-	list_del_init(&buf->list);	/* keep buffer safe for later cleanup */
-	v->active = buf;
+	v->engine.active = buf;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): picked buffer %p\n", ch,
 		buf);
@@ -68,9 +71,16 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 		dev_dbg(&hws->pdev->dev,
 			"arm_next(ch=%u): suspended after pick\n", ch);
 		spin_lock_irqsave(&v->irq_lock, f);
-		if (v->active) {
-			list_add(&buf->list, &v->capture_queue);
-			v->active = NULL;
+		if (v->engine.active) {
+			owner = READ_ONCE(v->engine.direct_owner);
+			if (owner) {
+				unsigned long qflags;
+
+				spin_lock_irqsave(&owner->qlock, qflags);
+				list_add(&buf->list, &owner->buf_queue);
+				spin_unlock_irqrestore(&owner->qlock, qflags);
+			}
+			v->engine.active = NULL;
 		}
 		spin_unlock_irqrestore(&v->irq_lock, f);
 		return -EBUSY;
@@ -127,7 +137,7 @@ static void hws_video_handle_vdone_fanout(struct hws_video *v)
 		return;
 	if (unlikely(READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)))
 		return;
-	if (!READ_ONCE(v->fanout_cpu))
+	if (!READ_ONCE(v->engine.fanout_cpu))
 		return;
 
 	expected = READ_ONCE(v->pix.sizeimage);
@@ -153,10 +163,11 @@ static void hws_video_handle_vdone_fanout(struct hws_video *v)
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
 		} else {
 			if (!have_seq) {
-				frame_seq = (u32)atomic_inc_return(&v->sequence_number);
+				frame_seq =
+				    (u32)atomic_inc_return(&v->engine.sequence_number);
 				have_seq = true;
 			}
-			memcpy(dst, v->fanout_cpu, expected);
+			memcpy(dst, v->engine.fanout_cpu, expected);
 			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
 			vb2v->sequence = frame_seq;
 			vb2v->vb2_buf.timestamp = ts;
@@ -170,7 +181,7 @@ static void hws_video_handle_vdone_fanout(struct hws_video *v)
 		return;
 
 	{
-		dma_addr_t dma_addr = READ_ONCE(v->fanout_dma);
+		dma_addr_t dma_addr = READ_ONCE(v->engine.fanout_dma);
 
 		hws_program_dma_for_addr(hws, ch, dma_addr);
 		iowrite32(lower_32_bits(dma_addr),
@@ -189,7 +200,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): stop=%d cap=%d active=%p\n",
 		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
-		v->active);
+		v->engine.active);
 
 	int ret;
 
@@ -203,10 +214,10 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		return;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
-	done = v->active;
-	if (done && v->next_prepared) {
-		v->active = v->next_prepared;
-		v->next_prepared = NULL;
+	done = v->engine.active;
+	if (done && v->engine.next_prepared) {
+		v->engine.active = v->engine.next_prepared;
+		v->engine.next_prepared = NULL;
 		promoted = true;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -221,7 +232,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			dev_warn_ratelimited(&hws->pdev->dev,
 					     "bh_video(ch=%u): sizeimage %zu > plane %zu, dropping seq=%u\n",
 					     ch, expected, plane_size,
-					     (u32)atomic_read(&v->sequence_number) + 1);
+					     (u32)atomic_read(&v->engine.sequence_number) + 1);
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
 			goto arm_next;
 		}
@@ -229,7 +240,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 		dma_rmb();	/* device writes visible before userspace sees it */
 
-		vb2v->sequence = (u32)atomic_inc_return(&v->sequence_number);
+		vb2v->sequence =
+		    (u32)atomic_inc_return(&v->engine.sequence_number);
 		vb2v->vb2_buf.timestamp = ktime_get_ns();
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
@@ -237,7 +249,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			v->last_buf_half_toggle);
 
 		if (!promoted)
-			v->active = NULL;	/* channel no longer owns this buffer */
+			v->engine.active = NULL; /* engine no longer owns this buffer */
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
@@ -247,7 +259,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (promoted) {
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): promoted pre-armed buffer active=%p\n",
-			ch, v->active);
+			ch, v->engine.active);
 		spin_lock_irqsave(&v->irq_lock, flags);
 		hws_prime_next_locked(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -264,8 +276,8 @@ arm_next:
 	}
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): armed next buffer, active=%p\n", ch,
-		v->active);
-	/* On success the engine now points at v->active’s DMA address */
+		v->engine.active);
+	/* On success the engine now points at engine.active’s DMA address */
 }
 
 irqreturn_t hws_irq_handler(int irq, void *info)
@@ -309,31 +321,31 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			if (!(int_state & vbit))
 				continue;
 
-				if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
-					   !READ_ONCE(pdx->video[ch].stop_requested))) {
-					if (READ_ONCE(pdx->video[ch].capture_mode) ==
-					    HWS_CAPTURE_MODE_FANOUT) {
-						hws_video_handle_vdone_fanout(&pdx->video[ch]);
-					} else {
-						if (unlikely(hws_toggle_debug)) {
-							u32 toggle =
-							    readl_relaxed(pdx->bar0_base +
-									  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-							WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
-								   toggle);
-						}
-						dma_rmb();
-						WRITE_ONCE(pdx->video[ch].half_seen, true);
-						dev_dbg(&pdx->pdev->dev,
-							"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
-							ch,
-							READ_ONCE(pdx->video[ch].last_buf_half_toggle),
-							READ_ONCE(pdx->video[ch].cap_active));
-						hws_video_handle_vdone(&pdx->video[ch]);
-					}
+			if (likely(READ_ONCE(pdx->video[ch].cap_active) &&
+				   !READ_ONCE(pdx->video[ch].stop_requested))) {
+				if (READ_ONCE(pdx->video[ch].engine.mode) ==
+				    HWS_CAPTURE_MODE_FANOUT) {
+					hws_video_handle_vdone_fanout(&pdx->video[ch]);
 				} else {
+					if (unlikely(hws_toggle_debug)) {
+						u32 toggle =
+						    readl_relaxed(pdx->bar0_base +
+								  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+						WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
+							   toggle);
+					}
+					dma_rmb();
+					WRITE_ONCE(pdx->video[ch].half_seen, true);
 					dev_dbg(&pdx->pdev->dev,
-						"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
+						"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
+						ch,
+						READ_ONCE(pdx->video[ch].last_buf_half_toggle),
+						READ_ONCE(pdx->video[ch].cap_active));
+					hws_video_handle_vdone(&pdx->video[ch]);
+				}
+			} else {
+				dev_dbg(&pdx->pdev->dev,
+					"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
 					ch,
 					READ_ONCE(pdx->video[ch].cap_active),
 					READ_ONCE(pdx->video[ch].stop_requested));

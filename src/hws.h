@@ -70,15 +70,26 @@ struct hws_vfh_ctx {
 	struct list_head node;
 };
 
+struct hws_capture_engine {
+	struct hwsvideo_buffer *active;
+	struct hwsvideo_buffer *next_prepared;
+	atomic_t sequence_number;
+	enum hws_capture_mode mode;
+	struct hws_vfh_ctx *direct_owner;
+	void *fanout_cpu;
+	dma_addr_t fanout_dma;
+	size_t fanout_size;
+};
+
 struct hws_video {
 	/* ───── linkage ───── */
 	struct hws_pcie_dev *parent;	/* parent device */
 	struct video_device *video_device;
 
 	struct vb2_queue buffer_queue;
-	struct list_head capture_queue;
-	struct hwsvideo_buffer *active;
-	struct hwsvideo_buffer *next_prepared;
+	struct list_head capture_queue; /* legacy channel queue path */
+	u32 queued_count; /* legacy channel queue depth */
+	struct hws_capture_engine engine;
 
 	/* ───── locking ───── */
 	struct mutex state_lock;	/* primary state */
@@ -113,14 +124,7 @@ struct hws_video {
 	bool stop_requested;
 	u8 last_buf_half_toggle;
 	bool half_seen;
-	atomic_t sequence_number;
-	u32 queued_count;
-	enum hws_capture_mode capture_mode;
-	struct hws_vfh_ctx *direct_owner;
 	struct list_head consumers;
-	void *fanout_cpu;
-	dma_addr_t fanout_dma;
-	size_t fanout_size;
 
 	/* ───── timeout and error handling ───── */
 	u32 timeout_count;
