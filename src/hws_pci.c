@@ -10,6 +10,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/pm.h>
 #include <linux/freezer.h>
 #include <linux/pci_regs.h>
@@ -25,6 +26,11 @@
 #define DRV_NAME "hws"
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
+
+static unsigned long long hws_elapsed_us(u64 start_ns)
+{
+	return div_u64(ktime_get_mono_fast_ns() - start_ns, 1000);
+}
 
 /* register layout inside HWS_REG_DEVICE_INFO */
 #define DEVINFO_VER GENMASK(7, 0)
@@ -245,8 +251,7 @@ static void hws_stop_kthread_action(void *data)
 		kthread_stop(t);
 		dev_dbg(&hws->pdev->dev,
 			"lifecycle:kthread-stop:done (%lluus)\n",
-			(unsigned long long)
-			((ktime_get_mono_fast_ns() - start_ns) / 1000));
+			hws_elapsed_us(start_ns));
 	}
 }
 
@@ -610,7 +615,7 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 		synchronize_irq(hws->irq);
 
 	dev_dbg(&hws->pdev->dev, "lifecycle:drain-after-stop:done (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		hws_elapsed_us(start_ns));
 }
 
 static void hws_stop_device(struct hws_pcie_dev *hws)
@@ -640,7 +645,7 @@ out:
 	else
 		dev_dbg(&hws->pdev->dev, "lifecycle:stop-device:device-lost\n");
 	dev_dbg(&hws->pdev->dev, "lifecycle:stop-device:done (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		hws_elapsed_us(start_ns));
 	dev_dbg(&hws->pdev->dev, "%s: complete\n", __func__);
 }
 
@@ -658,22 +663,20 @@ static int hws_quiesce_for_transition(struct hws_pcie_dev *hws,
 	step_ns = ktime_get_mono_fast_ns();
 	hws_block_hotpaths(hws);
 	dev_dbg(dev, "lifecycle:%s:block-hotpaths (%lluus)\n", action,
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 	hws_log_lifecycle_snapshot(hws, action, "blocked");
 
 	if (stop_thread) {
 		step_ns = ktime_get_mono_fast_ns();
 		hws_stop_kthread_action(hws);
 		dev_dbg(dev, "lifecycle:%s:stop-kthread (%lluus)\n", action,
-			(unsigned long long)
-			((ktime_get_mono_fast_ns() - step_ns) / 1000));
+			hws_elapsed_us(step_ns));
 	}
 
 	step_ns = ktime_get_mono_fast_ns();
 	vret = hws_video_quiesce(hws, action);
 	dev_dbg(dev, "lifecycle:%s:video-quiesce ret=%d (%lluus)\n", action,
-		vret,
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		vret, hws_elapsed_us(step_ns));
 	if (vret)
 		dev_warn(dev, "lifecycle:%s video quiesce returned %d\n",
 			 action, vret);
@@ -681,11 +684,10 @@ static int hws_quiesce_for_transition(struct hws_pcie_dev *hws,
 	step_ns = ktime_get_mono_fast_ns();
 	hws_stop_device(hws);
 	dev_dbg(dev, "lifecycle:%s:stop-device (%lluus)\n", action,
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 	hws_log_lifecycle_snapshot(hws, action, "end");
 	dev_dbg(dev, "lifecycle:%s:quiesce-done ret=%d (%lluus)\n", action,
-		vret,
-		(unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		vret, hws_elapsed_us(start_ns));
 
 	return vret;
 }
@@ -717,7 +719,7 @@ static void hws_remove(struct pci_dev *pdev)
 	/* kthread is stopped by the devm action you added in probe */
 	hws_log_lifecycle_snapshot(hws, "remove", "end");
 	dev_info(&pdev->dev, "lifecycle:remove done (%lluus)\n",
-		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		 hws_elapsed_us(start_ns));
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -738,9 +740,9 @@ static int hws_pm_suspend(struct device *dev)
 	pci_disable_device(pdev);
 	pci_set_power_state(pdev, PCI_D3hot);
 	dev_dbg(dev, "lifecycle:pm_suspend:pci-d3hot (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 	dev_info(dev, "lifecycle:pm_suspend done ret=%d (%lluus)\n", vret,
-		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		 hws_elapsed_us(start_ns));
 
 	return 0;
 }
@@ -767,7 +769,7 @@ static int hws_pm_resume(struct device *dev)
 	pci_restore_state(pdev);
 	pci_set_master(pdev);
 	dev_dbg(dev, "lifecycle:pm_resume:pci-enable (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 
 	/* Reapply any PCIe tuning lost across D3 */
 	enable_pcie_relaxed_ordering(pdev);
@@ -780,7 +782,7 @@ static int hws_pm_resume(struct device *dev)
 	hws_init_video_sys(hws, true);
 	hws_irq_clear_pending(hws);
 	dev_dbg(dev, "lifecycle:pm_resume:chip-reinit (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 
 	/* IRQs can be re-enabled now that MMIO is sane */
 	step_ns = ktime_get_mono_fast_ns();
@@ -789,16 +791,16 @@ static int hws_pm_resume(struct device *dev)
 
 	WRITE_ONCE(hws->suspended, false);
 	dev_dbg(dev, "lifecycle:pm_resume:irq-unsuspend (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 
 	/* vb2: nothing mandatory; userspace will STREAMON again when ready */
 	step_ns = ktime_get_mono_fast_ns();
 	hws_video_pm_resume(hws);
 	dev_dbg(dev, "lifecycle:pm_resume:video-resume (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 	hws_log_lifecycle_snapshot(hws, "pm_resume", "end");
 	dev_info(dev, "lifecycle:pm_resume done (%lluus)\n",
-		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		 hws_elapsed_us(start_ns));
 
 	return 0;
 }
@@ -825,10 +827,9 @@ static void hws_shutdown(struct pci_dev *pdev)
 	step_ns = ktime_get_mono_fast_ns();
 	pci_clear_master(pdev);
 	dev_dbg(&pdev->dev, "lifecycle:pci_shutdown:clear-master (%lluus)\n",
-		(unsigned long long)((ktime_get_mono_fast_ns() - step_ns) / 1000));
+		hws_elapsed_us(step_ns));
 	dev_info(&pdev->dev, "lifecycle:pci_shutdown done ret=%d (%lluus)\n",
-		 vret,
-		 (unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		 vret, hws_elapsed_us(start_ns));
 }
 
 static struct pci_driver hws_pci_driver = {

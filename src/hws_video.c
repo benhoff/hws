@@ -8,6 +8,7 @@
 #include <linux/bits.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/interrupt.h>
 #include <linux/moduleparam.h>
 
@@ -42,6 +43,11 @@ static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
 hws_take_queued_buffer_locked(struct hws_video *vid);
+
+static unsigned long long hws_elapsed_us(u64 start_ns)
+{
+	return div_u64(ktime_get_mono_fast_ns() - start_ns, 1000);
+}
 
 static inline bool list_node_unlinked(const struct list_head *n)
 {
@@ -1319,8 +1325,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	}
 	dev_dbg(&hws->pdev->dev,
 		"video:streamoff:done ch=%u completed=%u (%lluus)\n",
-		v->channel_index, done_cnt,
-		(unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		v->channel_index, done_cnt, hws_elapsed_us(start_ns));
 	hws_log_video_state(v, "streamoff", "end");
 }
 
@@ -1482,20 +1487,17 @@ int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
 
 			dev_dbg(&hws->pdev->dev,
 				"video:%s:ch=%d streamoff ret=%d (%lluus)\n",
-				reason, i, r, (unsigned long long)
-				((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
+				reason, i, r, hws_elapsed_us(ch_start_ns));
 			if (r && !ret)
 				ret = r;
 		} else {
 			dev_dbg(&hws->pdev->dev,
 				"video:%s:ch=%d idle (%lluus)\n",
-				reason, i, (unsigned long long)
-				((ktime_get_mono_fast_ns() - ch_start_ns) / 1000));
+				reason, i, hws_elapsed_us(ch_start_ns));
 		}
 	}
 	dev_dbg(&hws->pdev->dev, "video:%s:done ret=%d (%lluus)\n", reason,
-		ret,
-		(unsigned long long)((ktime_get_mono_fast_ns() - start_ns) / 1000));
+		ret, hws_elapsed_us(start_ns));
 	return ret;
 }
 
