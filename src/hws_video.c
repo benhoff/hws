@@ -307,7 +307,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	mutex_init(&vid->state_lock);
 	spin_lock_init(&vid->irq_lock);
 	spin_lock_init(&vid->consumers_lock);
-	INIT_LIST_HEAD(&vid->capture_queue);
 	INIT_LIST_HEAD(&vid->consumers);
 	hws_capture_engine_init(vid);
 
@@ -315,7 +314,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->timeout_count = 0;
 	vid->error_count = 0;
 
-	vid->queued_count = 0;
 	vid->window_valid = false;
 
 	/* default format (adjust to your HW) */
@@ -365,7 +363,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 static void hws_video_drain_queue_locked(struct hws_video *vid)
 {
-	/* Return in-flight first */
 	if (vid->engine.active) {
 		vb2_buffer_done(&vid->engine.active->vb.vb2_buf,
 				VB2_BUF_STATE_ERROR);
@@ -375,16 +372,6 @@ static void hws_video_drain_queue_locked(struct hws_video *vid)
 		vb2_buffer_done(&vid->engine.next_prepared->vb.vb2_buf,
 				VB2_BUF_STATE_ERROR);
 		vid->engine.next_prepared = NULL;
-	}
-
-	/* Legacy channel queue path, retained only for the placeholder queue. */
-	while (!list_empty(&vid->capture_queue)) {
-		struct hwsvideo_buffer *b =
-		    list_first_entry(&vid->capture_queue,
-				     struct hwsvideo_buffer,
-				     list);
-		list_del_init(&b->list);
-		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 	}
 }
 
@@ -414,14 +401,10 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	hws_video_drain_queue_locked(vid);
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 
-	/* 5) Release VB2 queue if initialized */
-	if (vid->buffer_queue.ops)
-		vb2_queue_release(&vid->buffer_queue);
-
-	/* 6) Free V4L2 controls */
+	/* 5) Free V4L2 controls */
 	v4l2_ctrl_handler_free(&vid->control_handler);
 
-	/* 7) Unregister the video_device if we own it */
+	/* 6) Unregister the video_device if we own it */
 	if (vid->video_device && video_is_registered(vid->video_device))
 		video_unregister_device(vid->video_device);
 	/* If you allocated it with video_device_alloc(), release it here:
@@ -429,11 +412,10 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	 */
 	vid->video_device = NULL;
 
-	/* 8) Reset simple state (don’t memset the whole struct here) */
+	/* 7) Reset simple state (don’t memset the whole struct here) */
 	hws_capture_engine_cleanup(vid);
 	INIT_LIST_HEAD(&vid->consumers);
 	mutex_destroy(&vid->state_lock);
-	INIT_LIST_HEAD(&vid->capture_queue);
 	vid->stop_requested = false;
 	vid->last_buf_half_toggle = 0;
 	vid->half_seen = false;
@@ -1339,276 +1321,6 @@ static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 	return v->pix.sizeimage;
 }
 
-static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
-			   unsigned int *nplanes, unsigned int sizes[],
-			   struct device *alloc_devs[])
-{
-	struct hws_video *vid = q->drv_priv;
-
-	(void)num_buffers;
-	(void)alloc_devs;
-
-	if (!vid->pix.sizeimage) {
-		vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
-		vid->pix.sizeimage = vid->pix.bytesperline * vid->pix.height;
-	}
-	if (*nplanes) {
-		if (sizes[0] < vid->pix.sizeimage)
-			return -EINVAL;
-	} else {
-		*nplanes = 1;
-		sizes[0] = PAGE_ALIGN(vid->pix.sizeimage);
-	}
-
-	vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
-	return 0;
-}
-
-static int hws_buffer_prepare(struct vb2_buffer *vb)
-{
-	struct hws_video *vid = vb->vb2_queue->drv_priv;
-	struct hws_pcie_dev *hws = vid->parent;
-	size_t need = vid->pix.sizeimage;
-	dma_addr_t dma_addr;
-
-	if (vb2_plane_size(vb, 0) < need)
-		return -EINVAL;
-
-	/* Validate DMA address alignment */
-	dma_addr = vb2_dma_contig_plane_dma_addr(vb, 0);
-	if (dma_addr & 0x3F) {	/* 64-byte alignment required */
-		dev_err(&hws->pdev->dev,
-			"Buffer DMA address 0x%llx not 64-byte aligned\n",
-			(unsigned long long)dma_addr);
-		return -EINVAL;
-	}
-
-	vb2_set_plane_payload(vb, 0, need);
-	return 0;
-}
-
-static void hws_buffer_queue(struct vb2_buffer *vb)
-{
-	struct hws_video *vid = vb->vb2_queue->drv_priv;
-	struct hwsvideo_buffer *buf = to_hwsbuf(vb);
-	struct hws_pcie_dev *hws = vid->parent;
-	unsigned long flags;
-
-	dev_dbg(&hws->pdev->dev,
-		"buffer_queue(ch=%u): vb=%p sizeimage=%u q_active=%d\n",
-		vid->channel_index, vb, vid->pix.sizeimage,
-		READ_ONCE(vid->cap_active));
-
-	/* Initialize buffer slot */
-	buf->slot = 0;
-
-	spin_lock_irqsave(&vid->irq_lock, flags);
-	list_add_tail(&buf->list, &vid->capture_queue);
-	vid->queued_count++;
-
-	/* If streaming and no in-flight buffer, prime HW immediately */
-	if (READ_ONCE(vid->cap_active) && !vid->engine.active) {
-		dma_addr_t dma_addr;
-
-		dev_dbg(&hws->pdev->dev,
-			"buffer_queue(ch=%u): priming first vb=%p\n",
-			vid->channel_index, &buf->vb.vb2_buf);
-		list_del_init(&buf->list);
-		vid->queued_count--;
-		vid->engine.active = buf;
-
-		dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		hws_program_dma_for_addr(vid->parent, vid->channel_index,
-					 dma_addr);
-		iowrite32(lower_32_bits(dma_addr),
-			  hws->bar0_base + HWS_REG_DMA_ADDR(vid->channel_index));
-
-		wmb(); /* ensure descriptors visible before enabling capture */
-		hws_enable_video_capture(hws, vid->channel_index, true);
-		hws_prime_next_locked(vid);
-	} else if (READ_ONCE(vid->cap_active) && vid->engine.active) {
-		hws_prime_next_locked(vid);
-	}
-	spin_unlock_irqrestore(&vid->irq_lock, flags);
-}
-
-static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
-{
-	struct hws_video *v = q->drv_priv;
-	struct hws_pcie_dev *hws = v->parent;
-	struct hwsvideo_buffer *to_program = NULL;	/* local copy */
-	struct vb2_buffer *prog_vb2 = NULL;
-	unsigned long flags;
-	int ret;
-
-	dev_dbg(&hws->pdev->dev, "start_streaming: ch=%u count=%u\n",
-		v->channel_index, count);
-
-	ret = hws_check_card_status(hws);
-	if (ret) {
-		struct hwsvideo_buffer *b, *tmp;
-		unsigned long f;
-		LIST_HEAD(queued);
-
-		spin_lock_irqsave(&v->irq_lock, f);
-		if (v->engine.active) {
-			list_add_tail(&v->engine.active->list, &queued);
-			v->engine.active = NULL;
-		}
-		if (v->engine.next_prepared) {
-			list_add_tail(&v->engine.next_prepared->list, &queued);
-			v->engine.next_prepared = NULL;
-		}
-		while (!list_empty(&v->capture_queue)) {
-			b = list_first_entry(&v->capture_queue,
-					     struct hwsvideo_buffer, list);
-			list_move_tail(&b->list, &queued);
-		}
-		spin_unlock_irqrestore(&v->irq_lock, f);
-
-		list_for_each_entry_safe(b, tmp, &queued, list) {
-			list_del_init(&b->list);
-			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
-		}
-		return ret;
-	}
-	(void)hws_update_active_interlace(hws, v->channel_index);
-
-	lockdep_assert_held(&v->state_lock);
-	/* init per-stream state */
-	WRITE_ONCE(v->stop_requested, false);
-	WRITE_ONCE(v->cap_active, true);
-	WRITE_ONCE(v->half_seen, false);
-	WRITE_ONCE(v->last_buf_half_toggle, 0);
-
-	/* Try to prime a buffer, but it's OK if none are queued yet */
-	spin_lock_irqsave(&v->irq_lock, flags);
-	if (!v->engine.active && !list_empty(&v->capture_queue)) {
-		to_program = list_first_entry(&v->capture_queue,
-					      struct hwsvideo_buffer, list);
-		list_del_init(&to_program->list);
-		v->queued_count--;
-		v->engine.active = to_program;
-		prog_vb2 = &to_program->vb.vb2_buf;
-		dev_dbg(&hws->pdev->dev,
-			"start_streaming: ch=%u took buffer %p\n",
-			v->channel_index, to_program);
-	}
-	spin_unlock_irqrestore(&v->irq_lock, flags);
-
-	/* Only program/enable HW if we actually have a buffer */
-	if (to_program) {
-		if (!prog_vb2)
-			prog_vb2 = &to_program->vb.vb2_buf;
-		{
-			dma_addr_t dma_addr;
-
-			dma_addr = vb2_dma_contig_plane_dma_addr(prog_vb2, 0);
-			hws_program_dma_for_addr(hws, v->channel_index, dma_addr);
-			iowrite32(lower_32_bits(dma_addr),
-				  hws->bar0_base +
-				  HWS_REG_DMA_ADDR(v->channel_index));
-			dev_dbg(&hws->pdev->dev,
-				"start_streaming: ch=%u programmed buffer %p dma=0x%08x\n",
-				v->channel_index, to_program,
-				lower_32_bits(dma_addr));
-			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
-		}
-
-		wmb(); /* ensure descriptors visible before enabling capture */
-		hws_enable_video_capture(hws, v->channel_index, true);
-		{
-			unsigned long pf;
-
-			spin_lock_irqsave(&v->irq_lock, pf);
-			hws_prime_next_locked(v);
-			spin_unlock_irqrestore(&v->irq_lock, pf);
-		}
-	} else {
-		dev_dbg(&hws->pdev->dev,
-			"start_streaming: ch=%u no buffer yet (will arm on QBUF)\n",
-			v->channel_index);
-	}
-
-	return 0;
-}
-
-static inline bool list_node_unlinked(const struct list_head *n)
-{
-	return n->next == LIST_POISON1 || n->prev == LIST_POISON2;
-}
-
-static void hws_stop_streaming(struct vb2_queue *q)
-{
-	struct hws_video *v = q->drv_priv;
-	unsigned long flags;
-	struct hwsvideo_buffer *b, *tmp;
-	LIST_HEAD(done);
-
-	/* 1) Quiesce SW/HW first */
-	lockdep_assert_held(&v->state_lock);
-	WRITE_ONCE(v->cap_active, false);
-	WRITE_ONCE(v->stop_requested, true);
-
-	hws_enable_video_capture(v->parent, v->channel_index, false);
-
-	/* 2) Collect in-flight + queued under the IRQ lock */
-	spin_lock_irqsave(&v->irq_lock, flags);
-
-	if (v->engine.active) {
-		/*
-		 * engine.active may not be on any list (only referenced directly).
-		 * Only move it if its list node is still linked somewhere.
-		 */
-		if (!list_node_unlinked(&v->engine.active->list)) {
-			/* Move directly to 'done' in one safe op */
-			list_move_tail(&v->engine.active->list, &done);
-		} else {
-			/* Not on a list: put list node into a known state for later reuse */
-			INIT_LIST_HEAD(&v->engine.active->list);
-			/*
-			 * We'll complete it below without relying on list pointers.
-			 * To unify flow, push it via a temporary single-element list.
-			 */
-			list_add_tail(&v->engine.active->list, &done);
-		}
-		v->engine.active = NULL;
-	}
-
-	if (v->engine.next_prepared) {
-		list_add_tail(&v->engine.next_prepared->list, &done);
-		v->engine.next_prepared = NULL;
-	}
-
-	while (!list_empty(&v->capture_queue)) {
-		b = list_first_entry(&v->capture_queue, struct hwsvideo_buffer,
-				     list);
-		/* Move (not del+add) to preserve invariants and avoid touching poisons */
-		list_move_tail(&b->list, &done);
-	}
-
-	spin_unlock_irqrestore(&v->irq_lock, flags);
-
-	/* 3) Complete outside the lock */
-	list_for_each_entry_safe(b, tmp, &done, list) {
-		/* Unlink from 'done' before completing */
-		list_del_init(&b->list);
-		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-	}
-}
-
-static const struct vb2_ops hwspcie_video_qops = {
-	.queue_setup = hws_queue_setup,
-	.buf_prepare = hws_buffer_prepare,
-	.buf_init = hws_buf_init,
-	.buf_finish = hws_buf_finish,
-	.buf_cleanup = hws_buf_cleanup,
-	// .buf_finish = hws_buffer_finish,
-	.buf_queue = hws_buffer_queue,
-	.start_streaming = hws_start_streaming,
-	.stop_streaming = hws_stop_streaming,
-};
-
 static int hws_consumer_queue_setup(struct vb2_queue *q,
 				    unsigned int *num_buffers,
 				    unsigned int *nplanes,
@@ -1730,12 +1442,11 @@ int hws_video_register(struct hws_pcie_dev *dev)
 	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
 		struct video_device *vdev;
-		struct vb2_queue *q;
 
 		/* hws_video_init_channel() should have set:
 		 * - ch->parent, ch->channel_index
 		 * - locks (state_lock, irq_lock)
-		 * - engine state + any legacy queue scaffolding
+		 * - engine state
 		 * - control_handler + controls
 		 * - fmt_curr (width/height)
 		 * Don’t reinitialize any of those here.
@@ -1764,28 +1475,6 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		if (ch->control_handler.error)
 			goto err_unwind;
 		video_set_drvdata(vdev, ch);
-
-		/* vb2 queue init (dma-contig) */
-		q = &ch->buffer_queue;
-		memset(q, 0, sizeof(*q));
-		q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		q->io_modes = VB2_MMAP | VB2_DMABUF;
-		q->drv_priv = ch;
-		q->buf_struct_size = sizeof(struct hwsvideo_buffer);
-		q->ops = &hwspcie_video_qops;	/* your vb2_ops */
-		q->mem_ops = &vb2_dma_contig_memops;
-		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-		q->lock = &ch->state_lock;
-		q->min_queued_buffers = 1;
-		q->dev = &dev->pdev->dev;
-
-		ret = vb2_queue_init(q);
-		vdev->queue = q;
-		if (ret) {
-			dev_err(&dev->pdev->dev,
-				"vb2_queue_init ch%u failed: %d\n", i, ret);
-			goto err_unwind;
-		}
 
 		/* Make controls live (no-op if none or already set up) */
 		if (ch->control_handler.error) {
@@ -1816,16 +1505,16 @@ int hws_video_register(struct hws_pcie_dev *dev)
 	return 0;
 
 err_unwind:
-	for (i = i - 1; i >= 0; i--) {
-		struct hws_video *ch = &dev->video[i];
+		for (i = i - 1; i >= 0; i--) {
+			struct hws_video *ch = &dev->video[i];
 
-		if (video_is_registered(ch->video_device))
-			hws_resolution_remove(ch->video_device);
-		if (video_is_registered(ch->video_device))
-			vb2_video_unregister_device(ch->video_device);
-		v4l2_ctrl_handler_free(&ch->control_handler);
-		if (ch->video_device) {
-			/* If not registered, we must free the alloc’d vdev ourselves */
+			if (video_is_registered(ch->video_device))
+				hws_resolution_remove(ch->video_device);
+			if (video_is_registered(ch->video_device))
+				video_unregister_device(ch->video_device);
+			v4l2_ctrl_handler_free(&ch->control_handler);
+			if (ch->video_device) {
+				/* If not registered, we must free the alloc’d vdev ourselves */
 			if (!video_is_registered(ch->video_device))
 				video_device_release(ch->video_device);
 			ch->video_device = NULL;
@@ -1861,7 +1550,7 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 		if (ch->video_device)
 			hws_resolution_remove(ch->video_device);
 		if (ch->video_device) {
-			vb2_video_unregister_device(ch->video_device);
+			video_unregister_device(ch->video_device);
 			ch->video_device = NULL;
 		}
 		v4l2_ctrl_handler_free(&ch->control_handler);

@@ -89,9 +89,6 @@ struct hws_video {
 	struct hws_pcie_dev *parent;	/* parent device */
 	struct video_device *video_device;
 
-	struct vb2_queue buffer_queue;
-	struct list_head capture_queue; /* legacy channel queue path */
-	u32 queued_count; /* legacy channel queue depth */
 	struct hws_capture_engine engine;
 
 	/* ───── locking ───── */
