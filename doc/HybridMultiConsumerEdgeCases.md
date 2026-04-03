@@ -11,6 +11,7 @@ This document describes edge cases for the hybrid capture implementation:
 The companion test script is:
 
 - `./test_hybrid_multi_consumer.sh`
+- It now validates capture progress using `sizeimage` from `VIDIOC_G_FMT` rather than treating any non-empty output file as success.
 
 ## Test Coverage Matrix
 
@@ -35,24 +36,35 @@ The companion test script is:
   - B completes
   - A continues and completes
 
-4. Abrupt close of one consumer
+4. Original direct owner exits first
 - Test: `Test 4`
+- Scenario:
+  - consumer A starts first in `DIRECT`
+  - consumer B joins, pushing the channel into `FANOUT`
+  - consumer A is terminated first
+- Expected:
+  - A has already produced some frame payloads
+  - B continues and completes
+
+5. Abrupt close of one consumer
+- Test: `Test 5`
 - Scenario:
   - two consumers streaming
   - one process is terminated
 - Expected:
   - remaining consumer continues successfully
 
-5. Format change while queue(s) busy
-- Test: `Test 5`
+6. Format change while queue(s) busy
+- Test: `Test 6`
 - Expected:
   - `VIDIOC_S_FMT` size change fails while another stream is active
   - active stream continues
 
-6. Rapid stream on/off loops
-- Test: `Test 6`
+7. Rapid stream on/off loops plus repeated `1 <-> 2` oscillation
+- Test: `Test 7`
 - Expected:
-  - repeated single and dual capture cycles succeed
+  - repeated single-open cycles succeed
+  - a long-lived primary stream survives repeated short-lived secondary consumers joining and exiting
   - no hangs/timeouts
 
 ## Edge Cases and Expected Behavior
@@ -148,39 +160,27 @@ These are common scenarios not fully covered by the current scripted suite and s
 - Goal:
   - verify direct path re-arms correctly once QBUF resumes
 
-3. Rapid mode oscillation stress (`1 <-> 2` consumers)
-- Scenario:
-  - repeatedly add/remove a short-lived second consumer while first stays active
-- Goal:
-  - expose stale pointer, lock ordering, or transition race bugs
-
-4. Direct-owner switch behavior
-- Scenario:
-  - in `DIRECT`, initial owner stops first while another open handle remains
-- Goal:
-  - verify owner reassignment is clean and stream continues
-
-5. Mixed memory/backing modes per consumer
+3. Mixed memory/backing modes per consumer
 - Scenario:
   - one consumer uses `MMAP`, second uses `DMABUF` (and different queue depths)
 - Goal:
   - currently unsupported for `FANOUT`
   - future work: verify mixed queue types and sizes do not break fan-out transitions once that policy is implemented
 
-6. Sequence/timestamp monotonicity across transitions
+4. Sequence/timestamp monotonicity across transitions
 - Scenario:
   - capture through repeated `DIRECT <-> FANOUT` mode flips
 - Goal:
   - verify sequence and timestamp progression remains monotonic and sane
 
-7. Queue error recovery across consumers
+5. Queue error recovery across consumers
 - Scenario:
   - trigger queue errors (e.g., busy `S_FMT`, suspend/resume)
   - recover with `STREAMOFF/REQBUFS/STREAMON`
 - Goal:
   - verify all consumer handles recover predictably without reboot/reload
 
-8. Signal-loss and re-lock in fan-out mode
+6. Signal-loss and re-lock in fan-out mode
 - Scenario:
   - run two consumers, force input loss/reconnect
 - Goal:
