@@ -96,7 +96,6 @@ struct hws_video {
 
 	/* ───── locking ───── */
 	struct mutex state_lock;	/* primary state */
-	struct mutex ioctl_lock;	/* route ioctl/poll/mmap to per-file queue */
 	spinlock_t irq_lock;	/* ISR-side */
 	spinlock_t consumers_lock;	/* protects consumers list and mode pointers */
 

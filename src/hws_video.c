@@ -305,7 +305,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 	/* locks & lists */
 	mutex_init(&vid->state_lock);
-	mutex_init(&vid->ioctl_lock);
 	spin_lock_init(&vid->irq_lock);
 	spin_lock_init(&vid->consumers_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
@@ -433,7 +432,6 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	/* 8) Reset simple state (don’t memset the whole struct here) */
 	hws_capture_engine_cleanup(vid);
 	INIT_LIST_HEAD(&vid->consumers);
-	mutex_destroy(&vid->ioctl_lock);
 	mutex_destroy(&vid->state_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
 	vid->stop_requested = false;
@@ -926,6 +924,13 @@ static struct hws_vfh_ctx *hws_ctx_from_file(struct file *file)
 	return container_of(fh, struct hws_vfh_ctx, fh);
 }
 
+static struct vb2_queue *hws_vb2q_from_file(struct file *file)
+{
+	struct hws_vfh_ctx *ctx = hws_ctx_from_file(file);
+
+	return ctx ? &ctx->vbq : NULL;
+}
+
 static struct hwsvideo_buffer *
 hws_ctx_pop_buffer_locked(struct hws_vfh_ctx *ctx)
 {
@@ -1076,6 +1081,8 @@ static int hws_open(struct file *file)
 		kfree(ctx);
 		return ret;
 	}
+	/* Each open file handle owns its own queue for its entire lifetime. */
+	q->owner = &ctx->fh;
 
 	spin_lock_irqsave(&vid->consumers_lock, flags);
 	list_add_tail(&ctx->node, &vid->consumers);
@@ -1108,6 +1115,7 @@ static int hws_release(struct file *file)
 	spin_unlock_irqrestore(&vid->consumers_lock, flags);
 
 	vb2_queue_release(&ctx->vbq);
+	ctx->vbq.owner = NULL;
 	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	file->private_data = NULL;
@@ -1119,67 +1127,34 @@ static long hws_unlocked_ioctl(struct file *file, unsigned int cmd,
 			       unsigned long arg)
 {
 	struct hws_vfh_ctx *ctx = hws_ctx_from_file(file);
-	struct hws_video *vid;
-	struct vb2_queue *oldq;
-	long ret;
 
 	if (!ctx)
 		return -EINVAL;
-	vid = ctx->video;
-	if (!vid || !vid->video_device)
+	if (!ctx->video || !ctx->video->video_device)
 		return -ENODEV;
-
-	mutex_lock(&vid->ioctl_lock);
-	oldq = vid->video_device->queue;
-	vid->video_device->queue = &ctx->vbq;
-	ret = video_ioctl2(file, cmd, arg);
-	vid->video_device->queue = oldq;
-	mutex_unlock(&vid->ioctl_lock);
-	return ret;
+	return video_ioctl2(file, cmd, arg);
 }
 
 static __poll_t hws_poll(struct file *file, struct poll_table_struct *wait)
 {
 	struct hws_vfh_ctx *ctx = hws_ctx_from_file(file);
-	struct hws_video *vid;
-	struct vb2_queue *oldq;
-	__poll_t ret;
 
 	if (!ctx)
 		return EPOLLERR;
-	vid = ctx->video;
-	if (!vid || !vid->video_device)
+	if (!ctx->video || !ctx->video->video_device)
 		return EPOLLERR;
-
-	mutex_lock(&vid->ioctl_lock);
-	oldq = vid->video_device->queue;
-	vid->video_device->queue = &ctx->vbq;
-	ret = vb2_fop_poll(file, wait);
-	vid->video_device->queue = oldq;
-	mutex_unlock(&vid->ioctl_lock);
-	return ret;
+	return vb2_poll(&ctx->vbq, file, wait);
 }
 
 static int hws_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct hws_vfh_ctx *ctx = hws_ctx_from_file(file);
-	struct hws_video *vid;
-	struct vb2_queue *oldq;
-	int ret;
 
 	if (!ctx)
 		return -EINVAL;
-	vid = ctx->video;
-	if (!vid || !vid->video_device)
+	if (!ctx->video || !ctx->video->video_device)
 		return -ENODEV;
-
-	mutex_lock(&vid->ioctl_lock);
-	oldq = vid->video_device->queue;
-	vid->video_device->queue = &ctx->vbq;
-	ret = vb2_fop_mmap(file, vma);
-	vid->video_device->queue = oldq;
-	mutex_unlock(&vid->ioctl_lock);
-	return ret;
+	return vb2_mmap(&ctx->vbq, vma);
 }
 
 static const struct v4l2_file_operations hws_fops = {
@@ -1204,6 +1179,105 @@ static int hws_subscribe_event(struct v4l2_fh *fh,
 	}
 }
 
+static int hws_vidioc_reqbufs(struct file *file, void *priv,
+			      struct v4l2_requestbuffers *req)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_reqbufs(q, req);
+}
+
+static int hws_vidioc_prepare_buf(struct file *file, void *priv,
+				  struct v4l2_buffer *buf)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_prepare_buf(q, NULL, buf);
+}
+
+static int hws_vidioc_create_bufs(struct file *file, void *priv,
+				  struct v4l2_create_buffers *create)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_create_bufs(q, create);
+}
+
+static int hws_vidioc_querybuf(struct file *file, void *priv,
+			       struct v4l2_buffer *buf)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_querybuf(q, buf);
+}
+
+static int hws_vidioc_qbuf(struct file *file, void *priv,
+			   struct v4l2_buffer *buf)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_qbuf(q, NULL, buf);
+}
+
+static int hws_vidioc_dqbuf(struct file *file, void *priv,
+			    struct v4l2_buffer *buf)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_dqbuf(q, buf, file->f_flags & O_NONBLOCK);
+}
+
+static int hws_vidioc_expbuf(struct file *file, void *priv,
+			     struct v4l2_exportbuffer *eb)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_expbuf(q, eb);
+}
+
+static int hws_vidioc_streamon(struct file *file, void *priv,
+			       enum v4l2_buf_type type)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_streamon(q, type);
+}
+
+static int hws_vidioc_streamoff(struct file *file, void *priv,
+				enum v4l2_buf_type type)
+{
+	struct vb2_queue *q = hws_vb2q_from_file(file);
+
+	(void)priv;
+	if (!q)
+		return -EINVAL;
+	return vb2_streamoff(q, type);
+}
+
 static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	/* Core caps/info */
 	.vidioc_querycap = hws_vidioc_querycap,
@@ -1215,15 +1289,15 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_try_fmt_vid_cap = hws_vidioc_try_fmt_vid_cap,
 
 	/* Buffer queueing / streaming */
-	.vidioc_reqbufs = vb2_ioctl_reqbufs,
-	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
-	.vidioc_create_bufs = vb2_ioctl_create_bufs,
-	.vidioc_querybuf = vb2_ioctl_querybuf,
-	.vidioc_qbuf = vb2_ioctl_qbuf,
-	.vidioc_dqbuf = vb2_ioctl_dqbuf,
-	.vidioc_expbuf = vb2_ioctl_expbuf,
-	.vidioc_streamon = vb2_ioctl_streamon,
-	.vidioc_streamoff = vb2_ioctl_streamoff,
+	.vidioc_reqbufs = hws_vidioc_reqbufs,
+	.vidioc_prepare_buf = hws_vidioc_prepare_buf,
+	.vidioc_create_bufs = hws_vidioc_create_bufs,
+	.vidioc_querybuf = hws_vidioc_querybuf,
+	.vidioc_qbuf = hws_vidioc_qbuf,
+	.vidioc_dqbuf = hws_vidioc_dqbuf,
+	.vidioc_expbuf = hws_vidioc_expbuf,
+	.vidioc_streamon = hws_vidioc_streamon,
+	.vidioc_streamoff = hws_vidioc_streamoff,
 
 	/* Inputs */
 	.vidioc_enum_input = hws_vidioc_enum_input,
