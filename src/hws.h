@@ -138,20 +138,23 @@ struct hws_audio {
 
 	/* ALSA */
 	struct snd_pcm_substream *pcm_substream;
-	/* ring geometry (set in prepare/hw_params) */
-	u32 periods;
-	u32 period_bytes;
-	u32 next_period;
+	spinlock_t ring_lock;
+	snd_pcm_uframes_t ring_size_byframes;
+	snd_pcm_uframes_t ring_wpos_byframes;
+	snd_pcm_uframes_t period_size_byframes;
+	snd_pcm_uframes_t period_used_byframes;
+	size_t frame_bytes;
+	size_t hw_packet_bytes;
 
 	/* stream state */
 	bool cap_active;
 	bool stream_running;
 	bool stop_requested;
 
-	/* minimal HW period tracking  */
+	/* minimal HW packet tracking */
 	u8 last_period_toggle;
-	snd_pcm_uframes_t ring_wpos_byframes;
-	/* PCM format (for HW programming) */
+
+	/* PCM format */
 	u32 output_sample_rate;
 	u16 channel_count;
 	u16 bits_per_sample;
@@ -198,6 +201,7 @@ struct hws_pcie_dev {
 	/* ───── kernel thread ───── */
 	struct task_struct *main_task;
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
+	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int irq;

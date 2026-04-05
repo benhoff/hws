@@ -144,6 +144,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 }
 
 static void hws_stop_device(struct hws_pcie_dev *hws);
+static void hws_free_seed_buffers(struct hws_pcie_dev *hws);
 
 static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 				       const char *action,
@@ -267,6 +268,7 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 	int ch;
 	/* 64 KiB is plenty for a safe dummy; align to 64 for your HW */
 	const size_t need = ALIGN(64 * 1024, 64);
+	const size_t aud_need = ALIGN(hws->audio_pkt_size * 2, 64);
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 #if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
@@ -294,6 +296,25 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 		hws->scratch_vid[ch].cpu  = cpu;
 		hws->scratch_vid[ch].size = need;
 	}
+
+	for (ch = 0; ch < hws->cur_max_linein_ch; ch++) {
+#if defined(CONFIG_HAS_DMA)
+		void *cpu = dma_alloc_coherent(&hws->pdev->dev, aud_need,
+					       &hws->scratch_aud[ch].dma,
+					       GFP_KERNEL);
+#else
+		void *cpu = NULL;
+#endif
+		if (!cpu) {
+			dev_warn(&hws->pdev->dev,
+				 "audio scratch: dma_alloc_coherent failed ch=%d\n",
+				 ch);
+			hws_free_seed_buffers(hws);
+			return -ENOMEM;
+		}
+		hws->scratch_aud[ch].cpu = cpu;
+		hws->scratch_aud[ch].size = aud_need;
+	}
 	return 0;
 }
 
@@ -309,6 +330,17 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 					  hws->scratch_vid[ch].dma);
 			hws->scratch_vid[ch].cpu = NULL;
 			hws->scratch_vid[ch].size = 0;
+		}
+	}
+
+	for (ch = 0; ch < hws->cur_max_linein_ch; ch++) {
+		if (hws->scratch_aud[ch].cpu) {
+			dma_free_coherent(&hws->pdev->dev,
+					  hws->scratch_aud[ch].size,
+					  hws->scratch_aud[ch].cpu,
+					  hws->scratch_aud[ch].dma);
+			hws->scratch_aud[ch].cpu = NULL;
+			hws->scratch_aud[ch].size = 0;
 		}
 	}
 }

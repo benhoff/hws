@@ -29,6 +29,126 @@ static const struct snd_pcm_hardware audio_pcm_hardware = {
 	.periods_max = 64,
 };
 
+static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_scratch_dma *scratch;
+	dma_addr_t dma;
+	u32 lo, hi, pci_addr;
+	u32 table_off;
+
+	if (!hws || ch >= hws->cur_max_linein_ch)
+		return -EINVAL;
+
+	scratch = &hws->scratch_aud[ch];
+	if (!scratch->cpu || !scratch->size)
+		return -ENOMEM;
+
+	dma = scratch->dma;
+	lo = lower_32_bits(dma);
+	hi = upper_32_bits(dma);
+	pci_addr = lo & PCI_E_BAR_ADD_LOWMASK;
+	lo &= PCI_E_BAR_ADD_MASK;
+	table_off = HWS_AUDIO_REMAP_SLOT_OFF(ch);
+
+	writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
+	writel_relaxed(lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
+		       PCIE_BARADDROFSIZE);
+	writel_relaxed((ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
+		       hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
+	(void)readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
+	return 0;
+}
+
+static size_t hws_audio_packet_offset(const struct hws_audio *a, u8 cur_toggle)
+{
+	size_t packet = a->hw_packet_bytes;
+
+	/*
+	 * ABUF_TOGGLE reports the half the device is filling now, so the
+	 * completed packet is the other half.
+	 */
+	return cur_toggle ? 0 : packet;
+}
+
+static void hws_audio_deliver_packet(struct hws_audio *a, const void *src)
+{
+	struct snd_pcm_substream *ss;
+	struct snd_pcm_runtime *rt;
+	snd_pcm_uframes_t frames, ring_pos, ring_frames, period_frames;
+	size_t frame_bytes, packet_bytes, ring_bytes, first;
+	unsigned long flags;
+	unsigned int elapsed = 0;
+	char *dst;
+
+	ss = READ_ONCE(a->pcm_substream);
+	if (!ss)
+		return;
+
+	rt = READ_ONCE(ss->runtime);
+	if (!rt || !rt->dma_area)
+		return;
+
+	frame_bytes = READ_ONCE(a->frame_bytes);
+	packet_bytes = READ_ONCE(a->hw_packet_bytes);
+	ring_frames = READ_ONCE(a->ring_size_byframes);
+	period_frames = READ_ONCE(a->period_size_byframes);
+	if (!frame_bytes || !packet_bytes || !ring_frames || !period_frames)
+		return;
+	if (packet_bytes % frame_bytes)
+		return;
+
+	frames = packet_bytes / frame_bytes;
+	if (!frames)
+		return;
+
+	spin_lock_irqsave(&a->ring_lock, flags);
+	ring_pos = a->ring_wpos_byframes;
+	ring_bytes = ring_frames * frame_bytes;
+	dst = rt->dma_area + ring_pos * frame_bytes;
+	first = min(packet_bytes, ring_bytes - ring_pos * frame_bytes);
+	memcpy(dst, src, first);
+	if (first < packet_bytes)
+		memcpy(rt->dma_area, (const char *)src + first, packet_bytes - first);
+
+	ring_pos += frames;
+	if (ring_pos >= ring_frames)
+		ring_pos %= ring_frames;
+	a->ring_wpos_byframes = ring_pos;
+
+	a->period_used_byframes += frames;
+	while (a->period_used_byframes >= period_frames) {
+		a->period_used_byframes -= period_frames;
+		elapsed++;
+	}
+	spin_unlock_irqrestore(&a->ring_lock, flags);
+
+	while (elapsed--)
+		snd_pcm_period_elapsed(ss);
+}
+
+void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cur_toggle)
+{
+	struct hws_audio *a;
+	struct hws_scratch_dma *scratch;
+	size_t offset;
+
+	if (!hws || ch >= hws->cur_max_linein_ch)
+		return;
+
+	a = &hws->audio[ch];
+	scratch = &hws->scratch_aud[ch];
+	if (!scratch->cpu || !READ_ONCE(a->stream_running))
+		return;
+
+	WRITE_ONCE(a->last_period_toggle, cur_toggle);
+	offset = hws_audio_packet_offset(a, cur_toggle);
+	if (offset + a->hw_packet_bytes > scratch->size)
+		return;
+
+	dma_rmb();
+	hws_audio_deliver_packet(a, scratch->cpu + offset);
+}
+
 static void hws_audio_hw_stop(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	if (!hws || ch >= hws->cur_max_linein_ch)
@@ -52,69 +172,6 @@ static void hws_audio_hw_stop(struct hws_pcie_dev *hws, unsigned int ch)
 	}
 }
 
-void hws_audio_program_next_period(struct hws_pcie_dev *hws, unsigned int ch)
-{
-	struct hws_audio *a;
-	struct snd_pcm_substream *ss;
-	struct snd_pcm_runtime *rt;
-	u32 period_idx, axi_index;
-	dma_addr_t dma;
-	u32 addr_low;
-	const u32 addr_high = 0; /* 32-bit DMA mask => HIGH always 0 */
-	u32 pci_addr_lowmasked, bar_low_masked;
-	u32 table_off;
-	u32 length_units;
-
-	if (WARN_ON(!hws || ch >= hws->cur_max_linein_ch))
-		return;
-
-	a  = &hws->audio[ch];
-	ss = READ_ONCE(a->pcm_substream);
-	if (WARN_ON(!ss || !ss->runtime || !a->periods || !a->period_bytes))
-		return;
-
-	rt = ss->runtime;
-
-	/* Contiguous ALSA DMA buffer; offset = period_idx * period_bytes */
-	period_idx = a->next_period % a->periods;
-	dma = rt->dma_addr + (dma_addr_t)((size_t)period_idx * a->period_bytes);
-
-	/* 32-bit DMA mask guarantees upper_32_bits(dma) == 0 */
-	addr_low = lower_32_bits(dma);
-
-	pci_addr_lowmasked = (addr_low & PCI_E_BAR_ADD_LOWMASK); /* into AXI base */
-	bar_low_masked     = (addr_low & PCI_E_BAR_ADD_MASK);    /* into table LOW */
-
-	/* Legacy address-table layout: start 0x208, step 8 per channel */
-	table_off = 0x208u + (ch * 8u);
-
-	/* 1) Program PCIe address table: HIGH (0) then LOW (BAR-masked) */
-	writel(addr_high, hws->bar0_base + (PCI_ADDR_TABLE_BASE + table_off));
-	writel(bar_low_masked,
-	       hws->bar0_base + (PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE));
-
-	/* Optional posted-write flush/readback */
-	(void)readl(hws->bar0_base + (PCI_ADDR_TABLE_BASE + table_off));
-	(void)readl(hws->bar0_base + (PCI_ADDR_TABLE_BASE + table_off + PCIE_BARADDROFSIZE));
-
-	/* 2) Program AXI-visible base for AUDIO slot (8 + ch) */
-	axi_index = 8u + ch;
-	writel(((ch + 1u) * PCIEBAR_AXI_BASE) + pci_addr_lowmasked,
-	       hws->bar0_base + CVBS_IN_BUF_BASE + (axi_index * PCIE_BARADDROFSIZE));
-
-	/* 3) Program period length (legacy: bytes/16 granularity) */
-	length_units = (a->period_bytes / 16u);
-	writel(length_units,
-	       hws->bar0_base + (CVBS_IN_BUF_BASE2 + (ch * PCIE_BARADDROFSIZE)));
-
-	/* Optional flush */
-	(void)readl(hws->bar0_base + (CVBS_IN_BUF_BASE  + (axi_index * PCIE_BARADDROFSIZE)));
-	(void)readl(hws->bar0_base + (CVBS_IN_BUF_BASE2 + (ch * PCIE_BARADDROFSIZE)));
-
-	/* 4) Advance ring */
-	a->next_period = (period_idx + 1u) % a->periods;
-}
-
 int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 {
 	struct hws_audio *aud;
@@ -128,19 +185,16 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 	/* identity */
 	aud->parent        = pdev;
 	aud->channel_index = ch;
+	spin_lock_init(&aud->ring_lock);
 
 	/* defaults */
 	aud->output_sample_rate = 48000;
 	aud->channel_count      = 2;
 	aud->bits_per_sample    = 16;
+	aud->hw_packet_bytes    = pdev->audio_pkt_size;
 
 	/* ALSA linkage */
 	aud->pcm_substream = NULL;
-
-	/* ring geometry (set later in .prepare) */
-	aud->periods      = 0;
-	aud->period_bytes = 0;
-	aud->next_period  = 0;
 
 	/* stream state */
 	aud->cap_active     = false;
@@ -183,10 +237,12 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 	}
 
 	/* 4) Clear book-keeping (optional) */
-	aud->next_period        = 0;
+	aud->ring_size_byframes = 0;
+	aud->ring_wpos_byframes = 0;
+	aud->period_size_byframes = 0;
+	aud->period_used_byframes = 0;
+	aud->frame_bytes = 0;
 	aud->last_period_toggle = 0xFF;
-	aud->periods            = 0;
-	aud->period_bytes       = 0;
 }
 
 static inline bool hws_check_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
@@ -217,11 +273,9 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	if (ret)
 		return ret;
 
-	hws->audio[ch].ring_wpos_byframes = 0;
-
-	/* Prime first period before enabling the engine */
-	hws->audio[ch].next_period = 0;
-	hws_audio_program_next_period(hws, ch);
+	ret = hws_audio_seed_capture_buffer(hws, ch);
+	if (ret)
+		return ret;
 
 	/* Flip state visible to IRQ */
 	WRITE_ONCE(hws->audio[ch].stop_requested, false);
@@ -279,7 +333,10 @@ void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 
 	/* 3) Ack any latched ADONE to prevent retrigger storms */
 	hws_audio_ack_pending(hws, ch);
+	spin_lock(&hws->audio[ch].ring_lock);
 	hws->audio[ch].ring_wpos_byframes = 0;
+	hws->audio[ch].period_used_byframes = 0;
+	spin_unlock(&hws->audio[ch].ring_lock);
 
 	dev_dbg(&hws->pdev->dev, "audio capture stopped on ch %u\n", ch);
 }
@@ -348,18 +405,25 @@ int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
 int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
-	struct hws_pcie_dev *hws = a->parent;
 	struct snd_pcm_runtime *rt = substream->runtime;
-	unsigned int ch = a->channel_index;
+	unsigned long flags;
+	size_t frame_bytes;
 
-	a->period_bytes = frames_to_bytes(rt, rt->period_size);
-	a->periods      = rt->periods;
-	a->next_period  = 0;
+	frame_bytes = snd_pcm_format_physical_width(rt->format) / 8;
+	frame_bytes *= rt->channels;
+	if (!frame_bytes || a->hw_packet_bytes % frame_bytes)
+		return -EINVAL;
 
+	spin_lock_irqsave(&a->ring_lock, flags);
+	a->ring_size_byframes = rt->buffer_size;
 	a->ring_wpos_byframes = 0;
+	a->period_size_byframes = rt->period_size;
+	a->period_used_byframes = 0;
+	a->frame_bytes = frame_bytes;
+	spin_unlock_irqrestore(&a->ring_lock, flags);
 
 	/* Optional: clear HW toggle readback */
-	a->last_period_toggle = 0;
+	a->last_period_toggle = 0xFF;
 	return 0;
 }
 
@@ -410,6 +474,8 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 
 	if (!hws)
 		return -EINVAL;
+	if (!hws->cur_max_linein_ch)
+		return 0;
 
 	/* ---- Create a single ALSA card for this PCI function ---- */
 	snprintf(card_id, sizeof(card_id), "hws%u", hws->port_id);     /* <=16 chars */
@@ -457,12 +523,18 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 		strscpy(pcm->name, pcm_name, sizeof(pcm->name));
 		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &hws_pcie_pcm_ops);
 
-		/* ALSA-owned DMA buffer, device-visible (no scratch buffer) */
-		snd_pcm_lib_preallocate_pages_for_all(pcm,
-						      SNDRV_DMA_TYPE_DEV,
-						      &hws->pdev->dev,
-						      audio_pcm_hardware.buffer_bytes_max,
-						      audio_pcm_hardware.buffer_bytes_max);
+		/* ALSA-managed ring buffer for software packet delivery. */
+		ret = snd_pcm_set_managed_buffer_all(pcm,
+						     SNDRV_DMA_TYPE_DEV,
+						     &hws->pdev->dev,
+						     audio_pcm_hardware.buffer_bytes_max,
+						     audio_pcm_hardware.buffer_bytes_max);
+		if (ret < 0) {
+			dev_err(&hws->pdev->dev,
+				"snd_pcm_set_managed_buffer_all(%d) failed: %d\n",
+				i, ret);
+			goto error_card;
+		}
 	}
 
 	/* Register the card once all PCMs are created */
@@ -571,4 +643,3 @@ int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws)
 
 	return ret;
 }
-

@@ -96,6 +96,14 @@
 #define HWS_REG_VBUF1_ADDR            (CVBS_IN_BASE + 25 * PCIE_BARADDROFSIZE)
 /* Per-channel DMA address. */
 #define HWS_REG_DMA_ADDR(ch)          (CVBS_IN_BASE + (26 + (ch)) * PCIE_BARADDROFSIZE)
+/* Per-channel audio DMA address window. */
+#define HWS_REG_AUD_DMA_ADDR(ch)      (CVBS_IN_BUF_BASE + ((8 + (ch)) * PCIE_BARADDROFSIZE))
+
+/*
+ * Audio uses the second bank of BAR remap windows, matching the AXI slot
+ * indices starting at 8.
+ */
+#define HWS_AUDIO_REMAP_SLOT_OFF(ch)  (0x208 + ((8 + (ch)) * 8))
 
 /* Per-channel live buffer toggles (read-only). */
 #define HWS_REG_VBUF_TOGGLE(ch)       (CVBS_IN_BASE + (32 + (ch)) * PCIE_BARADDROFSIZE)

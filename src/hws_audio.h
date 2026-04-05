@@ -6,9 +6,10 @@
 #include <sound/pcm.h>
 #include "hws.h"
 
-void hws_audio_program_next_period(struct hws_pcie_dev *hws, unsigned int ch);
 int hws_audio_register(struct hws_pcie_dev *dev);
 void hws_audio_unregister(struct hws_pcie_dev *hws);
+void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
+				u8 cur_toggle);
 void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 			      unsigned int ch,
 			      bool enable);

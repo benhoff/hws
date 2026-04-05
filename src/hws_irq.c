@@ -276,38 +276,8 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 				    readl_relaxed(pdx->bar0_base +
 						  HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 
-			/* Make device writes visible before notifying ALSA */
-			dma_rmb();
-			/* Period accounting + rearm + notify ALSA. */
-			{
-				struct hws_audio *a = &pdx->audio[ch];
-				struct snd_pcm_substream *ss;
-				struct snd_pcm_runtime *rt;
-				snd_pcm_uframes_t pos;
-
-				ss = READ_ONCE(a->pcm_substream);
-				if (!ss)
-					goto ack_audio;
-
-				rt = READ_ONCE(ss->runtime);
-				if (!rt)
-					goto ack_audio;
-
-				/* Advance write pointer by exactly one period (frames). */
-				pos = READ_ONCE(a->ring_wpos_byframes);
-				pos += rt->period_size;
-				if (pos >= rt->buffer_size)
-					pos -= rt->buffer_size;
-				WRITE_ONCE(a->ring_wpos_byframes, pos);
-
-				/* Program the period the HW will fill next. */
-				if (likely(!READ_ONCE(a->stop_requested)))
-					hws_audio_program_next_period(pdx, ch);
-
-				/* Notify ALSA now that the hardware advanced. */
-				snd_pcm_period_elapsed(ss);
-			}
-ack_audio:
+			hws_audio_handle_interrupt(pdx, ch,
+					       READ_ONCE(pdx->audio[ch].last_period_toggle));
 			writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
 			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
