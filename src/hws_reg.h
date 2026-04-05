@@ -33,6 +33,9 @@
 #define PCI_E_BAR_ADD_MASK 0xE0000000
 #define PCI_E_BAR_ADD_LOWMASK 0x1FFFFFFF
 
+#define MAX_DMA_AUDIO_PK_SIZE      (128U * 16U * 2U)
+
+
 #define MAX_VID_CHANNELS            4
 
 #define MAX_MM_VIDEO_SIZE            SZ_4M
@@ -81,6 +84,7 @@
 /* Capture enable switches. */
 /* bit0-3: CH0-CH3 video enable */
 #define HWS_REG_VCAP_ENABLE           (CVBS_IN_BASE +  2 * PCIE_BARADDROFSIZE)
+#define HWS_REG_ACAP_ENABLE           (CVBS_IN_BASE +  3 * PCIE_BARADDROFSIZE)
 /* bits0-3: signal present, bits8-11: interlace */
 #define HWS_REG_ACTIVE_STATUS          (CVBS_IN_BASE +  5  * PCIE_BARADDROFSIZE)
 /* bits0-3: HDCP detected */
@@ -100,8 +104,15 @@
  * currently filling for channel *ch* (0-3).
  */
 
-/* Per-interrupt bits (video 0-3). */
+#define HWS_REG_ABUF_TOGGLE(ch)       (CVBS_IN_BASE + (40 + (ch)) * PCIE_BARADDROFSIZE)
+/*
+ * Returns 0 or 1 = which half of the audio ring the DMA engine is
+ * currently filling for channel *ch* (0-3).
+ */
+
+/* Per-interrupt bits (video 0-3, audio 0-3). */
 #define HWS_INT_VDONE_BIT(ch)     BIT(ch)         /* 0x01,0x02,0x04,0x08  */
+#define HWS_INT_ADONE_BIT(ch)     BIT(8 + (ch))   /* 0x100 .. 0x800 */
 
 #define HWS_REG_INT_ACK           (CVBS_IN_BASE + 0x4000 + 1 * PCIE_BARADDROFSIZE)
 
@@ -133,4 +144,8 @@
 #define HWS_REG_VBUF_TOGGLE_CH2       HWS_REG_VBUF_TOGGLE(2)
 #define HWS_REG_VBUF_TOGGLE_CH3       HWS_REG_VBUF_TOGGLE(3)
 
+#define HWS_REG_ABUF_TOGGLE_CH0       HWS_REG_ABUF_TOGGLE(0)
+#define HWS_REG_ABUF_TOGGLE_CH1       HWS_REG_ABUF_TOGGLE(1)
+#define HWS_REG_ABUF_TOGGLE_CH2       HWS_REG_ABUF_TOGGLE(2)
+#define HWS_REG_ABUF_TOGGLE_CH3       HWS_REG_ABUF_TOGGLE(3)
 #endif /* _HWS_PCIE_REG_H */
