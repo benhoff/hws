@@ -8,6 +8,13 @@ The main positive change is the move from a channel-global vb2 queue to per-file
 
 However, the current implementation still has concurrency, lifetime, and validation gaps that are too significant for production-quality kernel code or upstream submission.
 
+Latest practical status:
+
+- the scripted hybrid multi-consumer runtime scenarios can now pass cleanly on a normal-rate live signal
+- `v4l2-compliance` is down to one warning and one failure in a representative host run
+- the old buffer-metadata issues (`Field: Any`, first-buffer sequence starting at `1`) are no longer the active blockers
+- the remaining compliance failure is the second-opener `REQBUFS`/`EBUSY` mismatch, which is tied to the branch's intentional per-file multi-consumer queue model rather than a simple metadata bug
+
 ## What Improved Versus `master`
 
 1. Per-file queues replace the old channel-global queue.
@@ -21,6 +28,12 @@ The branch uses a threaded IRQ path for fanout completions instead of doing memc
 
 4. Live resolution changes are handled more intentionally.
 The branch now tries to preserve active queues when the new frame still fits existing allocations, and only forces queue error recovery when the new size exceeds the negotiated allocation.
+
+5. Completed-buffer field metadata is now exported more consistently.
+Successful direct, fanout, and no-signal completions now stamp the active negotiated `field` into the returned `vb2_v4l2_buffer`, which removes the earlier `Field: Any` style `v4l2-compliance` regression.
+
+6. First-buffer sequence numbering is now aligned with userspace expectations.
+The capture completion paths now start each stream at sequence `0`, so the earlier `got sequence number 1, expected 0` warning class is no longer the active compliance issue.
 
 These are all real improvements. They make the branch more coherent and easier to reason about than `master`.
 
@@ -90,6 +103,15 @@ Kernel-grade code needs those rules to be obvious and defensible, because future
 
 The branch includes useful design notes and a companion test script, but the validation bar is still limited.
 
+The current script is better than it was before:
+
+- it covers the core direct/fanout runtime transitions
+- it runs a post-test `v4l2-compliance` pass when the tool is available
+- it now calls out known buffer-metadata signatures such as `V4L2_FIELD_ANY` and `buf.check(q, last_seq)` in a dedicated findings report
+- it adapts its functional frame/time budget to low-rate live inputs so a ~`1 fps` source does not trivially invalidate every transition test
+
+That closes one concrete regression class, but it does not change the broader conclusion below.
+
 The current material explicitly acknowledges missing coverage for:
 
 - abrupt `FANOUT -> DIRECT` exit races
@@ -97,6 +119,8 @@ The current material explicitly acknowledges missing coverage for:
 - long-duration stability
 - queue error recovery scenarios
 - signal-loss and relock behavior in fanout mode
+
+At the current branch state, a representative `v4l2-compliance` run is much closer to clean than before, but it still shows at least one remaining behavioral mismatch around second-opener `REQBUFS`/`EBUSY` semantics, plus a warning about `V4L2_CID_DV_RX_POWER_PRESENT`.
 
 That is good engineering honesty, but it also means the branch is not yet validated to the level implied by "kernel grade".
 
@@ -271,7 +295,7 @@ At a minimum, the branch should clear the following bar before being described t
 
 If the question is "is this branch closer to a kernel-quality design than `master`?", the answer is yes.
 
-If the question is "would I call this production-quality or upstream-quality Linux kernel code today?", the answer is no.
+If the question is "would I call this production-quality or upstream-quality Linux kernel code today?", the answer is still no.
 
 The branch has the right architectural direction:
 

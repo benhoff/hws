@@ -166,12 +166,13 @@ static bool hws_video_handle_vdone_fanout(struct hws_video *v)
 		} else {
 			if (!have_seq) {
 				frame_seq =
-				    (u32)atomic_inc_return(&v->engine.sequence_number);
+				    (u32)(atomic_inc_return(&v->engine.sequence_number) - 1);
 				have_seq = true;
 			}
 			memcpy(dst, v->engine.fanout_cpu, expected);
 			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
 			vb2v->sequence = frame_seq;
+			vb2v->field = v->pix.field;
 			vb2v->vb2_buf.timestamp = ts;
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 		}
@@ -238,7 +239,7 @@ static bool hws_video_handle_vdone(struct hws_video *v)
 			dev_warn_ratelimited(&hws->pdev->dev,
 					     "bh_video(ch=%u): sizeimage %zu > plane %zu, dropping seq=%u\n",
 					     ch, expected, plane_size,
-					     (u32)atomic_read(&v->engine.sequence_number) + 1);
+					     (u32)atomic_read(&v->engine.sequence_number));
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
 			goto arm_next;
 		}
@@ -247,7 +248,8 @@ static bool hws_video_handle_vdone(struct hws_video *v)
 		dma_rmb();	/* device writes visible before userspace sees it */
 
 		vb2v->sequence =
-		    (u32)atomic_inc_return(&v->engine.sequence_number);
+		    (u32)(atomic_inc_return(&v->engine.sequence_number) - 1);
+		vb2v->field = v->pix.field;
 		vb2v->vb2_buf.timestamp = ktime_get_ns();
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",

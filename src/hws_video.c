@@ -236,7 +236,8 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 			memset(dst, 0x10, v->pix.sizeimage);
 		vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
 		vb2v->sequence =
-		    (u32)atomic_inc_return(&v->engine.sequence_number);
+		    (u32)(atomic_inc_return(&v->engine.sequence_number) - 1);
+		vb2v->field = v->pix.field;
 		vb2v->vb2_buf.timestamp = ktime_get_ns();
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}

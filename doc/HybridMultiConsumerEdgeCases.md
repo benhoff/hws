@@ -11,7 +11,31 @@ This document describes edge cases for the hybrid capture implementation:
 The companion test script is:
 
 - `./test_hybrid_multi_consumer.sh`
-- It now validates capture progress using `sizeimage` from `VIDIOC_G_FMT` rather than treating any non-empty output file as success.
+- It validates capture progress using `sizeimage` from `VIDIOC_G_FMT` rather than treating any non-empty output file as success.
+- It now adds a lightweight post-run validation subset that runs `v4l2-compliance` when available and scans kernel logs for severe diagnostics or HWS-specific warning text.
+- It writes `kernel_grade_scope.txt` so the automated coverage is explicitly mapped against `doc/hybrid-multi-consumer-kernel-grade-assessment.md`.
+- It writes `kernel_grade_v4l2_findings.txt` so known compliance signatures such as `V4L2_FIELD_ANY`, first-buffer `expected 0` sequence warnings, and `buf.check(q, last_seq)` are called out directly.
+- It probes the live capture rate and switches to a smaller low-rate profile when the input is only around `1 fps`, so the functional tests do not fail purely because the current signal cadence is slow.
+- The compliance pass is now bounded by a configurable timeout instead of being allowed to run indefinitely.
+- Completed capture buffers now stamp the negotiated `field` value in the direct, fanout, and no-signal completion paths, so that older `Field: Any` regression no longer needs separate manual testing outside the script's compliance pass.
+- Passing the script is not the same as satisfying the full kernel-grade bar described in that assessment doc.
+
+## Latest Validation Snapshot
+
+Latest representative host run:
+
+- functional scripted tests passed end-to-end when the live input was running at a normal capture cadence
+- the script now adapts down to a low-rate profile for ~`1 fps` inputs, but transition-heavy subtests may still fail under extremely slow live signals
+- `v4l2-compliance` improved to `56/57` succeeded with `1` warning
+- the older `Field: Any` regression is gone
+- the older first-buffer `expected 0` sequence warning is gone
+- the remaining compliance warning is missing `V4L2_CID_DV_RX_POWER_PRESENT`
+- the remaining compliance failure is second-opener `REQBUFS` not returning `-EBUSY`
+
+Current practical interpretation:
+
+- the scripted hybrid multi-consumer behavior is in much better shape than before
+- the remaining red item is no longer buffer metadata integrity; it is the API-semantics mismatch between same-node multi-consumer fanout and the conventional single-owner `REQBUFS` model expected by `v4l2-compliance`
 
 ## Test Coverage Matrix
 
@@ -58,6 +82,7 @@ The companion test script is:
 - Test: `Test 6`
 - Expected:
   - `VIDIOC_S_FMT` size change fails while another stream is active
+  - the same size change succeeds once all queues are idle
   - active stream continues
 
 7. Rapid stream on/off loops plus repeated `1 <-> 2` oscillation
@@ -114,6 +139,14 @@ The companion test script is:
   - frame content validity is not guaranteed by this test suite; only stream liveness/non-empty output is checked.
 
 ## Known Limits Not Fully Covered by the Script
+
+The script's post-run validation subset is intentionally lightweight:
+
+- it checks `v4l2-compliance` only when the tool is installed
+- it scans kernel logs for severe diagnostics and HWS-specific warning text, but it is not a substitute for long-duration tracing or sanitizer-backed test runs
+- it now includes a dedicated findings report for known `v4l2-compliance` buffer-metadata signatures and first-buffer sequence warnings instead of relying on raw log tail inspection alone
+- it now bounds the compliance run with a timeout so the scripted suite fails cleanly if the compliance phase stalls
+- the broader branch-level kernel-grade judgment remains in `doc/hybrid-multi-consumer-kernel-grade-assessment.md`
 
 1. Exact frame integrity between consumers
 - Current script checks non-empty outputs and process success, not per-frame byte equality.
