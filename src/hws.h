@@ -11,6 +11,8 @@
 #include <linux/spinlock.h>
 #include <linux/sizes.h>
 #include <linux/atomic.h>
+#include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -57,6 +59,7 @@ enum hws_capture_mode {
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
+	struct hws_vfh_ctx *ctx;
 	int slot;		/* for two-buffer approach */
 };
 
@@ -66,6 +69,9 @@ struct hws_vfh_ctx {
 	struct list_head buf_queue;
 	spinlock_t qlock;
 	bool streaming;
+	bool closing;
+	atomic_t fanout_inflight;
+	wait_queue_head_t fanout_waitq;
 	struct hws_video *video;
 	struct list_head node;
 };
@@ -95,6 +101,7 @@ struct hws_video {
 	struct mutex state_lock;	/* primary state */
 	spinlock_t irq_lock;	/* ISR-side */
 	spinlock_t consumers_lock;	/* protects consumers list and mode pointers */
+	spinlock_t mode_change_lock; /* protects deferred mode-change state */
 
 	/* ───── indices ───── */
 	int channel_index;
@@ -116,6 +123,13 @@ struct hws_video {
 	struct v4l2_dv_timings cur_dv_timings; /* last configured/notified DV timings */
 	u32 current_fps; /* Hz, updated by mode changes, not by read-only queries */
 	u32 alloc_sizeimage;
+	struct work_struct mode_change_work;
+	bool mode_change_pending;
+	bool mode_change_worker_running;
+	u16 pending_width;
+	u16 pending_height;
+	bool pending_interlaced;
+	u32 pending_fps;
 
 	/* ───── per-channel capture state ───── */
 	bool cap_active;

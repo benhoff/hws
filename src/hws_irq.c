@@ -119,9 +119,19 @@ hws_pop_ctx_buffer(struct hws_vfh_ctx *ctx)
 		buf = list_first_entry(&ctx->buf_queue,
 				       struct hwsvideo_buffer, list);
 		list_del_init(&buf->list);
+		atomic_inc(&ctx->fanout_inflight);
 	}
 	spin_unlock_irqrestore(&ctx->qlock, flags);
 	return buf;
+}
+
+static void hws_ctx_put_fanout_ref(struct hws_vfh_ctx *ctx)
+{
+	if (!ctx)
+		return;
+
+	if (atomic_dec_and_test(&ctx->fanout_inflight))
+		wake_up_all(&ctx->fanout_waitq);
 }
 
 static bool hws_video_handle_vdone_fanout(struct hws_video *v)
@@ -129,11 +139,13 @@ static bool hws_video_handle_vdone_fanout(struct hws_video *v)
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
 	struct hws_vfh_ctx *ctx;
+	struct hwsvideo_buffer *buf, *tmp;
 	unsigned long flags;
 	size_t expected;
 	u64 ts;
 	u32 frame_seq = 0;
 	bool have_seq = false;
+	LIST_HEAD(work);
 
 	if (unlikely(READ_ONCE(hws->suspended)))
 		return false;
@@ -148,19 +160,20 @@ static bool hws_video_handle_vdone_fanout(struct hws_video *v)
 
 	spin_lock_irqsave(&v->consumers_lock, flags);
 	list_for_each_entry(ctx, &v->consumers, node) {
-		struct hwsvideo_buffer *buf;
-		struct vb2_v4l2_buffer *vb2v;
-		void *dst;
-
-		if (!ctx->streaming)
+		if (!READ_ONCE(ctx->streaming) || READ_ONCE(ctx->closing))
 			continue;
 		buf = hws_pop_ctx_buffer(ctx);
 		if (!buf)
 			continue;
+		list_add_tail(&buf->list, &work);
+	}
+	spin_unlock_irqrestore(&v->consumers_lock, flags);
 
-		spin_unlock_irqrestore(&v->consumers_lock, flags);
-		vb2v = &buf->vb;
-		dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+	list_for_each_entry_safe(buf, tmp, &work, list) {
+		struct vb2_v4l2_buffer *vb2v = &buf->vb;
+		void *dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+
+		list_del_init(&buf->list);
 		if (!dst || vb2_plane_size(&vb2v->vb2_buf, 0) < expected) {
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
 		} else {
@@ -176,9 +189,8 @@ static bool hws_video_handle_vdone_fanout(struct hws_video *v)
 			vb2v->vb2_buf.timestamp = ts;
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 		}
-		spin_lock_irqsave(&v->consumers_lock, flags);
+		hws_ctx_put_fanout_ref(buf->ctx);
 	}
-	spin_unlock_irqrestore(&v->consumers_lock, flags);
 
 	if (!READ_ONCE(v->cap_active))
 		return false;

@@ -303,7 +303,7 @@ static bool hws_all_streamers_support_fanout_locked(struct hws_video *vid)
 
 	spin_lock_irqsave(&vid->consumers_lock, flags);
 	list_for_each_entry(ctx, &vid->consumers, node) {
-		if (!ctx->streaming)
+		if (!READ_ONCE(ctx->streaming) || READ_ONCE(ctx->closing))
 			continue;
 		if (!hws_ctx_supports_fanout(ctx)) {
 			supported = false;
@@ -325,7 +325,7 @@ hws_count_streaming_ctxs_locked(struct hws_video *vid,
 
 	spin_lock_irqsave(&vid->consumers_lock, flags);
 	list_for_each_entry(ctx, &vid->consumers, node) {
-		if (!ctx->streaming)
+		if (!READ_ONCE(ctx->streaming) || READ_ONCE(ctx->closing))
 			continue;
 		count++;
 		single = ctx;

@@ -928,25 +928,3 @@ int hws_vidioc_s_input(struct file *file, void *priv, unsigned int i)
 {
 	return i ? -EINVAL : 0;
 }
-
-int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *param)
-{
-	struct hws_video *vid = video_drvdata(file);
-	struct v4l2_captureparm *cap;
-	u32 fps;
-
-	if (param->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
-	cap = &param->parm.capture;
-
-	fps = vid->current_fps ? vid->current_fps : 60;
-	cap->timeperframe.denominator = fps;
-	cap->timeperframe.numerator   = 1;
-	cap->capability               = V4L2_CAP_TIMEPERFRAME;
-	cap->capturemode              = 0;
-	cap->extendedmode             = 0;
-	/* readbuffers left unchanged or zero; vb2 handles queue depth */
-
-	return 0;
-}

@@ -6,14 +6,24 @@ This branch is a meaningful architectural improvement over `master`, but it is n
 
 The main positive change is the move from a channel-global vb2 queue to per-file-handle queues plus a channel-level capture state machine. That is a better model for multi-consumer streaming and is much closer to what a robust V4L2 implementation needs.
 
-However, the current implementation still has concurrency, lifetime, and validation gaps that are too significant for production-quality kernel code or upstream submission.
+Recent work also closed several concrete correctness gaps that were previously called out in this document:
+
+- fanout completion no longer walks the consumer list across unlock/relock windows
+- `release()` and `stop_streaming()` now wait for in-flight fanout completions before queue teardown
+- live mode changes are now deferred through worker state instead of being silently dropped on `mutex_trylock()`
+- registration/unwind now uses single-owner `video_device` teardown and cancels pending mode-change work
+- the dead `VIDIOC_S_PARM` implementation was removed
+
+That said, the branch is still not ready to be described as production-quality kernel code or an upstream-ready Linux V4L2 implementation.
 
 Latest practical status:
 
-- the scripted hybrid multi-consumer runtime scenarios can now pass cleanly on a normal-rate live signal
-- `v4l2-compliance` is down to one warning and one failure in a representative host run
+- on `2026-04-05`, the scripted hybrid multi-consumer runtime scenarios passed cleanly on a normal-rate live signal
+- on `2026-04-05`, the same script still timed out in Tests 3 and 7 on a very low-rate input of about `1.14 fps`
+- `v4l2-compliance` remains at one warning and one failure in representative host runs
 - the old buffer-metadata issues (`Field: Any`, first-buffer sequence starting at `1`) are no longer the active blockers
 - the remaining compliance failure is the second-opener `REQBUFS`/`EBUSY` mismatch, which is tied to the branch's intentional per-file multi-consumer queue model rather than a simple metadata bug
+- the remaining `V4L2_CID_DV_RX_POWER_PRESENT` warning is inherited from `master` and is not a branch-specific regression
 
 ## What Improved Versus `master`
 
@@ -35,192 +45,123 @@ Successful direct, fanout, and no-signal completions now stamp the active negoti
 6. First-buffer sequence numbering is now aligned with userspace expectations.
 The capture completion paths now start each stream at sequence `0`, so the earlier `got sequence number 1, expected 0` warning class is no longer the active compliance issue.
 
+7. Fanout completion and release ordering are materially safer.
+The fanout threaded IRQ path now snapshots per-consumer work under `consumers_lock`, and release/streamoff wait for in-flight fanout completions before queue teardown. That removes the earlier unstable list-walk pattern that was the most concrete lifetime bug in previous revisions of this branch.
+
+8. Live mode changes are now durable instead of best-effort.
+Detected mode changes are now coalesced into worker-owned pending state and applied under `state_lock`, rather than being silently skipped when the lock is busy.
+
+9. Failure-path teardown is more coherent.
+The registration and unregister paths now use a single `video_device` teardown helper and cancel pending mode-change work before dismantling channel state, which removes the earlier double-teardown risk in the sysfs-registration unwind path.
+
+10. The `G_PARM` / `S_PARM` surface is more honest.
+The dead `hws_vidioc_s_parm()` implementation was removed instead of leaving the source tree implying support that the ioctl table did not actually expose.
+
 These are all real improvements. They make the branch more coherent and easier to reason about than `master`.
 
 ## Why It Is Not Yet Kernel Grade
 
-### 1. Consumer lifetime is not safe enough in the fanout path
+### 1. The remaining `REQBUFS` failure is an API-model mismatch, not a small bug
 
-The most serious issue is the interaction between the fanout IRQ thread and `release()`.
+The only remaining `v4l2-compliance` failure is that a second opener can still allocate buffers instead of receiving `-EBUSY`.
 
-In the fanout completion path, the code iterates `v->consumers`, drops `consumers_lock`, processes a consumer buffer, then reacquires the lock and continues the same list walk:
+That is not an accident in the current branch design. The branch intentionally gives each open handle its own `vb2_queue`, and multi-consumer streaming depends on that same-node, per-file queue model.
 
-- `src/hws_irq.c`: `hws_video_handle_vdone_fanout()`
+So the unresolved question is architectural:
 
-At the same time, `release()` can remove that same `ctx` from the list and free it:
+- keep the current same-node multi-consumer behavior and accept that this compliance check fails
+- add an explicit opt-in path for fanout semantics while keeping the default node conventional
+- redesign the userspace-facing topology around separate nodes or another explicit fanout layer
 
-- `src/hws_video.c`: `hws_release()`
+Until that policy is settled, the branch is not upstream-ready.
 
-That pattern is not safe for kernel code. It creates a real risk of:
+### 2. Validation is still branch-grade rather than kernel-grade
 
-- use-after-free
-- invalid iterator state after relock
-- list corruption or stale pointer reuse during close or stream shutdown
+The branch now has a much better test story than earlier revisions:
 
-This is the main blocker to calling the branch kernel grade.
+- the scripted direct/fanout scenarios pass on a normal-rate live signal
+- the script adapts to low-rate inputs instead of blindly assuming a high frame cadence
+- the post-run validation subset now extracts known `v4l2-compliance` signatures into a dedicated findings report
 
-### 2. Live mode changes can be dropped silently
+But the validation bar is still below what "kernel grade" should imply.
 
-`hws_video_apply_mode_change()` uses `mutex_trylock()` and simply returns if the lock is busy.
+Missing or incomplete coverage still includes:
 
-That means a detected input mode change can be skipped with no deferred retry and no durable "pending mode change" record. In practice, the next polling cycle may notice again, but that is still best-effort behavior rather than a correctness guarantee.
+- lock-focused stress under `lockdep`
+- memory/race validation under `KASAN` and `KCSAN`
+- long-duration soak
+- exact frame-integrity checks across consumers
+- failure-injection coverage for registration and teardown paths
+- deeper suspend/resume and signal-loss stress
 
-For kernel-grade code, mode detection and reconfiguration should not depend on a transient lock race.
+### 3. Very low-rate live inputs still expose behavioral gaps
 
-### 3. Teardown and quiesce behavior are not fully deterministic
+On `2026-04-05`, the full scripted suite passed on a normal-rate input around `36.70 fps`, but the same suite still timed out in Tests 3 and 7 on a low-rate input around `1.14 fps`.
 
-The branch has improved teardown paths, but they still do not provide the kind of strict shutdown guarantees expected from production kernel code.
+That does not prove a kernel race by itself, because the current tests intentionally rely on short-lived peer consumers and a live source that may not deliver enough frames during those windows. But it does mean the current branch is not yet robust enough to claim clean behavior across the low-cadence cases that real hardware may present.
 
-Examples:
+At minimum, this area still needs either:
 
-- engine stop primarily handles direct-path in-flight buffers
-- per-consumer queued buffers are not always drained under one unified teardown model
-- unregister/quiesce paths rely heavily on queue error signaling rather than explicit completion and synchronization
-- the release path does not make a strong enough guarantee that no threaded IRQ path can still observe a soon-to-be-freed consumer context
+- stronger low-rate handling in the driver or userspace interaction model
+- or a more explicit test and API contract for what should happen when a peer joins and exits while the source cadence is extremely low
 
-For remove, suspend, error recovery, and hot-unplug scenarios, kernel code should be more explicit and more deterministic than this.
+### 4. The lock and ownership model is improved but still needs upstream-grade validation
 
-### 4. The lock and ownership model is still too fragile
-
-The implementation now uses several separate synchronization domains:
+The current implementation is materially safer than before, but it still relies on several interacting synchronization domains:
 
 - `state_lock`
 - `irq_lock`
 - `consumers_lock`
 - per-context `qlock`
+- deferred mode-change work
 
-That can be correct, but only if the invariants and lock ordering are extremely clear. Right now the code does not yet establish a sufficiently crisp, documented lock hierarchy or ownership contract for:
+That can be correct, but upstream-quality confidence normally comes from both code review and dedicated stress tooling. Until the branch has been exercised under lockdep/sanitizer coverage and the invariants are documented more explicitly, the locking story should still be treated as improved rather than fully closed.
+
+### 5. The remaining `DV_RX_POWER_PRESENT` warning is inherited, but still part of the observed surface
+
+The missing `V4L2_CID_DV_RX_POWER_PRESENT` warning is not a regression introduced by this branch. `master` does not expose it either, and this branch intentionally no longer tries to add it independently.
+
+That warning is not the reason this branch is considered not kernel grade. The `REQBUFS` behavior and the validation gaps above are the real blockers. But the warning should still be documented honestly in the current validation snapshot.
+
+## Must-Fix Items Before Calling It Kernel Grade
+
+### 1. Decide the public API story for multi-consumer queue ownership
+
+This is now the top remaining blocker.
+
+The branch needs one explicit policy:
+
+1. accept and document the current same-node multi-consumer behavior, understanding that it diverges from a conventional `REQBUFS` ownership model
+2. introduce an opt-in fanout path while keeping the default node conventional
+3. redesign the topology so the capture node and the fanout/distribution path are separated
+
+Until that choice is made, the remaining compliance failure is expected but unresolved.
+
+### 2. Strengthen low-rate and long-duration validation
+
+The branch now behaves well on a normal-rate source, but low-rate live inputs still show timeouts in transition-heavy tests.
+
+Before calling the branch kernel grade, validate:
+
+- normal-rate and very low-rate live signals
+- long soak under repeated `1 <-> 2` consumer oscillation
+- abrupt join/exit near frame boundaries
+- queue starvation and refill recovery
+
+### 3. Document and validate lock ordering and invariants
+
+The code should explicitly describe the intended ownership and lock ordering for:
 
 - `engine.active`
 - `engine.next_prepared`
 - `engine.direct_owner`
-- the `consumers` list
-- each context's private queued buffers
+- the consumer registry
+- per-context queue ownership
+- deferred mode-change state
 
-Kernel-grade code needs those rules to be obvious and defensible, because future maintenance otherwise tends to reintroduce races quickly.
+That documentation should then be backed by stress testing and assertions where practical.
 
-### 5. Validation is still branch-grade rather than kernel-grade
-
-The branch includes useful design notes and a companion test script, but the validation bar is still limited.
-
-The current script is better than it was before:
-
-- it covers the core direct/fanout runtime transitions
-- it runs a post-test `v4l2-compliance` pass when the tool is available
-- it now calls out known buffer-metadata signatures such as `V4L2_FIELD_ANY` and `buf.check(q, last_seq)` in a dedicated findings report
-- it adapts its functional frame/time budget to low-rate live inputs so a ~`1 fps` source does not trivially invalidate every transition test
-
-That closes one concrete regression class, but it does not change the broader conclusion below.
-
-The current material explicitly acknowledges missing coverage for:
-
-- abrupt `FANOUT -> DIRECT` exit races
-- exact frame integrity between consumers
-- long-duration stability
-- queue error recovery scenarios
-- signal-loss and relock behavior in fanout mode
-
-At the current branch state, a representative `v4l2-compliance` run is much closer to clean than before, but it still shows at least one remaining behavioral mismatch around second-opener `REQBUFS`/`EBUSY` semantics, plus a warning about `V4L2_CID_DV_RX_POWER_PRESENT`.
-
-That is good engineering honesty, but it also means the branch is not yet validated to the level implied by "kernel grade".
-
-### 6. Registration error unwind still has an object lifetime bug
-
-The `hws_video_register()` failure path is not safe enough around `video_device` ownership.
-
-On the `hws_resolution_create()` failure path, the code does:
-
-- `video_unregister_device(vdev)`
-- then falls into `err_unwind`
-- then reuses `ch->video_device` during the unwind loop
-
-Those steps are not interchangeable. Once `video_unregister_device()` runs, the `video_device` may already have been released through its `->release` callback. Continuing to inspect or free that same pointer in generic unwind code creates a real risk of:
-
-- use-after-free in the unwind loop
-- double release or double unregister style teardown
-- failure-path-only crashes that are easy to miss in normal testing
-
-Kernel-grade code needs the registration path to have single-owner, single-release semantics even under partial initialization failure.
-
-### 7. The userspace API surface is internally inconsistent
-
-The branch still carries an implementation of `hws_vidioc_s_parm()`, but the ioctl table no longer exposes `.vidioc_s_parm`.
-
-That leaves the driver in an awkward state:
-
-- the source implies `VIDIOC_S_PARM` support exists
-- userspace receives unsupported-ioctl behavior instead
-- `VIDIOC_G_PARM` and `VIDIOC_S_PARM` no longer form a coherent pair
-
-This is not the worst defect in the branch, but it is still below kernel-grade polish. At best it is dead code and an avoidable compatibility regression. At worst it causes confusing behavior in userspace and `v4l2-compliance`.
-
-## Must-Fix Items Before Calling It Kernel Grade
-
-### 1. Fix consumer lifetime and list-walk safety
-
-This is the first hard blocker.
-
-Acceptable directions include:
-
-1. Add reference counting to `struct hws_vfh_ctx`
-- take a ref while selecting work under `consumers_lock`
-- drop the lock
-- process the consumer safely
-- put the ref after use
-
-2. Use an RCU-style consumer list and deferred free
-- if the list really needs lockless or relock-heavy traversal
-- still pair this with explicit ownership rules for queued buffers
-
-3. Snapshot work items under the lock
-- build a temporary stable list or array of consumer work targets under `consumers_lock`
-- drop the lock
-- process those items without continuing an unstable kernel list iteration
-
-Any of these can be made correct. The current pattern should not remain.
-
-### 2. Replace dropped mode changes with deferred work
-
-The mode-change path should not just give up on `mutex_trylock()` failure.
-
-The better pattern is:
-
-1. record the newly detected mode in stable channel state
-2. queue a worker
-3. let the worker take `state_lock`
-4. coalesce repeated changes and apply only the latest valid state
-
-This gives deterministic behavior under load and makes the detection path auditable.
-
-### 3. Make teardown and release synchronization explicit
-
-Before freeing a consumer context, the code should make it impossible for either the hard IRQ path or the threaded IRQ path to still reference that context.
-
-That generally means:
-
-1. mark the context dead and remove it from selection under the appropriate lock
-2. synchronize any pending threaded work or IRQ visibility for that channel
-3. only then release the vb2 queue and free the context
-
-Similarly, suspend, unregister, and error paths should:
-
-- stop the engine
-- prevent further consumer selection
-- complete or error all affected buffers in a deterministic way
-- only then release higher-level objects
-
-### 4. Document and enforce lock ordering
-
-The code should define and follow a single lock ordering scheme. For example:
-
-1. `state_lock` as the outer state transition lock
-2. `consumers_lock` for the consumer registry and channel-level ownership pointers
-3. per-context `qlock` for a specific context queue
-4. `irq_lock` only for the engine's in-flight pointer state
-
-The exact order may differ, but it needs to be deliberate, documented, and backed by assertions where practical.
-
-### 5. Strengthen observable state and diagnostics
+### 4. Strengthen observable state and diagnostics
 
 Before calling this branch robust, add better observability for:
 
@@ -233,26 +174,15 @@ Before calling this branch robust, add better observability for:
 
 Tracepoints, debug counters, or at least strongly structured debug logs would make review and stress testing far easier.
 
-### 6. Fix registration unwind ownership after `video_unregister_device()`
+### 5. Run upstream-grade tooling, not just functional scripts
 
-The registration path should never continue to treat a `video_device *` as live after handing it to `video_unregister_device()`.
+Before describing the branch as kernel grade, it should be exercised under:
 
-The simplest acceptable fix is:
-
-1. make the failure path choose exactly one teardown primitive per object
-2. clear `ch->video_device` immediately after unregistering or releasing it
-3. structure `err_unwind` so it never re-visits an already released node
-
-Failure paths are part of the correctness story in kernel code, not cleanup afterthoughts.
-
-### 7. Make `G_PARM` / `S_PARM` policy consistent
-
-The driver should make one explicit choice and implement it cleanly:
-
-1. either expose both `VIDIOC_G_PARM` and `VIDIOC_S_PARM` with a defensible policy
-2. or reject `S_PARM` intentionally and remove the dead handler
-
-Half-implemented ioctl support is the wrong middle ground for production kernel code.
+- `lockdep`
+- `KASAN`
+- `KCSAN`
+- failure injection for registration and teardown paths
+- `v4l2-compliance` against the final intended userspace API
 
 ## Validation Bar for "Kernel Grade"
 
@@ -304,17 +234,14 @@ The branch has the right architectural direction:
 - deferred mode transitions
 - threaded fanout completion work
 
-But the concurrency and teardown details are not yet strong enough, and the validation story is not yet deep enough, to justify calling it kernel grade.
+But the remaining same-node `REQBUFS` semantics question and the still-shallow validation story are enough to keep it out of the "kernel grade" bucket.
 
 ## Suggested Next Steps
 
-1. Fix the fanout consumer lifetime race first.
-2. Replace best-effort live mode changes with deferred work.
-3. Harden release, quiesce, suspend, and unregister ordering.
-4. Document lock ordering and engine invariants.
-5. Fix the registration unwind path so `video_device` lifetime is single-owner and single-release.
-6. Decide whether `VIDIOC_S_PARM` is supported, then wire it or remove it consistently.
-7. Add stress tests that specifically target the known race windows.
-8. Re-evaluate after lockdep/KASAN/KCSAN, `v4l2-compliance`, failure-injection, and soak coverage.
+1. Decide whether the current same-node multi-consumer queue model is the intended userspace API, or whether it needs a more conventional capture/fanout split.
+2. Add targeted low-rate transition coverage and decide whether the observed low-fps timeouts are driver issues or test-contract issues.
+3. Document lock ordering and engine invariants in code and review material.
+4. Add stress tests that specifically target abrupt join/exit and queue-starvation windows.
+5. Re-evaluate after lockdep/KASAN/KCSAN, `v4l2-compliance`, failure-injection, and soak coverage.
 
 Until those are done, this branch should be treated as a strong refactor/prototype branch, not a finished kernel-grade implementation.
