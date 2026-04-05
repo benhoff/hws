@@ -122,7 +122,8 @@
 #define HWS_INT_VDONE_BIT(ch)     BIT(ch)         /* 0x01,0x02,0x04,0x08  */
 #define HWS_INT_ADONE_BIT(ch)     BIT(8 + (ch))   /* 0x100 .. 0x800 */
 
-#define HWS_REG_INT_ACK           (CVBS_IN_BASE + 0x4000 + 1 * PCIE_BARADDROFSIZE)
+/* Legacy hardware clears interrupt bits by W1C on INT_STATUS. */
+#define HWS_REG_INT_ACK           HWS_REG_INT_STATUS
 
 /* 16-bit W | 16-bit H. */
 #define HWS_REG_IN_RES(ch)             (CVBS_IN_BASE + (90  + (ch) * 2) * PCIE_BARADDROFSIZE)
