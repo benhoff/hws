@@ -11,7 +11,6 @@ int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *c
 int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh, struct v4l2_fmtdesc *f);
 int hws_vidioc_g_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *fmt);
 int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *f);
-int vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f);
 int hws_vidioc_g_std(struct file *file, void *priv, v4l2_std_id *tvnorms);
 int hws_vidioc_s_std(struct file *file, void *priv, v4l2_std_id tvnorms);
 int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *setfps);
@@ -26,7 +25,6 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 			    struct v4l2_dv_timings *timings);
 
 int hws_vidioc_queryctrl(struct file *file, void *fh, struct v4l2_queryctrl *a);
-int hws_vidioc_s_parm(struct file *file, void *fh, struct v4l2_streamparm *a);
 int hws_vidioc_g_dv_timings(struct file *file, void *fh,
 			    struct v4l2_dv_timings *timings);
 int hws_vidioc_enum_dv_timings(struct file *file, void *fh,
