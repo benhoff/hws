@@ -35,6 +35,7 @@
 #include <linux/slab.h>
 #include <linux/uio_driver.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/uio_driver.h>
 #include <linux/platform_device.h>
 #include <asm/io.h>
@@ -356,6 +357,8 @@ struct hws_audio{
 	u32                         sample_rate_out;
     u16                         channels;
     u16                         bits_per_sample;
+	u32							irq_count;
+	u32							delivered_count;
 };
 	
 
@@ -454,6 +457,9 @@ struct hws_pcie_dev {
 	ULONG m_brightness[MAX_VID_CHANNELS];
 	ULONG m_saturation[MAX_VID_CHANNELS];
 	ULONG m_hue[MAX_VID_CHANNELS];
+	struct mutex reg_probe_lock;
+	bool reg_probe_valid;
+	char reg_probe_report[8192];
 	
 };
 

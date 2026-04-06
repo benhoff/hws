@@ -16,6 +16,11 @@
 #include <sound/rawmidi.h>
 #include <sound/initval.h>
 
+static bool hws_audio_trace;
+module_param_named(audio_trace, hws_audio_trace, bool, 0644);
+MODULE_PARM_DESC(audio_trace,
+		 "Enable baseline audio/MMIO trace logging");
+
 static void hws_adapters_init(struct hws_pcie_dev *dev);
 static void hws_get_video_param(struct hws_pcie_dev *dev,int index);
 //static void StartDma(int index);
@@ -1385,6 +1390,17 @@ void audio_data_process(struct work_struct *p_work)
 	{
 		//--- send data -------------
 		 delived = _deliver_samples(drv,bBuf, aud_len);
+		drv->delivered_count++;
+		if (hws_audio_trace && drv->delivered_count <= 8) {
+			dev_info(&pdx->pdev->dev,
+				 "audio-trace:deliver ch%d delivered=%u ring=%u/%u period=%u used=%u bytes=%d\n",
+				 dwAudioCh, drv->delivered_count,
+				 drv->ring_wpos_byframes,
+				 drv->ring_size_byframes,
+				 drv->period_size_byframes,
+				 drv->period_used_byframes,
+				 delived);
+		}
 		#if 0
 		 avail = aud_len - delived;
 		 if(avail)
@@ -3502,9 +3518,11 @@ int hws_audio_register(struct hws_pcie_dev *dev)
             audio_pcm_hardware.buffer_bytes_max
             );
 		//----------------------------
-		  dev->audio[i].sample_rate_out        = 48000;
+		dev->audio[i].sample_rate_out        = 48000;
     	  dev->audio[i].channels               = 2;
 		  dev->audio[i].resampled_buf_size = dev->audio[i].sample_rate_out * 2/* sample bytes */ * dev->audio[i].channels /* channels */;
+		  dev->audio[i].irq_count = 0;
+		  dev->audio[i].delivered_count = 0;
 		  //dev->audio[i].resampled_buf = vmalloc(dev->audio[i].resampled_buf_size);  
 		//if(dev->audio[i].resampled_buf == NULL)
 		//	goto fail1;
@@ -3562,6 +3580,462 @@ static u32 READ_REGISTER_ULONG (struct hws_pcie_dev *pdx,u32 RegisterOffset)
 	//return(map_bar0_addr[RegisterOffset/4]);
 	return(ioread32(bar0+RegisterOffset));
 }
+
+static u32 hws_audio_base_reg(int index)
+{
+	return CBVS_IN_BUF_BASE + ((8 + index) * PCIE_BARADDROFSIZE);
+}
+
+static u32 hws_abuf_toggle_reg(int index)
+{
+	return CVBS_IN_BASE + ((40 + index) * PCIE_BARADDROFSIZE);
+}
+
+static void hws_trace_bar0_snapshot(struct hws_pcie_dev *pdx, const char *tag)
+{
+	unsigned int slot;
+	unsigned int ch;
+
+	if (!pdx || !pdx->map_bar0_addr || !tag || !hws_audio_trace)
+		return;
+
+	dev_info(&pdx->pdev->dev,
+		 "bar0-snap:%s core dma=%08x int=%08x vcap=%08x acap=%08x int_en=%08x br=%08x dec=%08x\n",
+		 tag,
+		 READ_REGISTER_ULONG(pdx, CVBS_IN_BASE),
+		 READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (1 * PCIE_BARADDROFSIZE)),
+		 READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (2 * PCIE_BARADDROFSIZE)),
+		 READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (3 * PCIE_BARADDROFSIZE)),
+		 READ_REGISTER_ULONG(pdx, INT_EN_REG_BASE),
+		 READ_REGISTER_ULONG(pdx, PCIEBR_EN_REG_BASE),
+		 READ_REGISTER_ULONG(pdx, PCIE_INT_DEC_REG_BASE));
+
+	for (slot = 0; slot < 16; slot++) {
+		u32 base_reg;
+		u32 table_hi;
+		u32 table_lo;
+
+		base_reg = CBVS_IN_BUF_BASE + slot * PCIE_BARADDROFSIZE;
+		table_hi = PCI_ADDR_TABLE_BASE + 0x208 + slot * 8;
+		table_lo = table_hi + PCIE_BARADDROFSIZE;
+		dev_info(&pdx->pdev->dev,
+			 "bar0-snap:%s slot%u base=%08x remap_hi=%08x remap_lo=%08x\n",
+			 tag, slot,
+			 READ_REGISTER_ULONG(pdx, base_reg),
+			 READ_REGISTER_ULONG(pdx, table_hi),
+			 READ_REGISTER_ULONG(pdx, table_lo));
+	}
+
+	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl && ch < MAX_VID_CHANNELS; ch++) {
+		dev_info(&pdx->pdev->dev,
+			 "bar0-snap:%s ach%u base=%08x toggle=%08x run=%u irq=%u delivered=%u\n",
+			 tag, ch,
+			 READ_REGISTER_ULONG(pdx, hws_audio_base_reg(ch)),
+			 READ_REGISTER_ULONG(pdx, hws_abuf_toggle_reg(ch)),
+			 pdx->m_bAudioRun[ch],
+			 pdx->audio[ch].irq_count,
+			 pdx->audio[ch].delivered_count);
+	}
+}
+
+static void hws_trace_audio_state(struct hws_pcie_dev *pdx, const char *phase,
+				  int index)
+{
+	u32 shared_hi;
+	u32 shared_lo;
+	u32 audio_hi;
+	u32 audio_lo;
+	u32 base;
+	u32 toggle;
+	u32 acap;
+	u32 dma_status;
+	u32 int_status;
+
+	if (!pdx || !phase || index < 0 || index >= MAX_VID_CHANNELS ||
+	    !hws_audio_trace)
+		return;
+
+	shared_hi = READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE + 0x208 +
+					index * 8);
+	shared_lo = READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE + 0x20c +
+					index * 8);
+	audio_hi = READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE + 0x208 +
+				       (8 + index) * 8);
+	audio_lo = READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE + 0x20c +
+				       (8 + index) * 8);
+	base = READ_REGISTER_ULONG(pdx, hws_audio_base_reg(index));
+	toggle = READ_REGISTER_ULONG(pdx, hws_abuf_toggle_reg(index)) & 0x01;
+	acap = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE + (3 * PCIE_BARADDROFSIZE));
+	dma_status = READ_REGISTER_ULONG(pdx, CVBS_IN_BASE);
+	int_status = READ_REGISTER_ULONG(pdx,
+					 CVBS_IN_BASE + (1 * PCIE_BARADDROFSIZE));
+
+	dev_info(&pdx->pdev->dev,
+		 "audio-trace:%s ch%d base=%08x acap=%08x dma=%08x int=%08x int_en=%08x br=%08x dec=%08x shared=[%08x/%08x] audio=[%08x/%08x] toggle=%u run=%u irq=%u delivered=%u\n",
+		 phase, index, base, acap, dma_status, int_status,
+		 READ_REGISTER_ULONG(pdx, INT_EN_REG_BASE),
+		 READ_REGISTER_ULONG(pdx, PCIEBR_EN_REG_BASE),
+		 READ_REGISTER_ULONG(pdx, PCIE_INT_DEC_REG_BASE),
+		 shared_hi, shared_lo, audio_hi, audio_lo, toggle,
+		 pdx->m_bAudioRun[index],
+		 pdx->audio[index].irq_count,
+		 pdx->audio[index].delivered_count);
+}
+
+static int hws_reg_probe_append_snapshot(struct hws_pcie_dev *pdx, char *buf,
+					 size_t len, const char *section)
+{
+	unsigned int ch;
+	int n;
+
+	if (!pdx || !buf || !len)
+		return 0;
+
+	n = 0;
+	n += scnprintf(buf + n, len - n, "[%s]\n", section);
+	n += scnprintf(buf + n, len - n, "INT_EN=0x%08x\n",
+		       READ_REGISTER_ULONG(pdx, INT_EN_REG_BASE));
+	n += scnprintf(buf + n, len - n, "PCIEBR_EN=0x%08x\n",
+		       READ_REGISTER_ULONG(pdx, PCIEBR_EN_REG_BASE));
+	n += scnprintf(buf + n, len - n, "PCIE_INT_DEC=0x%08x\n",
+		       READ_REGISTER_ULONG(pdx, PCIE_INT_DEC_REG_BASE));
+	n += scnprintf(buf + n, len - n, "DMA_STATUS=0x%08x\n",
+		       READ_REGISTER_ULONG(pdx, CVBS_IN_BASE));
+	n += scnprintf(buf + n, len - n, "INT_STATUS=0x%08x\n",
+		       READ_REGISTER_ULONG(pdx, CVBS_IN_BASE +
+					   (1 * PCIE_BARADDROFSIZE)));
+	n += scnprintf(buf + n, len - n, "VCAP_ENABLE=0x%08x\n",
+		       READ_REGISTER_ULONG(pdx, CVBS_IN_BASE +
+					   (2 * PCIE_BARADDROFSIZE)));
+	n += scnprintf(buf + n, len - n, "ACAP_ENABLE=0x%08x\n",
+		       READ_REGISTER_ULONG(pdx, CVBS_IN_BASE +
+					   (3 * PCIE_BARADDROFSIZE)));
+
+	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl && n < len; ch++) {
+		n += scnprintf(buf + n, len - n,
+			       "ch%u.audio_base=0x%08x shared_hi=0x%08x shared_lo=0x%08x audio_hi=0x%08x audio_lo=0x%08x abuf_toggle=0x%08x run=%u irq=%u delivered=%u\n",
+			       ch,
+			       READ_REGISTER_ULONG(pdx, hws_audio_base_reg(ch)),
+			       READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE +
+						   0x208 + ch * 8),
+			       READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE +
+						   0x20c + ch * 8),
+			       READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE +
+						   0x208 + (8 + ch) * 8),
+			       READ_REGISTER_ULONG(pdx, PCI_ADDR_TABLE_BASE +
+						   0x20c + (8 + ch) * 8),
+			       READ_REGISTER_ULONG(pdx, hws_abuf_toggle_reg(ch)),
+			       pdx->m_bAudioRun[ch],
+			       pdx->audio[ch].irq_count,
+			       pdx->audio[ch].delivered_count);
+	}
+
+	return n;
+}
+
+static int hws_reg_probe_append_busy(struct hws_pcie_dev *pdx, char *buf,
+				     size_t len)
+{
+	unsigned int ch;
+	int n;
+
+	if (!pdx || !buf || !len)
+		return 0;
+
+	n = 0;
+	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl && n < len; ch++) {
+		if (!pdx->m_bVCapStarted[ch])
+			continue;
+
+		n += scnprintf(buf + n, len - n, "busy=video ch%u active\n", ch);
+		return n;
+	}
+
+	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl && n < len; ch++) {
+		if (!pdx->m_bAudioRun[ch])
+			continue;
+
+		n += scnprintf(buf + n, len - n, "busy=audio ch%u running\n", ch);
+		return n;
+	}
+
+	return 0;
+}
+
+static void hws_reg_probe_write_read_restore(struct hws_pcie_dev *pdx, u32 reg,
+					     u32 test, u32 *orig, u32 *readback,
+					     u32 *restored)
+{
+	*orig = READ_REGISTER_ULONG(pdx, reg);
+	WRITE_REGISTER_ULONG(pdx, reg, test);
+	*readback = READ_REGISTER_ULONG(pdx, reg);
+	WRITE_REGISTER_ULONG(pdx, reg, *orig);
+	*restored = READ_REGISTER_ULONG(pdx, reg);
+}
+
+static int hws_reg_probe_append_write_probe(struct hws_pcie_dev *pdx, char *buf,
+					    size_t len)
+{
+	unsigned int ch;
+	int n;
+	u32 orig, readback, restored;
+
+	if (!pdx || !buf || !len)
+		return 0;
+
+	n = 0;
+	n += scnprintf(buf + n, len - n, "[write_probe]\n");
+	hws_reg_probe_write_read_restore(pdx, INT_EN_REG_BASE, 0x0003ffff,
+					 &orig, &readback, &restored);
+	n += scnprintf(buf + n, len - n,
+		       "INT_EN.probe orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
+		       orig, 0x0003ffff, readback, restored);
+	hws_reg_probe_write_read_restore(pdx, PCIEBR_EN_REG_BASE, 0x00000001,
+					 &orig, &readback, &restored);
+	n += scnprintf(buf + n, len - n,
+		       "PCIEBR_EN.probe orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
+		       orig, 0x00000001, readback, restored);
+	hws_reg_probe_write_read_restore(pdx, PCIE_INT_DEC_REG_BASE, 0x00000000,
+					 &orig, &readback, &restored);
+	n += scnprintf(buf + n, len - n,
+		       "PCIE_INT_DEC.probe orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
+		       orig, 0x00000000, readback, restored);
+
+	for (ch = 0; ch < pdx->m_nCurreMaxVideoChl && n < len; ch++) {
+		u32 reg;
+		u32 test;
+
+		reg = hws_audio_base_reg(ch);
+		test = ((ch + 1) * PCIEBAR_AXI_BASE + 0x00123000);
+		hws_reg_probe_write_read_restore(pdx, reg, test,
+						 &orig, &readback, &restored);
+		n += scnprintf(buf + n, len - n,
+			       "ch%u.audio_base.probe reg=0x%04x orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
+			       ch, reg, orig, test, readback, restored);
+	}
+
+	return n;
+}
+
+static int hws_reg_probe_append_slot_probe(struct hws_pcie_dev *pdx, char *buf,
+					   size_t len)
+{
+	unsigned int slot;
+	int n;
+
+	if (!pdx || !buf || !len)
+		return 0;
+
+	n = 0;
+	n += scnprintf(buf + n, len - n, "[slot_probe]\n");
+	for (slot = 0; slot < 16 && n < len; slot++) {
+		u32 reg;
+		u32 test;
+		u32 orig, readback, restored;
+
+		reg = CBVS_IN_BUF_BASE + slot * PCIE_BARADDROFSIZE;
+		test = 0x80000000 | (slot << 16) | 0x00123000;
+		hws_reg_probe_write_read_restore(pdx, reg, test,
+						 &orig, &readback, &restored);
+		n += scnprintf(buf + n, len - n,
+			       "slot%u.base.probe reg=0x%04x orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
+			       slot, reg, orig, test, readback, restored);
+	}
+
+	return n;
+}
+
+static int hws_reg_probe_append_remap_probe(struct hws_pcie_dev *pdx, char *buf,
+					    size_t len)
+{
+	unsigned int slot;
+	int n;
+
+	if (!pdx || !buf || !len)
+		return 0;
+
+	n = 0;
+	n += scnprintf(buf + n, len - n, "[remap_slot_probe]\n");
+	for (slot = 0; slot < 16 && n < len; slot++) {
+		u32 hi_reg;
+		u32 lo_reg;
+		u32 hi_test;
+		u32 lo_test;
+		u32 orig, readback, restored;
+
+		hi_reg = PCI_ADDR_TABLE_BASE + 0x208 + slot * 8;
+		lo_reg = hi_reg + PCIE_BARADDROFSIZE;
+		hi_test = 0x00010000 | slot;
+		lo_test = 0xE0000000u | (slot << 12);
+		hws_reg_probe_write_read_restore(pdx, hi_reg, hi_test,
+						 &orig, &readback, &restored);
+		n += scnprintf(buf + n, len - n,
+			       "slot%u.remap_hi.probe reg=0x%04x orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
+			       slot, hi_reg, orig, hi_test, readback, restored);
+		hws_reg_probe_write_read_restore(pdx, lo_reg, lo_test,
+						 &orig, &readback, &restored);
+		n += scnprintf(buf + n, len - n,
+			       "slot%u.remap_lo.probe reg=0x%04x orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
+			       slot, lo_reg, orig, lo_test, readback, restored);
+	}
+
+	return n;
+}
+
+static ssize_t audio_reg_probe_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct hws_pcie_dev *pdx;
+	ssize_t n;
+
+	pdx = dev_get_drvdata(dev);
+	if (!pdx || !pdx->map_bar0_addr)
+		return -ENODEV;
+
+	mutex_lock(&pdx->reg_probe_lock);
+	if (pdx->reg_probe_valid)
+		n = sysfs_emit(buf, "%s", pdx->reg_probe_report);
+	else
+		n = hws_reg_probe_append_snapshot(pdx, buf, PAGE_SIZE,
+						  "snapshot.live");
+	mutex_unlock(&pdx->reg_probe_lock);
+	return n;
+}
+
+static ssize_t audio_reg_probe_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct hws_pcie_dev *pdx;
+	int n;
+	int busy_n;
+
+	pdx = dev_get_drvdata(dev);
+	if (!pdx || !pdx->map_bar0_addr)
+		return -ENODEV;
+
+	if (!sysfs_streq(buf, "run") && !sysfs_streq(buf, "snapshot"))
+		return -EINVAL;
+
+	mutex_lock(&pdx->reg_probe_lock);
+	memset(pdx->reg_probe_report, 0, sizeof(pdx->reg_probe_report));
+	n = scnprintf(pdx->reg_probe_report, sizeof(pdx->reg_probe_report),
+		      "pci=%s\n", pci_name(pdx->pdev));
+
+	if (sysfs_streq(buf, "snapshot")) {
+		n += hws_reg_probe_append_snapshot(pdx, pdx->reg_probe_report + n,
+						   sizeof(pdx->reg_probe_report) - n,
+						   "snapshot.live");
+		pdx->reg_probe_valid = true;
+		mutex_unlock(&pdx->reg_probe_lock);
+		return count;
+	}
+
+	busy_n = hws_reg_probe_append_busy(pdx, pdx->reg_probe_report + n,
+					   sizeof(pdx->reg_probe_report) - n);
+	n += busy_n;
+	if (busy_n) {
+		pdx->reg_probe_valid = true;
+		mutex_unlock(&pdx->reg_probe_lock);
+		return -EBUSY;
+	}
+
+	n += hws_reg_probe_append_snapshot(pdx, pdx->reg_probe_report + n,
+					   sizeof(pdx->reg_probe_report) - n,
+					   "snapshot.before");
+	n += hws_reg_probe_append_write_probe(pdx, pdx->reg_probe_report + n,
+					      sizeof(pdx->reg_probe_report) - n);
+	n += hws_reg_probe_append_snapshot(pdx, pdx->reg_probe_report + n,
+					   sizeof(pdx->reg_probe_report) - n,
+					   "snapshot.after");
+	pdx->reg_probe_valid = true;
+	mutex_unlock(&pdx->reg_probe_lock);
+	return count;
+}
+
+static ssize_t audio_reg_probe_run_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct hws_pcie_dev *pdx;
+	int n;
+	int busy_n;
+
+	pdx = dev_get_drvdata(dev);
+	if (!pdx || !pdx->map_bar0_addr)
+		return -ENODEV;
+
+	mutex_lock(&pdx->reg_probe_lock);
+	memset(pdx->reg_probe_report, 0, sizeof(pdx->reg_probe_report));
+	n = scnprintf(pdx->reg_probe_report, sizeof(pdx->reg_probe_report),
+		      "pci=%s\n", pci_name(pdx->pdev));
+	busy_n = hws_reg_probe_append_busy(pdx, pdx->reg_probe_report + n,
+					   sizeof(pdx->reg_probe_report) - n);
+	n += busy_n;
+	if (!busy_n) {
+		n += hws_reg_probe_append_snapshot(pdx, pdx->reg_probe_report + n,
+						   sizeof(pdx->reg_probe_report) - n,
+						   "snapshot.before");
+		n += hws_reg_probe_append_write_probe(pdx, pdx->reg_probe_report + n,
+						      sizeof(pdx->reg_probe_report) - n);
+		n += hws_reg_probe_append_snapshot(pdx, pdx->reg_probe_report + n,
+						   sizeof(pdx->reg_probe_report) - n,
+						   "snapshot.after");
+	}
+	pdx->reg_probe_valid = true;
+	n = sysfs_emit(buf, "%s", pdx->reg_probe_report);
+	mutex_unlock(&pdx->reg_probe_lock);
+	return n;
+}
+
+static ssize_t audio_reg_probe_slots_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	struct hws_pcie_dev *pdx;
+	int n;
+	int busy_n;
+
+	pdx = dev_get_drvdata(dev);
+	if (!pdx || !pdx->map_bar0_addr)
+		return -ENODEV;
+
+	mutex_lock(&pdx->reg_probe_lock);
+	n = scnprintf(buf, PAGE_SIZE, "pci=%s\n", pci_name(pdx->pdev));
+	busy_n = hws_reg_probe_append_busy(pdx, buf + n, PAGE_SIZE - n);
+	n += busy_n;
+	if (!busy_n)
+		n += hws_reg_probe_append_slot_probe(pdx, buf + n, PAGE_SIZE - n);
+	mutex_unlock(&pdx->reg_probe_lock);
+	return n;
+}
+
+static ssize_t audio_reg_probe_remap_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	struct hws_pcie_dev *pdx;
+	int n;
+	int busy_n;
+
+	pdx = dev_get_drvdata(dev);
+	if (!pdx || !pdx->map_bar0_addr)
+		return -ENODEV;
+
+	mutex_lock(&pdx->reg_probe_lock);
+	n = scnprintf(buf, PAGE_SIZE, "pci=%s\n", pci_name(pdx->pdev));
+	busy_n = hws_reg_probe_append_busy(pdx, buf + n, PAGE_SIZE - n);
+	n += busy_n;
+	if (!busy_n)
+		n += hws_reg_probe_append_remap_probe(pdx, buf + n,
+						      PAGE_SIZE - n);
+	mutex_unlock(&pdx->reg_probe_lock);
+	return n;
+}
+
+static DEVICE_ATTR_RW(audio_reg_probe);
+static DEVICE_ATTR_RO(audio_reg_probe_run);
+static DEVICE_ATTR_RO(audio_reg_probe_slots);
+static DEVICE_ATTR_RO(audio_reg_probe_remap);
 //----------------------------------------------
 static int Check_Busy(struct hws_pcie_dev *pdx)
 {
@@ -4011,6 +4485,10 @@ static void hws_remove(struct pci_dev *pdev)
 	/* disable interrupts */
 	irq_teardown(dev);
 	StopKSThread(dev);
+	device_remove_file(&pdev->dev, &dev_attr_audio_reg_probe);
+	device_remove_file(&pdev->dev, &dev_attr_audio_reg_probe_run);
+	device_remove_file(&pdev->dev, &dev_attr_audio_reg_probe_slots);
+	device_remove_file(&pdev->dev, &dev_attr_audio_reg_probe_remap);
 	//printk("hws_remove  0\n");
 	for ( i = 0; i<MAX_VID_CHANNELS; i++)
 	{
@@ -4117,6 +4595,8 @@ static int  StartAudioCapture(struct hws_pcie_dev *pdx,int index)
 	pdx->m_bAudioStop[index] = 0;
 	pdx->m_nAudioBufferIndex[index] =0; 
 	pdx->audio_data[index]=0;
+	pdx->audio[index].irq_count = 0;
+	pdx->audio[index].delivered_count = 0;
 	pdx->m_nRDAudioIndex[index] =0;
 	for(j=0; j<MAX_AUDIO_QUEUE;j++)
 	{
@@ -4124,6 +4604,8 @@ static int  StartAudioCapture(struct hws_pcie_dev *pdx,int index)
 	}
 	pdx->m_AudioInfo[index].dwisRuning =1;
 	EnableAudioCapture(pdx,index,1);
+	hws_trace_audio_state(pdx, "start", index);
+	hws_trace_bar0_snapshot(pdx, "audio.start");
 	return 0;
 }
 
@@ -4885,6 +5367,17 @@ static irqreturn_t irqhandler(int irq, void  *info)
 					tmp = (READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (40+0) * PCIE_BARADDROFSIZE)))&0x01;
 					pdx->m_nAudioBufferIndex[0] = tmp;
 					pdx->audio_data[0]= pdx->m_nAudioBufferIndex[0];
+					pdx->audio[0].irq_count++;
+					if (hws_audio_trace) {
+						if (pdx->audio[0].irq_count == 1)
+							hws_trace_bar0_snapshot(pdx, "audio.first_irq");
+						if (pdx->audio[0].irq_count <= 8) {
+							dev_info(&pdx->pdev->dev,
+								 "audio-trace:irq ch0 irq=%u toggle=%u int_state=%08x\n",
+								 pdx->audio[0].irq_count, tmp, IntState);
+							hws_trace_audio_state(pdx, "irq", 0);
+						}
+					}
 					tasklet_schedule(&pdx->dpc_audio_tasklet[0]); 
 				}
 			}
@@ -4898,6 +5391,17 @@ static irqreturn_t irqhandler(int irq, void  *info)
 					tmp = (READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (40+1) * PCIE_BARADDROFSIZE)))&0x01;
 					pdx->m_nAudioBufferIndex[1] = tmp;
 					pdx->audio_data[1]= pdx->m_nAudioBufferIndex[1];
+					pdx->audio[1].irq_count++;
+					if (hws_audio_trace) {
+						if (pdx->audio[1].irq_count == 1)
+							hws_trace_bar0_snapshot(pdx, "audio.first_irq");
+						if (pdx->audio[1].irq_count <= 8) {
+							dev_info(&pdx->pdev->dev,
+								 "audio-trace:irq ch1 irq=%u toggle=%u int_state=%08x\n",
+								 pdx->audio[1].irq_count, tmp, IntState);
+							hws_trace_audio_state(pdx, "irq", 1);
+						}
+					}
 					tasklet_schedule(&pdx->dpc_audio_tasklet[1]); 
 				}
 			}
@@ -4912,6 +5416,17 @@ static irqreturn_t irqhandler(int irq, void  *info)
 					tmp = (READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (40+2) * PCIE_BARADDROFSIZE)))&0x01;
 					pdx->m_nAudioBufferIndex[2] = tmp;
 					pdx->audio_data[2]= pdx->m_nAudioBufferIndex[2];
+					pdx->audio[2].irq_count++;
+					if (hws_audio_trace) {
+						if (pdx->audio[2].irq_count == 1)
+							hws_trace_bar0_snapshot(pdx, "audio.first_irq");
+						if (pdx->audio[2].irq_count <= 8) {
+							dev_info(&pdx->pdev->dev,
+								 "audio-trace:irq ch2 irq=%u toggle=%u int_state=%08x\n",
+								 pdx->audio[2].irq_count, tmp, IntState);
+							hws_trace_audio_state(pdx, "irq", 2);
+						}
+					}
 					tasklet_schedule(&pdx->dpc_audio_tasklet[2]); 
 				}
 			}
@@ -4925,6 +5440,17 @@ static irqreturn_t irqhandler(int irq, void  *info)
 					tmp = (READ_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (40+3) * PCIE_BARADDROFSIZE)))&0x01;
 					pdx->m_nAudioBufferIndex[3] = tmp;
 					pdx->audio_data[3]= pdx->m_nAudioBufferIndex[3];
+					pdx->audio[3].irq_count++;
+					if (hws_audio_trace) {
+						if (pdx->audio[3].irq_count == 1)
+							hws_trace_bar0_snapshot(pdx, "audio.first_irq");
+						if (pdx->audio[3].irq_count <= 8) {
+							dev_info(&pdx->pdev->dev,
+								 "audio-trace:irq ch3 irq=%u toggle=%u int_state=%08x\n",
+								 pdx->audio[3].irq_count, tmp, IntState);
+							hws_trace_audio_state(pdx, "irq", 3);
+						}
+					}
 					tasklet_schedule(&pdx->dpc_audio_tasklet[3]); 
 				}
 			}
@@ -5079,11 +5605,13 @@ static void SetDMAAddress(struct hws_pcie_dev *pdx)
 				WRITE_REGISTER_ULONG(pdx,(CBVS_IN_BUF_BASE + ((8+i)*PCIE_BARADDROFSIZE)), ((i+1)*PCIEBAR_AXI_BASE+PCI_Addr)); //Buffer 1 address
 				m_ReadTmp = READ_REGISTER_ULONG(pdx,(CBVS_IN_BUF_BASE + ((8+i)*PCIE_BARADDROFSIZE)));
 		    	//printk("[X1]Audio:[%d] :--------BUF1: %X=%X\n",i,(PCIEBAR_AXI_BASE+PCI_Addr),m_ReadTmp);
+				hws_trace_audio_state(pdx, "seed", i);
 		}
 		#endif 
 	}
 	WRITE_REGISTER_ULONG(pdx,INT_EN_REG_BASE, 0x3ffff); //enable PCI Interruput		
 	//WRITE_REGISTER_ULONG(PCIEBR_EN_REG_BASE, 0xFFFFFFFF);	
+	hws_trace_bar0_snapshot(pdx, "setdma");
 	
 }
 
@@ -5521,6 +6049,7 @@ static void InitVideoSys(struct hws_pcie_dev *pdx,int set)
 	WRITE_REGISTER_ULONG(pdx,CVBS_IN_BASE, m_Valude);
 	WRITE_REGISTER_ULONG(pdx,(CVBS_IN_BASE + (0 * PCIE_BARADDROFSIZE)), 0X13);
 	pdx->m_bStartRun = 1;
+	hws_trace_bar0_snapshot(pdx, "init.done");
 	//--------------------------------------------------
 	
 }
@@ -5668,6 +6197,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	gdev = alloc_dev_instance(pdev);
 	//sys_dvrs_hw_pdx = gdev;
 	gdev->pdev = pdev;
+	mutex_init(&gdev->reg_probe_lock);
+	gdev->reg_probe_valid = false;
 	
 	gdev->dwDeviceID = gdev->pdev->device;
 	gdev->dwVendorID = gdev->pdev->vendor;
@@ -5852,6 +6383,23 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		if(hws_audio_register(gdev))
 		goto err_mem_alloc;
 #endif	
+	ret = device_create_file(&pdev->dev, &dev_attr_audio_reg_probe);
+	if (ret)
+		dev_warn(&pdev->dev, "audio_reg_probe sysfs create failed: %d\n",
+			 ret);
+	ret = device_create_file(&pdev->dev, &dev_attr_audio_reg_probe_run);
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "audio_reg_probe_run sysfs create failed: %d\n", ret);
+	ret = device_create_file(&pdev->dev, &dev_attr_audio_reg_probe_slots);
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "audio_reg_probe_slots sysfs create failed: %d\n", ret);
+	ret = device_create_file(&pdev->dev, &dev_attr_audio_reg_probe_remap);
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "audio_reg_probe_remap sysfs create failed: %d\n", ret);
+	hws_trace_bar0_snapshot(gdev, "probe.ready");
 	return 0;
 err_mem_alloc:
 	
