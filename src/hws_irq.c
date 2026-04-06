@@ -259,6 +259,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 		for (unsigned int ch = 0; ch < pdx->cur_max_linein_ch; ++ch) {
 			u32 abit = HWS_INT_ADONE_BIT(ch);
+			u8 cur_toggle;
 
 			if (!(int_state & abit))
 				continue;
@@ -271,13 +272,20 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 				continue;
 			}
 
+			/*
+			 * Baseline read ABUF_TOGGLE for every ADONE interrupt.
+			 * The register reports the half the device is filling
+			 * now, so the completed packet is the opposite half.
+			 */
+			cur_toggle = readl_relaxed(pdx->bar0_base +
+						    HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+			WRITE_ONCE(pdx->audio[ch].last_period_toggle, cur_toggle);
 			if (unlikely(hws_toggle_debug))
-				pdx->audio[ch].last_period_toggle =
-				    readl_relaxed(pdx->bar0_base +
-						  HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+				dev_dbg(&pdx->pdev->dev,
+					"irq: ADONE ch=%u toggle=%u\n", ch,
+					cur_toggle);
 
-			hws_audio_handle_interrupt(pdx, ch,
-					       READ_ONCE(pdx->audio[ch].last_period_toggle));
+			hws_audio_handle_interrupt(pdx, ch, cur_toggle);
 			writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
 			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}

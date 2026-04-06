@@ -632,6 +632,7 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 	/* 1) reset the decoder mode register to 0 */
 	writel(0x00000000, hws->bar0_base + HWS_REG_DEC_MODE);
 	hws_seed_dma_windows(hws);
+	hws_audio_seed_channels(hws);
 
 	/* 3) on a full reset, clear all per-channel status and indices */
 	if (!enable) {
@@ -642,15 +643,21 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 		}
 	}
 
+	/*
+	 * Baseline armed the interrupt gate before the decoder start-run
+	 * sequence. Keep that ordering here.
+	 */
+	writel(HWS_INT_EN_MASK, hws->bar0_base + INT_EN_REG_BASE);
+	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
+
 	/* 4) “Start run”: set bit31, wait a bit, then program low 24 bits */
 	writel(0x80000000, hws->bar0_base + HWS_REG_DEC_MODE);
 	// udelay(500);
 	writel(0x80FFFFFF, hws->bar0_base + HWS_REG_DEC_MODE);
 	writel(0x13, hws->bar0_base + HWS_REG_DEC_MODE);
-	hws_ack_all_irqs(hws);
-	hws_open_irq_fabric(hws);
 	/* 6) record that we're now running */
 	hws->start_run = true;
+	hws_trace_bar0_snapshot(hws, "init.done");
 }
 
 int hws_check_card_status(struct hws_pcie_dev *hws)

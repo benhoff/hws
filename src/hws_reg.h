@@ -34,6 +34,12 @@
 #define PCI_E_BAR_ADD_LOWMASK 0x1FFFFFFF
 
 #define MAX_DMA_AUDIO_PK_SIZE      (128U * 16U * 2U)
+/*
+ * The legacy driver reserved a 10 KiB hardware capture window per audio
+ * channel even though the delivered packet size is 4 KiB. Keep that headroom
+ * for the split-buffer DMA engine.
+ */
+#define MAX_AUDIO_CAP_SIZE         (10U * 1024U)
 
 
 #define MAX_VID_CHANNELS            4

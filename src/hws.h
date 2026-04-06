@@ -8,9 +8,11 @@
 #include <linux/kthread.h>
 #include <linux/pci.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/sizes.h>
 #include <linux/atomic.h>
+#include <linux/workqueue.h>
 
 #include <sound/pcm.h>
 #include <sound/core.h>
@@ -23,6 +25,7 @@
 #include "hws_reg.h"
 
 struct snd_pcm_substream;
+struct dentry;
 
 struct hwsmem_param {
 	u32 index;
@@ -153,6 +156,10 @@ struct hws_audio {
 
 	/* minimal HW packet tracking */
 	u8 last_period_toggle;
+	u32 irq_count;
+	u32 delivered_count;
+	struct delayed_work trace_probe_work;
+	u32 trace_probe_crc;
 
 	/* PCM format */
 	u32 output_sample_rate;
@@ -197,6 +204,10 @@ struct hws_pcie_dev {
 	struct v4l2_device v4l2_device;
 
 	struct snd_card *snd_card;
+	struct dentry *debugfs_dir;
+	struct mutex reg_probe_lock;
+	bool reg_probe_valid;
+	char reg_probe_report[8192];
 
 	/* ───── kernel thread ───── */
 	struct task_struct *main_task;
@@ -210,5 +221,8 @@ struct hws_pcie_dev {
 	int pci_lost;
 
 };
+
+void hws_restore_irq_fabric(struct hws_pcie_dev *hws);
+void hws_trace_bar0_snapshot(struct hws_pcie_dev *hws, const char *tag);
 
 #endif
