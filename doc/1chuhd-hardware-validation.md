@@ -38,7 +38,28 @@ hardware.
 
 7. If the board supports interlaced input, test at least one interlaced mode.
 
-## Commands
+## Preferred Log Collection
+
+Run the collector script after building the module:
+
+```sh
+make -C /lib/modules/$(uname -r)/build M=$PWD/src modules
+chmod +x ./collect_1chuhd_logs.sh
+./collect_1chuhd_logs.sh
+```
+
+The script reloads the module with `trace_1chuhd=1`, captures probe and
+streaming logs, runs the key `v4l2-ctl` queries, and writes everything to a
+timestamped directory under `/tmp`.
+
+If the source cannot generate every default mode, pass only the supported
+modes, for example:
+
+```sh
+./collect_1chuhd_logs.sh 1920x1080 3840x2160
+```
+
+## Manual Commands
 
 Build:
 
@@ -46,10 +67,10 @@ Build:
 make -C /lib/modules/$(uname -r)/build M=$PWD/src modules
 ```
 
-Load:
+Load with tracing:
 
 ```sh
-sudo insmod src/HwsCapture.ko
+sudo insmod src/HwsCapture.ko trace_1chuhd=1
 ```
 
 Inspect:
@@ -65,8 +86,15 @@ Stream test:
 ```sh
 v4l2-ctl -d /dev/video0 \
   --set-fmt-video=width=3840,height=2160,pixelformat=YUYV \
-  --stream-mmap=4 --stream-count=120 --stream-to=/tmp/1chuhd.yuyv
+  --stream-mmap=4 --stream-count=120 --stream-to=/dev/null
 ```
+
+Relevant trace lines in `dmesg` are prefixed with `1chuhd:` and should show:
+
+- board capability selection and scratch DMA allocation
+- per-slot sliced DMA layout programming
+- per-VDONE bank/toggle handling
+- logical frame completion after both banks arrive
 
 ## Questions The Hardware Owner Needs To Answer
 
@@ -89,9 +117,7 @@ v4l2-ctl -d /dev/video0 \
 
 ## What To Send Back
 
-- `dmesg` from module load and a short stream run
-- output of `v4l2-ctl --all`
-- output of `v4l2-ctl --query-dv-timings`
+- the result directory from `./collect_1chuhd_logs.sh`
 - whether each tested mode produced a correct image
 - whether any mode showed slice ordering issues, duplicated halves, or
   interlace artifacts

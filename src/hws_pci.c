@@ -225,6 +225,11 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 		 "chip detected: ver=%u subver=%u port=%u yv12=%u\n",
 		 hdev->device_ver, hdev->sub_ver, hdev->port_id,
 		 hdev->support_yv12);
+	dev_info(&hdev->pdev->dev,
+		 "caps: chans=%u sliced_dma=%u max=%ux%u frame_max=%u\n",
+		 hdev->cur_max_video_ch, hdev->uses_sliced_dma,
+		 hdev->max_video_width, hdev->max_video_height,
+		 hdev->max_hw_video_buf_sz);
 
 	return 0;
 }
@@ -311,6 +316,9 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 		}
 		hws->scratch_vid[ch].cpu  = cpu;
 		hws->scratch_vid[ch].size = need;
+		hws_1chuhd_log(hws, "scratch slot=%d dma=%pad size=%zu",
+			       ch, &hws->scratch_vid[ch].dma,
+			       hws->scratch_vid[ch].size);
 	}
 	return 0;
 }

@@ -95,10 +95,14 @@ static void hws_program_sliced_dma_layout(struct hws_video *vid)
 
 	hws = vid->parent;
 	hws_calc_slice_sizes(vid->pix.sizeimage, phys_sizes, copy_sizes);
+	hws_1chuhd_log(hws,
+		       "layout ch=%d %ux%u field=%u size=%u half=%u",
+		       vid->channel_index, vid->pix.width, vid->pix.height,
+		       vid->pix.field, vid->pix.sizeimage, vid->pix.half_size);
 
 	for (slot = 0; slot < 4; slot++) {
 		dma_addr_t paddr;
-		u32 lo, hi, pci_addr_low;
+		u32 lo, hi, pci_addr_low, base_reg, half_reg;
 
 		if (!hws->scratch_vid[slot].cpu)
 			continue;
@@ -108,18 +112,24 @@ static void hws_program_sliced_dma_layout(struct hws_video *vid)
 		hi = upper_32_bits(paddr);
 		pci_addr_low = lo & addr_low_mask;
 		lo &= addr_mask;
+		base_reg = (slot + 1U) * PCIEBAR_AXI_BASE + pci_addr_low;
+		half_reg = phys_sizes[slot] / 16U;
 
 		writel_relaxed(hi,
 			       hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + slot * 8);
 		writel_relaxed(lo,
 			       hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + slot * 8 +
 			       PCIE_BARADDROFSIZE);
-		writel_relaxed((slot + 1U) * PCIEBAR_AXI_BASE + pci_addr_low,
+		writel_relaxed(base_reg,
 			       hws->bar0_base + CVBS_IN_BUF_BASE +
 			       slot * PCIE_BARADDROFSIZE);
-		writel_relaxed(phys_sizes[slot] / 16U,
+		writel_relaxed(half_reg,
 			       hws->bar0_base + CVBS_IN_BUF_BASE2 +
 			       slot * PCIE_BARADDROFSIZE);
+		hws_1chuhd_log(hws,
+			       "layout slot=%u dma=%pad remap_hi=0x%08x remap_lo=0x%08x base=0x%08x half16=0x%08x copy=%u phys=%u",
+			       slot, &paddr, hi, lo, base_reg, half_reg,
+			       copy_sizes[slot], phys_sizes[slot]);
 	}
 
 	(void)copy_sizes;
@@ -145,6 +155,11 @@ static bool dma_window_verify;
 module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
 MODULE_PARM_DESC(dma_window_verify,
 		 "Read back DMA window registers after programming (debug)");
+
+bool hws_1chuhd_trace;
+module_param_named(trace_1chuhd, hws_1chuhd_trace, bool, 0644);
+MODULE_PARM_DESC(trace_1chuhd,
+		 "Emit structured 1CHUHD sliced-DMA trace logs");
 
 void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
 			  dma_addr_t dma, const char *tag)
@@ -255,6 +270,9 @@ void hws_prime_next_locked(struct hws_video *vid)
 
 	vid->next_prepared = next;
 	if (hws->uses_sliced_dma) {
+		hws_1chuhd_log(hws, "prime ch=%d active=%p next=%p queued=%u",
+			       vid->channel_index, vid->active, next,
+			       vid->queued_count);
 		dev_dbg(&hws->pdev->dev,
 			"ch%u pre-staged next sliced buffer %p\n",
 			vid->channel_index, next);
@@ -336,6 +354,9 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	if (have_next && next) {
 		if (hws->uses_sliced_dma) {
 			hws_program_sliced_dma_layout(v);
+			hws_1chuhd_log(hws,
+				       "nosignal ch=%d recycled=%p next=%p",
+				       v->channel_index, buf, next);
 			doorbell = true;
 		} else {
 			dma_addr_t dma =
@@ -640,6 +661,8 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 
 	dev_dbg(&hws->pdev->dev, "vcap %s ch%u (reg=0x%08x)\n",
 		on ? "ON" : "OFF", chan, status);
+	hws_1chuhd_log(hws, "capture %s ch=%u reg=0x%08x",
+		       on ? "on" : "off", chan, status);
 }
 
 static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
@@ -977,6 +1000,13 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	if (!geometry_changed && fps == v->current_fps)
 		return;
 
+	hws_1chuhd_log(pdx,
+		       "mode-change ch=%u old=%ux%u field=%u fps=%u new=%ux%u field=%u fps=%u",
+		       ch, v->pix.width, v->pix.height, v->pix.field,
+		       v->current_fps, w, h,
+		       interlaced ? V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE,
+		       fps);
+
 	if (!geometry_changed) {
 		/* Refresh cached live timing state, but don't emit a resolution
 		 * change event when only the frame rate changes.
@@ -1235,6 +1265,11 @@ static int hws_buffer_prepare(struct vb2_buffer *vb)
 	if (hws->uses_sliced_dma && !vb2_plane_vaddr(vb, 0))
 		return -EINVAL;
 
+	hws_1chuhd_log(hws,
+		       "prepare ch=%d vb=%p dma=%pad need=%zu plane=%zu vaddr=%p",
+		       vid->channel_index, vb, &dma_addr, need,
+		       vb2_plane_size(vb, 0), vb2_plane_vaddr(vb, 0));
+
 	vb2_set_plane_payload(vb, 0, need);
 	return 0;
 }
@@ -1250,6 +1285,10 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 		"buffer_queue(ch=%u): vb=%p sizeimage=%u q_active=%d\n",
 		vid->channel_index, vb, vid->pix.sizeimage,
 		READ_ONCE(vid->cap_active));
+	hws_1chuhd_log(hws,
+		       "queue ch=%d vb=%p active=%p next=%p queued=%u streaming=%d",
+		       vid->channel_index, vb, vid->active, vid->next_prepared,
+		       vid->queued_count, READ_ONCE(vid->cap_active));
 
 	/* Initialize buffer slot */
 	buf->slot = 0;
@@ -1277,6 +1316,10 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 				  hws->bar0_base + HWS_REG_DMA_ADDR(vid->channel_index));
 		} else {
 			hws_program_sliced_dma_layout(vid);
+			hws_1chuhd_log(hws,
+				       "queue-armed ch=%d active=%p next=%p",
+				       vid->channel_index, buf,
+				       vid->next_prepared);
 		}
 
 		wmb(); /* ensure descriptors visible before enabling capture */
@@ -1299,6 +1342,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	dev_dbg(&hws->pdev->dev, "start_streaming: ch=%u count=%u\n",
 		v->channel_index, count);
+	hws_1chuhd_log(hws,
+		       "streamon ch=%d count=%u queued=%u active=%p next=%p",
+		       v->channel_index, count, v->queued_count, v->active,
+		       v->next_prepared);
 
 	ret = hws_check_card_status(hws);
 	if (ret) {
@@ -1373,6 +1420,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 		} else {
 			hws_program_sliced_dma_layout(v);
+			hws_1chuhd_log(hws,
+				       "streamon-armed ch=%d active=%p size=%u",
+				       v->channel_index, to_program,
+				       v->pix.sizeimage);
 		}
 
 		wmb(); /* ensure descriptors visible before enabling capture */

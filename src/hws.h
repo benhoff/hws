@@ -45,6 +45,7 @@ struct hws_pix_state {
 struct hws_pcie_dev;
 struct hws_adapter;
 struct hws_video;
+extern bool hws_1chuhd_trace;
 
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
@@ -174,5 +175,18 @@ struct hws_pcie_dev {
 	int pci_lost;
 
 };
+
+static inline bool hws_trace_1chuhd(const struct hws_pcie_dev *hws)
+{
+	return hws && hws->pdev && hws->uses_sliced_dma &&
+		READ_ONCE(hws_1chuhd_trace);
+}
+
+#define hws_1chuhd_log(_hws, _fmt, ...)					\
+	do {								\
+		if (hws_trace_1chuhd((_hws)))				\
+			dev_info(&(_hws)->pdev->dev,			\
+				 "1chuhd: " _fmt, ##__VA_ARGS__);	\
+	} while (0)
 
 #endif

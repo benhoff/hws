@@ -47,6 +47,7 @@ static int hws_copy_sliced_bank(struct hws_video *v, u8 toggle)
 	void *dst;
 	u32 copy_sizes[4];
 	u32 slot0, slot1, off0, off1;
+	u8 banks_before;
 
 	if (!active)
 		return -ENOENT;
@@ -57,6 +58,7 @@ static int hws_copy_sliced_bank(struct hws_video *v, u8 toggle)
 		return -ENOMEM;
 
 	hws_calc_slice_sizes(v->pix.sizeimage, copy_sizes);
+	banks_before = v->slice_banks_done;
 	if (toggle) {
 		slot0 = 0;
 		slot1 = 1;
@@ -78,6 +80,11 @@ static int hws_copy_sliced_bank(struct hws_video *v, u8 toggle)
 
 	memcpy(dst + off0, hws->scratch_vid[slot0].cpu, copy_sizes[slot0]);
 	memcpy(dst + off1, hws->scratch_vid[slot1].cpu, copy_sizes[slot1]);
+	hws_1chuhd_log(hws,
+		       "bank ch=%d toggle=%u active=%p slots=%u/%u offs=%u/%u copy=%u/%u banks=0x%x->0x%x",
+		       v->channel_index, toggle, active, slot0, slot1, off0,
+		       off1, copy_sizes[slot0], copy_sizes[slot1],
+		       banks_before, v->slice_banks_done);
 
 	return 0;
 }
@@ -91,6 +98,11 @@ static void hws_video_handle_sliced_vdone(struct hws_video *v)
 	int ret;
 
 	toggle = readl_relaxed(hws->bar0_base + HWS_REG_VBUF_TOGGLE(v->channel_index)) & 0x01;
+	WRITE_ONCE(v->last_buf_half_toggle, toggle);
+	hws_1chuhd_log(hws,
+		       "vdone ch=%d toggle=%u active=%p next=%p banks=0x%x queued=%u",
+		       v->channel_index, toggle, v->active, v->next_prepared,
+		       v->slice_banks_done, v->queued_count);
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	ret = hws_copy_sliced_bank(v, toggle);
@@ -110,6 +122,10 @@ static void hws_video_handle_sliced_vdone(struct hws_video *v)
 	vb2_set_plane_payload(&done->vb.vb2_buf, 0, v->pix.sizeimage);
 	done->vb.sequence = (u32)atomic_inc_return(&v->sequence_number);
 	done->vb.vb2_buf.timestamp = ktime_get_ns();
+	hws_1chuhd_log(hws,
+		       "frame-done ch=%d buf=%p seq=%u size=%u next=%p",
+		       v->channel_index, done, done->vb.sequence,
+		       v->pix.sizeimage, v->active);
 	vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
 }
 
