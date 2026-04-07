@@ -51,6 +51,81 @@ static inline u32 hws_dev_max_height(const struct hws_pcie_dev *pdev)
 		MAX_VIDEO_HW_H;
 }
 
+static inline unsigned int hws_scratch_slot_count(const struct hws_pcie_dev *hws)
+{
+	return hws && hws->uses_sliced_dma ? 4U : hws->cur_max_video_ch;
+}
+
+static void hws_calc_slice_sizes(size_t total, u32 phys_sizes[4], u32 copy_sizes[4])
+{
+	const u32 align = 16U * 128U;
+	u32 base, tail_copy, tail_phys;
+
+	if (!total)
+		total = HWS_FHD_FRAME_SIZE;
+
+	base = ((u32)total / (4U * align)) * align;
+	if (!base)
+		base = rounddown((u32)total / 4U, align);
+
+	tail_copy = (u32)total - (base * 3U);
+	tail_phys = ALIGN(tail_copy, align);
+
+	phys_sizes[0] = base;
+	phys_sizes[1] = base;
+	phys_sizes[2] = base;
+	phys_sizes[3] = tail_phys;
+
+	copy_sizes[0] = base;
+	copy_sizes[1] = base;
+	copy_sizes[2] = base;
+	copy_sizes[3] = tail_copy;
+}
+
+static void hws_program_sliced_dma_layout(struct hws_video *vid)
+{
+	const u32 addr_mask = PCI_E_BAR_ADD_MASK;
+	const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;
+	struct hws_pcie_dev *hws;
+	u32 phys_sizes[4], copy_sizes[4];
+	unsigned int slot;
+
+	if (!vid || !vid->parent || !vid->parent->uses_sliced_dma)
+		return;
+
+	hws = vid->parent;
+	hws_calc_slice_sizes(vid->pix.sizeimage, phys_sizes, copy_sizes);
+
+	for (slot = 0; slot < 4; slot++) {
+		dma_addr_t paddr;
+		u32 lo, hi, pci_addr_low;
+
+		if (!hws->scratch_vid[slot].cpu)
+			continue;
+
+		paddr = hws->scratch_vid[slot].dma;
+		lo = lower_32_bits(paddr);
+		hi = upper_32_bits(paddr);
+		pci_addr_low = lo & addr_low_mask;
+		lo &= addr_mask;
+
+		writel_relaxed(hi,
+			       hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + slot * 8);
+		writel_relaxed(lo,
+			       hws->bar0_base + PCI_ADDR_TABLE_BASE + 0x208 + slot * 8 +
+			       PCIE_BARADDROFSIZE);
+		writel_relaxed((slot + 1U) * PCIEBAR_AXI_BASE + pci_addr_low,
+			       hws->bar0_base + CVBS_IN_BUF_BASE +
+			       slot * PCIE_BARADDROFSIZE);
+		writel_relaxed(phys_sizes[slot] / 16U,
+			       hws->bar0_base + CVBS_IN_BUF_BASE2 +
+			       slot * PCIE_BARADDROFSIZE);
+	}
+
+	(void)copy_sizes;
+	(void)readl(hws->bar0_base + CVBS_IN_BUF_BASE2 + 3 * PCIE_BARADDROFSIZE);
+}
+
 /* DMA helper functions */
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
@@ -163,7 +238,6 @@ void hws_prime_next_locked(struct hws_video *vid)
 {
 	struct hws_pcie_dev *hws;
 	struct hwsvideo_buffer *next;
-	dma_addr_t dma;
 
 	if (!vid)
 		return;
@@ -180,6 +254,16 @@ void hws_prime_next_locked(struct hws_video *vid)
 		return;
 
 	vid->next_prepared = next;
+	if (hws->uses_sliced_dma) {
+		dev_dbg(&hws->pdev->dev,
+			"ch%u pre-staged next sliced buffer %p\n",
+			vid->channel_index, next);
+		return;
+	}
+
+	{
+		dma_addr_t dma;
+
 	dma = vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
 	hws_program_dma_for_addr(hws, vid->channel_index, dma);
 	iowrite32(lower_32_bits(dma),
@@ -187,6 +271,7 @@ void hws_prime_next_locked(struct hws_video *vid)
 	dev_dbg(&hws->pdev->dev,
 		"ch%u pre-armed next buffer %p dma=0x%llx\n",
 		vid->channel_index, next, (u64)dma);
+	}
 }
 
 static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
@@ -249,12 +334,17 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 	if (have_next && next) {
-		dma_addr_t dma =
-		    vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
-		hws_program_dma_for_addr(hws, v->channel_index, dma);
-		hws_set_dma_doorbell(hws, v->channel_index, dma,
-				     tag ? tag : "nosignal_zero");
-		doorbell = true;
+		if (hws->uses_sliced_dma) {
+			hws_program_sliced_dma_layout(v);
+			doorbell = true;
+		} else {
+			dma_addr_t dma =
+			    vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
+			hws_program_dma_for_addr(hws, v->channel_index, dma);
+			hws_set_dma_doorbell(hws, v->channel_index, dma,
+					     tag ? tag : "nosignal_zero");
+			doorbell = true;
+		}
 	}
 	if (doorbell) {
 		wmb(); /* ensure descriptors visible before enabling capture */
@@ -361,6 +451,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->cap_active = false;
 	vid->stop_requested = false;
 	vid->last_buf_half_toggle = 0;
+	vid->slice_banks_done = 0;
 	vid->half_seen = false;
 	vid->signal_loss_cnt = 0;
 
@@ -524,6 +615,11 @@ void hws_program_dma_for_addr(struct hws_pcie_dev *hws, unsigned int ch,
 {
 	struct hws_video *vid = &hws->video[ch];
 
+	if (hws->uses_sliced_dma) {
+		hws_program_sliced_dma_layout(vid);
+		return;
+	}
+
 	hws_program_dma_window(vid, dma);
 }
 
@@ -560,9 +656,14 @@ static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
 	if (!hws->cur_max_video_ch || hws->cur_max_video_ch > hws->max_channels)
 		hws->cur_max_video_ch = hws->max_channels;
 
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++, table += 8) {
+	for (ch = 0; ch < hws_scratch_slot_count(hws); ch++, table += 8) {
 		if (!hws->scratch_vid[ch].cpu)
 			continue;
+
+		if (hws->uses_sliced_dma) {
+			hws_program_sliced_dma_layout(&hws->video[0]);
+			break;
+		}
 
 		/* Program 64-bit BAR remap entry for this channel */
 		{
@@ -945,12 +1046,16 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	/* Program HW with new resolution */
 	hws_write_if_diff(pdx, HWS_REG_OUT_RES(ch), (h << 16) | w);
-
-	/* Legacy half-buffer programming */
-	writel(v->pix.half_size / 16,
-	       pdx->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-	(void)readl(pdx->bar0_base + CVBS_IN_BUF_BASE2 +
-		    ch * PCIE_BARADDROFSIZE);
+	if (pdx->uses_sliced_dma) {
+		v->slice_banks_done = 0;
+		hws_program_sliced_dma_layout(v);
+	} else {
+		/* Legacy half-buffer programming */
+		writel(v->pix.half_size / 16,
+		       pdx->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
+		(void)readl(pdx->bar0_base + CVBS_IN_BUF_BASE2 +
+			    ch * PCIE_BARADDROFSIZE);
+	}
 
 	/* Reset per-channel toggles/counters */
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
@@ -1127,6 +1232,9 @@ static int hws_buffer_prepare(struct vb2_buffer *vb)
 		return -EINVAL;
 	}
 
+	if (hws->uses_sliced_dma && !vb2_plane_vaddr(vb, 0))
+		return -EINVAL;
+
 	vb2_set_plane_payload(vb, 0, need);
 	return 0;
 }
@@ -1152,8 +1260,6 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 
 	/* If streaming and no in-flight buffer, prime HW immediately */
 	if (READ_ONCE(vid->cap_active) && !vid->active) {
-		dma_addr_t dma_addr;
-
 		dev_dbg(&hws->pdev->dev,
 			"buffer_queue(ch=%u): priming first vb=%p\n",
 			vid->channel_index, &buf->vb.vb2_buf);
@@ -1161,11 +1267,17 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 		vid->queued_count--;
 		vid->active = buf;
 
-		dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		hws_program_dma_for_addr(vid->parent, vid->channel_index,
-					 dma_addr);
-		iowrite32(lower_32_bits(dma_addr),
-			  hws->bar0_base + HWS_REG_DMA_ADDR(vid->channel_index));
+		if (!hws->uses_sliced_dma) {
+			dma_addr_t dma_addr;
+
+			dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+			hws_program_dma_for_addr(vid->parent, vid->channel_index,
+						 dma_addr);
+			iowrite32(lower_32_bits(dma_addr),
+				  hws->bar0_base + HWS_REG_DMA_ADDR(vid->channel_index));
+		} else {
+			hws_program_sliced_dma_layout(vid);
+		}
 
 		wmb(); /* ensure descriptors visible before enabling capture */
 		hws_enable_video_capture(hws, vid->channel_index, true);
@@ -1225,6 +1337,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	WRITE_ONCE(v->cap_active, true);
 	WRITE_ONCE(v->half_seen, false);
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
+	WRITE_ONCE(v->slice_banks_done, 0);
 
 	/* Try to prime a buffer, but it's OK if none are queued yet */
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -1245,7 +1358,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (to_program) {
 		if (!prog_vb2)
 			prog_vb2 = &to_program->vb.vb2_buf;
-		{
+		if (!hws->uses_sliced_dma) {
 			dma_addr_t dma_addr;
 
 			dma_addr = vb2_dma_contig_plane_dma_addr(prog_vb2, 0);
@@ -1258,6 +1371,8 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 				v->channel_index, to_program,
 				lower_32_bits(dma_addr));
 			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		} else {
+			hws_program_sliced_dma_layout(v);
 		}
 
 		wmb(); /* ensure descriptors visible before enabling capture */
@@ -1413,7 +1528,8 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q = &ch->buffer_queue;
 		memset(q, 0, sizeof(*q));
 		q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		q->io_modes = VB2_MMAP | VB2_DMABUF;
+		q->io_modes = dev->uses_sliced_dma ? VB2_MMAP :
+			VB2_MMAP | VB2_DMABUF;
 		q->drv_priv = ch;
 		q->buf_struct_size = sizeof(struct hwsvideo_buffer);
 		q->ops = &hwspcie_video_qops;	/* your vb2_ops */

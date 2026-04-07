@@ -21,6 +21,98 @@ module_param_named(toggle_debug, hws_toggle_debug, bool, 0644);
 MODULE_PARM_DESC(toggle_debug,
 		 "Read toggle registers in IRQ handler for debug logging");
 
+static void hws_calc_slice_sizes(size_t total, u32 copy_sizes[4])
+{
+	const u32 align = 16U * 128U;
+	u32 base;
+
+	if (!total)
+		total = HWS_FHD_FRAME_SIZE;
+
+	base = ((u32)total / (4U * align)) * align;
+	if (!base)
+		base = rounddown((u32)total / 4U, align);
+
+	copy_sizes[0] = base;
+	copy_sizes[1] = base;
+	copy_sizes[2] = base;
+	copy_sizes[3] = (u32)total - (base * 3U);
+}
+
+static int hws_copy_sliced_bank(struct hws_video *v, u8 toggle)
+{
+	struct hws_pcie_dev *hws = v->parent;
+	struct hwsvideo_buffer *active = v->active;
+	struct vb2_v4l2_buffer *vb2v;
+	void *dst;
+	u32 copy_sizes[4];
+	u32 slot0, slot1, off0, off1;
+
+	if (!active)
+		return -ENOENT;
+
+	vb2v = &active->vb;
+	dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+	if (!dst)
+		return -ENOMEM;
+
+	hws_calc_slice_sizes(v->pix.sizeimage, copy_sizes);
+	if (toggle) {
+		slot0 = 0;
+		slot1 = 1;
+		off0 = 0;
+		off1 = copy_sizes[0];
+		v->slice_banks_done |= BIT(0);
+	} else {
+		slot0 = 2;
+		slot1 = 3;
+		off0 = copy_sizes[0] + copy_sizes[1];
+		off1 = off0 + copy_sizes[2];
+		v->slice_banks_done |= BIT(1);
+	}
+
+	dma_sync_single_for_cpu(&hws->pdev->dev, hws->scratch_vid[slot0].dma,
+				hws->scratch_vid[slot0].size, DMA_FROM_DEVICE);
+	dma_sync_single_for_cpu(&hws->pdev->dev, hws->scratch_vid[slot1].dma,
+				hws->scratch_vid[slot1].size, DMA_FROM_DEVICE);
+
+	memcpy(dst + off0, hws->scratch_vid[slot0].cpu, copy_sizes[slot0]);
+	memcpy(dst + off1, hws->scratch_vid[slot1].cpu, copy_sizes[slot1]);
+
+	return 0;
+}
+
+static void hws_video_handle_sliced_vdone(struct hws_video *v)
+{
+	struct hws_pcie_dev *hws = v->parent;
+	unsigned long flags;
+	struct hwsvideo_buffer *done = NULL;
+	u8 toggle;
+	int ret;
+
+	toggle = readl_relaxed(hws->bar0_base + HWS_REG_VBUF_TOGGLE(v->channel_index)) & 0x01;
+
+	spin_lock_irqsave(&v->irq_lock, flags);
+	ret = hws_copy_sliced_bank(v, toggle);
+	if (!ret && v->slice_banks_done == (BIT(0) | BIT(1))) {
+		done = v->active;
+		v->active = v->next_prepared;
+		v->next_prepared = NULL;
+		v->slice_banks_done = 0;
+	}
+	if (v->active)
+		hws_prime_next_locked(v);
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+
+	if (ret || !done)
+		return;
+
+	vb2_set_plane_payload(&done->vb.vb2_buf, 0, v->pix.sizeimage);
+	done->vb.sequence = (u32)atomic_inc_return(&v->sequence_number);
+	done->vb.vb2_buf.timestamp = ktime_get_ns();
+	vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
+}
+
 static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 {
 	struct hws_video *v = &hws->video[ch];
@@ -59,6 +151,13 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): picked buffer %p\n", ch,
 		buf);
+
+	if (hws->uses_sliced_dma) {
+		spin_lock_irqsave(&v->irq_lock, flags);
+		hws_prime_next_locked(v);
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return 0;
+	}
 
 	/* Publish descriptor(s) before doorbell/MMIO kicks. */
 	wmb();
@@ -119,6 +218,11 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
 		return;
+
+	if (hws->uses_sliced_dma) {
+		hws_video_handle_sliced_vdone(v);
+		return;
+	}
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	done = v->active;

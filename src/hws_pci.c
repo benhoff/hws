@@ -108,6 +108,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 	hdev->max_video_width = 1920;
 	hdev->max_video_height = 1080;
 	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
+	hdev->uses_sliced_dma = false;
 
 	/* select per-chip channel counts */
 	switch (id) {
@@ -119,6 +120,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 		hdev->max_video_height = MAX_VIDEO_HW_H;
 		hdev->max_hw_video_buf_sz =
 			hws_yuyv_frame_bytes(MAX_VIDEO_HW_W, MAX_VIDEO_HW_H);
+		hdev->uses_sliced_dma = true;
 		break;
 	case 0x9534:
 	case 0x6524:
@@ -208,6 +210,7 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->max_video_width = 1920;
 	hdev->max_video_height = 1080;
 	hdev->max_channels = 4;
+	hdev->uses_sliced_dma = false;
 	hdev->buf_allocated = false;
 	hdev->main_task = NULL;
 	hdev->start_run = false;
@@ -279,10 +282,11 @@ static void hws_stop_kthread_action(void *data)
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
-	/* 64 KiB is plenty for a safe dummy; align to 64 for your HW */
-	const size_t need = ALIGN(64 * 1024, 64);
+	int slots = hws->uses_sliced_dma ? 4 : hws->cur_max_video_ch;
+	size_t need = hws->uses_sliced_dma ? MAX_MM_VIDEO_SIZE :
+		ALIGN(64 * 1024, 64);
 
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+	for (ch = 0; ch < slots; ch++) {
 #if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
 		void *cpu = dma_alloc_coherent(&hws->pdev->dev, need,
 					       &hws->scratch_vid[ch].dma,
@@ -314,8 +318,9 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
+	int slots = hws->uses_sliced_dma ? 4 : hws->cur_max_video_ch;
 
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+	for (ch = 0; ch < slots; ch++) {
 		if (hws->scratch_vid[ch].cpu) {
 			dma_free_coherent(&hws->pdev->dev,
 					  hws->scratch_vid[ch].size,
@@ -365,6 +370,9 @@ static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
 static void hws_seed_all_channels(struct hws_pcie_dev *hws)
 {
 	int ch;
+
+	if (hws->uses_sliced_dma)
+		return;
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 		if (hws->scratch_vid[ch].cpu)

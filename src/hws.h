@@ -91,6 +91,7 @@ struct hws_video {
 	bool cap_active;
 	bool stop_requested;
 	u8 last_buf_half_toggle;
+	u8 slice_banks_done;
 	bool half_seen;
 	atomic_t sequence_number;
 	u32 queued_count;
@@ -154,6 +155,7 @@ struct hws_pcie_dev {
 	u16 max_video_height;
 	u8 max_channels;
 	u8 cur_max_video_ch;
+	bool uses_sliced_dma;
 	bool start_run;
 
 	bool buf_allocated;
