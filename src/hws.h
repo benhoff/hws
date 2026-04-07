@@ -150,6 +150,8 @@ struct hws_pcie_dev {
 	// TriState, used in `set_video_format_size`
 	u32 support_yv12;
 	u32 max_hw_video_buf_sz;
+	u16 max_video_width;
+	u16 max_video_height;
 	u8 max_channels;
 	u8 cur_max_video_ch;
 	bool start_run;

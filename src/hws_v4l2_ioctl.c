@@ -213,6 +213,84 @@ static const struct hws_dv_mode hws_dv_modes[] = {
 		},
 		60,
 	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 1920,
+				.height = 1200,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 2560,
+				.height = 1080,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 2560,
+				.height = 1440,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 3840,
+				.height = 2160,
+				.interlaced = 0,
+			},
+		},
+		30,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 3840,
+				.height = 2160,
+				.pixelclock = 594000000,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 4096,
+				.height = 2160,
+				.interlaced = 0,
+			},
+		},
+		30,
+	},
+	{
+		{
+			.type = V4L2_DV_BT_656_1120,
+			.bt = {
+				.width = 4096,
+				.height = 2160,
+				.interlaced = 0,
+			},
+		},
+		60,
+	},
 	/* Portrait */
 	{
 		{
@@ -227,14 +305,64 @@ static const struct hws_dv_mode hws_dv_modes[] = {
 	},
 };
 
-static const size_t hws_dv_modes_cnt = ARRAY_SIZE(hws_dv_modes);
-
 /* YUYV: 16 bpp; align to 64 as you did elsewhere */
 static inline u32 hws_calc_bpl_yuyv(u32 w)     { return ALIGN(w * 2, 64); }
 static inline u32 hws_calc_size_yuyv(u32 w, u32 h) { return hws_calc_bpl_yuyv(w) * h; }
 static inline u32 hws_calc_half_size(u32 sizeimage)
 {
 	return sizeimage / 2;
+}
+
+static inline u32 hws_dev_max_width(const struct hws_pcie_dev *pdev)
+{
+	return (pdev && pdev->max_video_width) ? pdev->max_video_width :
+		MAX_VIDEO_HW_W;
+}
+
+static inline u32 hws_dev_max_height(const struct hws_pcie_dev *pdev)
+{
+	return (pdev && pdev->max_video_height) ? pdev->max_video_height :
+		MAX_VIDEO_HW_H;
+}
+
+static bool hws_mode_supported_by_dev(const struct hws_pcie_dev *pdev,
+				      const struct hws_dv_mode *mode)
+{
+	const struct v4l2_bt_timings *bt;
+	u32 max_w, max_h;
+	size_t max_frame;
+
+	if (!mode)
+		return false;
+
+	bt = &mode->timings.bt;
+	max_w = hws_dev_max_width(pdev);
+	max_h = hws_dev_max_height(pdev);
+	max_frame = pdev ? pdev->max_hw_video_buf_sz : HWS_UHD_FRAME_SIZE;
+
+	if (bt->width > max_w)
+		return false;
+	if ((!bt->interlaced && bt->height > max_h) ||
+	    (bt->interlaced && (bt->height * 2) > max_h))
+		return false;
+
+	return hws_calc_size_yuyv(bt->width, bt->height) <= max_frame;
+}
+
+static const struct hws_dv_mode *
+hws_nth_dv_mode_for_dev(const struct hws_pcie_dev *pdev, unsigned int index)
+{
+	size_t i;
+	unsigned int visible = 0;
+
+	for (i = 0; i < ARRAY_SIZE(hws_dv_modes); i++) {
+		if (!hws_mode_supported_by_dev(pdev, &hws_dv_modes[i]))
+			continue;
+		if (visible++ == index)
+			return &hws_dv_modes[i];
+	}
+
+	return NULL;
 }
 
 static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,
@@ -443,6 +571,7 @@ int hws_vidioc_enum_dv_timings(struct file *file, void *fh,
 			       struct v4l2_enum_dv_timings *edv)
 {
 	struct hws_video *vid = video_drvdata(file);
+	const struct hws_pcie_dev *pdev = vid ? vid->parent : NULL;
 	const struct hws_dv_mode *m;
 	u32 w, h;
 	u32 fps;
@@ -473,10 +602,11 @@ int hws_vidioc_enum_dv_timings(struct file *file, void *fh,
 		}
 	}
 
-	if (edv->index >= hws_dv_modes_cnt)
+	m = hws_nth_dv_mode_for_dev(pdev, edv->index);
+	if (!m)
 		return -EINVAL;
 
-	edv->timings = hws_dv_modes[edv->index].timings;
+	edv->timings = m->timings;
 	return 0;
 }
 
@@ -541,6 +671,8 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 
 	m = hws_match_supported_dv(timings);
 	if (!m)
+		return -EINVAL;
+	if (!hws_mode_supported_by_dev(vid->parent, m))
 		return -EINVAL;
 
 	bt = &m->timings.bt;
@@ -607,6 +739,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 			      struct v4l2_dv_timings_cap *cap)
 {
+	struct hws_video *vid = video_drvdata(file);
 	u32 min_w = ~0U, min_h = ~0U;
 	u32 max_w = 0,       max_h = 0;
 	size_t i, n = 0;
@@ -621,6 +754,9 @@ int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 		const struct v4l2_bt_timings *bt = &hws_dv_modes[i].timings.bt;
 
 		if (hws_dv_modes[i].timings.type != V4L2_DV_BT_656_1120)
+			continue;
+		if (!hws_mode_supported_by_dev(vid ? vid->parent : NULL,
+					       &hws_dv_modes[i]))
 			continue;
 		n++;
 
@@ -749,9 +885,11 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	struct hws_pcie_dev *pdev = vid ? vid->parent : NULL;
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 	u32 req_w = pix->width, req_h = pix->height;
+	u32 max_w = hws_dev_max_width(pdev);
+	u32 max_h = hws_dev_max_height(pdev);
 	u32 w, h, min_bpl, bpl;
 	size_t size; /* wider than u32 for overflow check */
-	size_t max_frame = pdev ? pdev->max_hw_video_buf_sz : MAX_MM_VIDEO_SIZE;
+	size_t max_frame = pdev ? pdev->max_hw_video_buf_sz : HWS_UHD_FRAME_SIZE;
 
 	/* Only YUYV */
 	pix->pixelformat = V4L2_PIX_FMT_YUYV;
@@ -759,10 +897,10 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	/* Defaults then clamp */
 	w = (req_w ? req_w : 640);
 	h = (req_h ? req_h : 480);
-	if (w > MAX_VIDEO_HW_W)
-		w = MAX_VIDEO_HW_W;
-	if (h > MAX_VIDEO_HW_H)
-		h = MAX_VIDEO_HW_H;
+	if (w > max_w)
+		w = max_w;
+	if (h > max_h)
+		h = max_h;
 	if (!w)
 		w = 640; /* hard fallback in case macros are odd */
 	if (!h)

@@ -39,6 +39,18 @@ static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch);
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced);
 
+static inline u32 hws_dev_max_width(const struct hws_pcie_dev *pdev)
+{
+	return (pdev && pdev->max_video_width) ? pdev->max_video_width :
+		MAX_VIDEO_HW_W;
+}
+
+static inline u32 hws_dev_max_height(const struct hws_pcie_dev *pdev)
+{
+	return (pdev && pdev->max_video_height) ? pdev->max_video_height :
+		MAX_VIDEO_HW_H;
+}
+
 /* DMA helper functions */
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
@@ -320,8 +332,10 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->window_valid = false;
 
 	/* default format (adjust to your HW) */
-	vid->pix.width = 1920;
-	vid->pix.height = 1080;
+	vid->pix.width = hws_dev_max_width(pdev) < 1920 ?
+		hws_dev_max_width(pdev) : 1920;
+	vid->pix.height = hws_dev_max_height(pdev) < 1080 ?
+		hws_dev_max_height(pdev) : 1080;
 	vid->pix.fourcc = V4L2_PIX_FMT_YUYV;
 	vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
 	vid->pix.sizeimage = vid->pix.bytesperline * vid->pix.height;
@@ -839,6 +853,8 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	struct hws_video *v = &pdx->video[ch];
 	unsigned long flags;
 	u32 new_size;
+	u32 max_w = hws_dev_max_width(pdx);
+	u32 max_h = hws_dev_max_height(pdx);
 	bool queue_busy;
 	bool geometry_changed;
 	struct list_head done;
@@ -848,9 +864,9 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		return;
 	if (ch >= pdx->max_channels)
 		return;
-	if (!w || !h || w > MAX_VIDEO_HW_W ||
-	    (!interlaced && h > MAX_VIDEO_HW_H) ||
-	    (interlaced && (h * 2) > MAX_VIDEO_HW_H))
+	if (!w || !h || w > max_w ||
+	    (!interlaced && h > max_h) ||
+	    (interlaced && (h * 2) > max_h))
 		return;
 	if (!fps || fps == 0xFFFFFFFF || fps > 240)
 		fps = (h == 576) ? 50 : 60;
@@ -957,12 +973,14 @@ static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch,
 	u16 res_w = reg & 0xFFFF;
 	u16 res_h = (reg >> 16) & 0xFFFF;
 	struct hws_video *vid = &pdx->video[ch];
+	u32 max_w = hws_dev_max_width(pdx);
+	u32 max_h = hws_dev_max_height(pdx);
 	bool geometry_changed;
 	bool fps_changed;
 
-	bool within_hw = (res_w <= MAX_VIDEO_HW_W) &&
-	    ((!interlace && res_h <= MAX_VIDEO_HW_H) ||
-	     (interlace && (res_h * 2) <= MAX_VIDEO_HW_H));
+	bool within_hw = (res_w <= max_w) &&
+	    ((!interlace && res_h <= max_h) ||
+	     (interlace && (res_h * 2) <= max_h));
 
 	if (!within_hw)
 		return;

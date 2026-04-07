@@ -60,6 +60,12 @@ static const struct pci_device_id hws_pci_table[] = {
 	MAKE_ENTRY(0x1F33, 0x8534, 0x8888, 0x0007, NULL),
 	MAKE_ENTRY(0x1F33, 0x8554, 0x8888, 0x0007, NULL),
 
+	/* HWS HDMI 1CH UHD family. */
+	MAKE_ENTRY(0x8888, 0x8581, 0x8888, 0x0007, NULL),
+	MAKE_ENTRY(0x8888, 0x85A1, 0x8888, 0x0007, NULL),
+	MAKE_ENTRY(0x1F33, 0x8581, 0x8888, 0x0007, NULL),
+	MAKE_ENTRY(0x8888, 0x8591, 0x8888, 0x0007, NULL),
+
 	/* HWS 2x2 HDMI family. */
 	MAKE_ENTRY(0x8888, 0x8524, 0x8888, 0x0007, NULL),
 	/* HWS 2x2 SDI family. */
@@ -89,12 +95,31 @@ static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
 	pcie_capability_set_word(dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
 }
 
+static u32 hws_yuyv_frame_bytes(u32 width, u32 height)
+{
+	return width * height * 2U;
+}
+
 static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 {
 	u16 id = hdev->device_id;
 
+	hdev->cur_max_video_ch = 4;
+	hdev->max_video_width = 1920;
+	hdev->max_video_height = 1080;
+	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
+
 	/* select per-chip channel counts */
 	switch (id) {
+	case 0x8581:
+	case 0x85A1:
+	case 0x8591:
+		hdev->cur_max_video_ch = 1;
+		hdev->max_video_width = MAX_VIDEO_HW_W;
+		hdev->max_video_height = MAX_VIDEO_HW_H;
+		hdev->max_hw_video_buf_sz =
+			hws_yuyv_frame_bytes(MAX_VIDEO_HW_W, MAX_VIDEO_HW_H);
+		break;
 	case 0x9534:
 	case 0x6524:
 	case 0x8524:
@@ -112,13 +137,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 	case 0x8501:
 		hdev->cur_max_video_ch = 1;
 		break;
-	default:
-		hdev->cur_max_video_ch = 4;
-		break;
 	}
-
-	/* universal buffer capacity */
-	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
 
 	/* decide hardware-version and program DMA max size if needed */
 	if (hdev->device_ver > 121) {
@@ -126,7 +145,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 			hdev->hw_ver = 0;
 		} else {
 			hdev->hw_ver = 1;
-			u32 dma_max = (u32)(MAX_VIDEO_SCALER_SIZE / 16);
+			u32 dma_max = hdev->max_hw_video_buf_sz / 16;
 
 			writel(dma_max, hdev->bar0_base + HWS_REG_DMA_MAX_SIZE);
 			/* readback to flush posted MMIO write */
@@ -186,6 +205,8 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->port_id = FIELD_GET(DEVINFO_PORTID, reg);
 
 	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
+	hdev->max_video_width = 1920;
+	hdev->max_video_height = 1080;
 	hdev->max_channels = 4;
 	hdev->buf_allocated = false;
 	hdev->main_task = NULL;

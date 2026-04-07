@@ -37,9 +37,15 @@
 
 #define MAX_MM_VIDEO_SIZE            SZ_4M
 
-#define MAX_VIDEO_HW_W 1920
-#define MAX_VIDEO_HW_H 1080
-#define MAX_VIDEO_SCALER_SIZE     (1920U * 1080U * 2U)
+/*
+ * Family-wide geometry ceiling. Individual boards clamp below this via the
+ * per-device capability fields populated in probe.
+ */
+#define MAX_VIDEO_HW_W 4096U
+#define MAX_VIDEO_HW_H 2160U
+
+#define HWS_FHD_FRAME_SIZE           (1920U * 1080U * 2U)
+#define HWS_UHD_FRAME_SIZE           (4096U * 2160U * 2U)
 
 #define MIN_VAMP_BRIGHTNESS_UNITS   0
 #define MAX_VAMP_BRIGHTNESS_UNITS   0xff
