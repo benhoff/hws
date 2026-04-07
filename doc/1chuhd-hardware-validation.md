@@ -40,17 +40,16 @@ hardware.
 
 ## Preferred Log Collection
 
-Run the collector script after building the module:
+Run the collector script:
 
 ```sh
-make -C /lib/modules/$(uname -r)/build M=$PWD/src modules
-chmod +x ./collect_1chuhd_logs.sh
 ./collect_1chuhd_logs.sh
 ```
 
-The script reloads the module with `trace_1chuhd=1`, captures probe and
-streaming logs, runs the key `v4l2-ctl` queries, and writes everything to a
-timestamped directory under `/tmp`.
+The script builds the module, reloads it with `trace_1chuhd=1`, captures probe
+and streaming logs, runs the key `v4l2-ctl` queries, and writes everything to
+a timestamped directory under `/tmp`. By default it also creates a `.tar.gz`
+archive next to that directory for easy return.
 
 If the source cannot generate every default mode, pass only the supported
 modes, for example:
@@ -117,7 +116,8 @@ Relevant trace lines in `dmesg` are prefixed with `1chuhd:` and should show:
 
 ## What To Send Back
 
-- the result directory from `./collect_1chuhd_logs.sh`
+- the `.tar.gz` archive from `./collect_1chuhd_logs.sh`
+- or the full result directory if you skipped packaging
 - whether each tested mode produced a correct image
 - whether any mode showed slice ordering issues, duplicated halves, or
   interlace artifacts

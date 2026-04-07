@@ -9,12 +9,82 @@ Branch:
 feat/1chuhd-video-only-port
 ```
 
+Target hardware:
+
+- `8888:8581`
+- `1f33:8581`
+- `8888:85a1`
+- `8888:8591`
+
 Scope:
 
 - same-driver support for the `1CHUHD` PCI IDs
 - video capture only
 - no audio support
 - no software scaling requirement
+
+## Quick Start For A Hardware Tester
+
+If you have one of the boards above and a live HDMI source connected, this is
+the fastest path:
+
+```sh
+git checkout feat/1chuhd-video-only-port
+./collect_1chuhd_logs.sh
+```
+
+That script builds the module, reloads it with extra tracing, runs the main
+capture tests, and creates a timestamped log directory under `/tmp` plus a
+`.tar.gz` archive you can send back.
+
+Please send back:
+
+- the generated `.tar.gz` file
+- a short note saying which tested modes showed a correct image
+- any visible failures such as reordered quadrants, duplicated halves,
+  corrupted stripes, no signal, or interlace artifacts
+
+## Tester Prerequisites
+
+The tester should have:
+
+- one of the target `1CHUHD` boards installed
+- a live HDMI source available for testing
+- Linux kernel headers for the running kernel
+- `make`
+- `sudo`
+- `v4l2-ctl`
+- `lspci`
+
+If `v4l2-ctl` is missing, it is usually provided by the `v4l-utils` package.
+
+## What The Script Does
+
+`./collect_1chuhd_logs.sh` will:
+
+- detect whether a matching target PCI ID is present
+- build `src/HwsCapture.ko` unless `--no-build` is given
+- reload the module with `trace_1chuhd=1`
+- auto-detect the HWS video node when possible
+- run `v4l2-ctl` capability, format, and DV timing queries
+- run MMAP streaming tests for `1920x1080`, `3840x2160`, and `4096x2160` by default
+- capture `dmesg` and all command output
+- package the results into a `.tar.gz` archive for easy return
+
+If the test source cannot produce every default mode, pass only the supported
+modes:
+
+```sh
+./collect_1chuhd_logs.sh 1920x1080 3840x2160
+```
+
+Useful options:
+
+```sh
+./collect_1chuhd_logs.sh --help
+./collect_1chuhd_logs.sh -d /dev/video2
+./collect_1chuhd_logs.sh --no-build
+```
 
 ## Current Status
 
@@ -26,9 +96,9 @@ Implemented in this branch:
 - CPU-side frame assembly from the sliced DMA banks
 - structured trace logging for probe, slice layout, bank completion, and
   frame completion
-- a log collection script for hardware validation handoff
+- a hardware-validation collector script for external testers
 
-Not finished yet:
+Still open:
 
 - real hardware validation
 - confirming bank ordering on the actual board
@@ -37,54 +107,6 @@ Not finished yet:
 - confirming whether the `support_yv12` bit requires a missing format path
 - deciding whether `MMAP` is enough or whether `DMABUF` must be restored for
   this board
-
-## What You Need
-
-If you do not have the hardware yourself, hand this branch to someone who
-does and ask them to:
-
-1. Build the module from this branch.
-2. Run the collector script.
-3. Send back the generated result directory and a short note about image
-   correctness for each tested mode.
-
-The main evidence needed is:
-
-- whether `1920x1080`, `3840x2160`, and `4096x2160` stream correctly
-- whether any mode shows reordered quadrants, duplicated halves, or other
-  slice assembly errors
-- whether interlaced input behaves differently
-
-## Build
-
-```sh
-make -C /lib/modules/$(uname -r)/build M=$PWD/src modules
-```
-
-## Hardware Validation
-
-Run:
-
-```sh
-./collect_1chuhd_logs.sh
-```
-
-If the source cannot generate every default mode, pass only the supported
-modes:
-
-```sh
-./collect_1chuhd_logs.sh 1920x1080 3840x2160
-```
-
-The script will:
-
-- reload the module with `trace_1chuhd=1`
-- run the key `v4l2-ctl` capability and DV timing queries
-- stream test the requested modes with `MMAP`
-- capture `dmesg` and per-mode command output into a timestamped directory
-  under `/tmp`
-
-Send that whole result directory back.
 
 ## Important Files
 
