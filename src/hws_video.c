@@ -332,7 +332,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->pix.xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	vid->pix.interlaced = false;
 	vid->pix.half_size = vid->pix.sizeimage / 2;
-	vid->alloc_sizeimage = vid->pix.sizeimage;
 	hws_set_current_dv_timings(vid, vid->pix.width,
 				   vid->pix.height, vid->pix.interlaced);
 	vid->current_fps = 60;
@@ -838,7 +837,6 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 {
 	struct hws_video *v = &pdx->video[ch];
 	unsigned long flags;
-	u32 new_size;
 	bool queue_busy;
 	bool geometry_changed;
 	struct list_head done;
@@ -906,7 +904,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	hws_set_current_dv_timings(v, w, h, interlaced);
 	v->current_fps = fps;
 
-	new_size = hws_calc_sizeimage(v, w, h, interlaced);
+	hws_calc_sizeimage(v, w, h, interlaced);
 	v->window_valid = false;
 
 	/* Geometry changes require userspace renegotiation once buffers exist.
@@ -923,7 +921,6 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		v4l2_event_queue(v->video_device, &ev);
 		vb2_queue_error(&v->buffer_queue);
 	} else {
-		v->alloc_sizeimage = PAGE_ALIGN(new_size);
 		WRITE_ONCE(v->stop_requested, false);
 	}
 
@@ -1047,7 +1044,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced)
 {
-	/* example for packed 16bpp (YUYV); replace with your real math/align */
+	/* HWS captures packed YUYV only; stride is 16 bpp aligned to 64 bytes. */
 	u32 lines = h;		/* full frame lines for sizeimage */
 	u32 bytesperline = ALIGN(w * 2, 64);
 	u32 sizeimage, half0;
@@ -1071,22 +1068,14 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 {
 	struct hws_video *vid = q->drv_priv;
 
-	(void)num_buffers;
-	(void)alloc_devs;
-
-	if (!vid->pix.sizeimage) {
-		vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
-		vid->pix.sizeimage = vid->pix.bytesperline * vid->pix.height;
-	}
 	if (*nplanes) {
 		if (sizes[0] < vid->pix.sizeimage)
 			return -EINVAL;
 	} else {
 		*nplanes = 1;
-		sizes[0] = PAGE_ALIGN(vid->pix.sizeimage);
+		sizes[0] = vid->pix.sizeimage;
 	}
 
-	vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
 	return 0;
 }
 

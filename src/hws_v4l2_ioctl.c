@@ -429,7 +429,7 @@ int hws_vidioc_query_dv_timings(struct file *file, void *fh,
 	w = vid->pix.width;
 	h = vid->pix.height;
 	interlace = vid->pix.interlaced;
-	(void)hws_get_live_dv_geometry(vid, &w, &h, &interlace);
+	hws_get_live_dv_geometry(vid, &w, &h, &interlace);
 	fps = hws_get_live_fps(vid);
 	if (!fps)
 		fps = vid->current_fps ? vid->current_fps :
@@ -596,8 +596,6 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->cur_dv_timings   = m->timings;
 	vid->current_fps      = m->refresh_hz;
-	if (!was_busy)
-		vid->alloc_sizeimage = vid->pix.sizeimage;
 	return ret;
 }
 
@@ -863,13 +861,10 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	 * hws_calc_sizeimage(vid, vid->pix.width, vid->pix.height, false);
 	 */
 
-	/* Refresh vb2 watermark when idle */
-	if (!vb2_is_busy(&vid->buffer_queue))
-		vid->alloc_sizeimage = PAGE_ALIGN(vid->pix.sizeimage);
 	dev_dbg(&vid->parent->pdev->dev,
-		"s_fmt:   w=%u h=%u bpl=%u size=%u alloc=%u\n",
+		"s_fmt:   w=%u h=%u bpl=%u size=%u\n",
 		vid->pix.width, vid->pix.height, vid->pix.bytesperline,
-		vid->pix.sizeimage, vid->alloc_sizeimage);
+		vid->pix.sizeimage);
 
 	return 0;
 }

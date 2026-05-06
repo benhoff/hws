@@ -85,7 +85,6 @@ struct hws_video {
 	struct hws_pix_state pix;
 	struct v4l2_dv_timings cur_dv_timings; /* last configured/notified DV timings */
 	u32 current_fps; /* Hz, updated by mode changes, not by read-only queries */
-	u32 alloc_sizeimage;
 
 	/* ───── per-channel capture state ───── */
 	bool cap_active;
