@@ -552,7 +552,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 
 	lockdep_assert_held(&vid->state_lock);
 	live_present = hws_get_live_dv_geometry(vid, &live_w, &live_h,
-						      &live_interlaced);
+						&live_interlaced);
 
 	/* If vb2 has active buffers and size would change, reject. */
 	was_busy = vb2_is_busy(&vid->buffer_queue);
@@ -571,8 +571,8 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 		live_fps = hws_get_live_fps(vid);
 		if (!live_fps)
 			live_fps = vid->current_fps ? vid->current_fps :
-				   hws_pick_fps_from_mode(live_w, live_h,
-							   live_interlaced);
+					hws_pick_fps_from_mode(live_w, live_h,
+							       live_interlaced);
 		if (live_w == new_w && live_h == new_h &&
 		    live_interlaced == interlaced &&
 		    m->refresh_hz == live_fps)
@@ -590,7 +590,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 
 	hws_set_colorimetry_state(&vid->pix);
 
-	/* Recompute stride/sizeimage/half_size using your helper */
+	/* Recompute stride, sizeimage, and half_size. */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
 	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
@@ -645,7 +645,7 @@ int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 	cap->bt.standards =
 		V4L2_DV_BT_STD_CEA861 | V4L2_DV_BT_STD_DMT | V4L2_DV_BT_STD_CVT;
 
-	/* Progressive only, unless your table includes interlaced entries. */
+	/* Only progressive modes are advertised. */
 	cap->bt.capabilities = V4L2_DV_BT_CAP_PROGRESSIVE;
 
 	/* Leave pixelclock/porch limits unconstrained (0) for now. */
@@ -849,7 +849,7 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	vid->pix.quantization = f->fmt.pix.quantization;
 	vid->pix.xfer_func    = f->fmt.pix.xfer_func;
 
-	/* Update sizes (use helper if you prefer strict alignment math) */
+	/* Update negotiated buffer sizes. */
 	vid->pix.bytesperline = f->fmt.pix.bytesperline; /* aligned */
 	vid->pix.sizeimage    = f->fmt.pix.sizeimage;    /* logical */
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);

@@ -212,7 +212,7 @@ static int main_ks_thread_handle(void *data)
 	set_freezable();
 
 	while (!kthread_should_stop()) {
-		/* If we’re suspending, don’t touch hardware; just sleep/freeeze */
+		/* If we're suspending, don't touch hardware; just sleep/freeze. */
 		if (READ_ONCE(pdx->suspended)) {
 			try_to_freeze();
 			schedule_timeout_interruptible(msecs_to_jiffies(1000));
@@ -258,7 +258,7 @@ static void hws_stop_kthread_action(void *data)
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
-	/* 64 KiB is plenty for a safe dummy; align to 64 for your HW */
+	/* 64 KiB is plenty for a safe dummy; hardware needs 64-byte alignment. */
 	const size_t need = ALIGN(64 * 1024, 64);
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
@@ -327,7 +327,7 @@ static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
 		       hws->bar0_base + CVBS_IN_BUF_BASE +
 		       ch * PCIE_BARADDROFSIZE);
 
-	/* half size: use either the current format’s half or half of scratch */
+	/* Half size: use either the current format's half or half of scratch. */
 	{
 		u32 half = hws->video[ch].pix.half_size ?
 			hws->video[ch].pix.half_size :
@@ -428,7 +428,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_dbg(&pdev->dev, "Using 64-bit DMA mask\n");
 	}
 
-	/* 3) Optional PCIe tuning (same as before) */
+	/* 3) Apply optional PCIe tuning. */
 	enable_pcie_relaxed_ordering(pdev);
 #ifdef CONFIG_ARCH_TI816X
 	pcie_set_readrq(pdev, 128);
@@ -454,7 +454,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	if (!ret)
 		hws_seed_all_channels(hws);
 
-	/* 7) Start-run sequence (like InitVideoSys) */
+	/* 7) Start-run sequence. */
 	hws_init_video_sys(hws, false);
 
 	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
@@ -573,7 +573,7 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 }
 
-/* Publish stop so ISR/BH won’t touch video buffers anymore. */
+/* Publish stop so ISR/BH will not touch video buffers anymore. */
 static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 {
 	unsigned int i;
@@ -708,15 +708,15 @@ static void hws_remove(struct pci_dev *pdev)
 	hws_block_hotpaths(hws);
 	hws_stop_kthread_action(hws);
 
-	/* Stop hardware / capture cleanly (your helper) */
+	/* Stop hardware and capture cleanly. */
 	hws_stop_device(hws);
 
-	/* Unregister subsystems you registered */
+	/* Unregister V4L2 resources. */
 	hws_video_unregister(hws);
 
 	/* Release seeded DMA buffers */
 	hws_free_seed_buffers(hws);
-	/* kthread is stopped by the devm action you added in probe */
+	/* kthread is stopped by the devm action registered in probe. */
 	hws_log_lifecycle_snapshot(hws, "remove", "end");
 	dev_info(&pdev->dev, "lifecycle:remove done (%lluus)\n",
 		 hws_elapsed_us(start_ns));

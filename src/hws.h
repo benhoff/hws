@@ -37,7 +37,7 @@ struct hws_pix_state {
 	enum v4l2_quantization quantization;	/* V4L2_QUANTIZATION_LIM_RANGE */
 	enum v4l2_xfer_func xfer_func;	/* V4L2_XFER_FUNC_DEFAULT */
 	bool interlaced;	/* cached hardware state */
-	u32 half_size;		/* optional: if your HW needs it */
+	u32 half_size;		/* hardware half-frame size */
 };
 
 #define	UNSET	(-1U)
@@ -49,12 +49,12 @@ struct hws_video;
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
-	int slot;		/* for two-buffer approach */
+	int slot;
 };
 
 struct hws_video {
-	/* ───── linkage ───── */
-	struct hws_pcie_dev *parent;	/* parent device */
+	/* Linkage */
+	struct hws_pcie_dev *parent;
 	struct video_device *video_device;
 
 	struct vb2_queue buffer_queue;
@@ -62,31 +62,32 @@ struct hws_video {
 	struct hwsvideo_buffer *active;
 	struct hwsvideo_buffer *next_prepared;
 
-	/* ───── locking ───── */
-	struct mutex state_lock;	/* primary state */
-	spinlock_t irq_lock;	/* ISR-side */
+	/* Locking */
+	struct mutex state_lock;
+	spinlock_t irq_lock;	/* Protects capture_queue and active buffers. */
 
-	/* ───── indices ───── */
+	/* Indices */
 	int channel_index;
 
-	/* ───── colour controls ───── */
+	/* Color controls */
 	int current_brightness;
 	int current_contrast;
 	int current_saturation;
 	int current_hue;
 
-	/* ───── V4L2 controls ───── */
+	/* V4L2 controls */
 	struct v4l2_ctrl_handler control_handler;
 	struct v4l2_ctrl *ctrl_brightness;
 	struct v4l2_ctrl *ctrl_contrast;
 	struct v4l2_ctrl *ctrl_saturation;
 	struct v4l2_ctrl *ctrl_hue;
-	/* ───── capture queue status ───── */
+
+	/* Capture queue status */
 	struct hws_pix_state pix;
 	struct v4l2_dv_timings cur_dv_timings; /* last configured/notified DV timings */
 	u32 current_fps; /* Hz, updated by mode changes, not by read-only queries */
 
-	/* ───── per-channel capture state ───── */
+	/* Per-channel capture state */
 	bool cap_active;
 	bool stop_requested;
 	u8 last_buf_half_toggle;
@@ -94,7 +95,7 @@ struct hws_video {
 	atomic_t sequence_number;
 	u32 queued_count;
 
-	/* ───── timeout and error handling ───── */
+	/* Timeout and error handling */
 	u32 timeout_count;
 	u32 error_count;
 
@@ -104,7 +105,7 @@ struct hws_video {
 	u32 last_pci_addr;
 	u32 last_half16;
 
-	/* ───── misc counters ───── */
+	/* Misc counters */
 	int signal_loss_cnt;
 };
 
@@ -132,21 +133,21 @@ struct hws_scratch_dma {
 };
 
 struct hws_pcie_dev {
-	/* ───── core objects ───── */
+	/* Core objects */
 	struct pci_dev *pdev;
 	struct hws_video video[MAX_VID_CHANNELS];
 
-	/* ───── BAR & workqueues ───── */
+	/* BAR and workqueues */
 	void __iomem *bar0_base;
 
-	/* ───── device identity / capabilities ───── */
+	/* Device identity and capabilities */
 	u16 vendor_id;
 	u16 device_id;
 	u16 device_ver;
 	u16 hw_ver;
 	u32 sub_ver;
 	u32 port_id;
-	// TriState, used in `set_video_format_size`
+	/* Tri-state support flag used by set_video_format_size(). */
 	u32 support_yv12;
 	u32 max_hw_video_buf_sz;
 	u8 max_channels;
@@ -155,19 +156,18 @@ struct hws_pcie_dev {
 
 	bool buf_allocated;
 
-	/* ───── V4L2 framework objects ───── */
+	/* V4L2 framework objects */
 	struct v4l2_device v4l2_device;
 
-	/* ───── kernel thread ───── */
+	/* Kernel thread */
 	struct task_struct *main_task;
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int irq;
 
-	/* ───── error flags ───── */
+	/* Error flags */
 	int pci_lost;
-
 };
 
 #endif
