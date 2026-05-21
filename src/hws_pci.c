@@ -802,7 +802,7 @@ static int main_ks_thread_handle(void *data)
 	set_freezable();
 
 	while (!kthread_should_stop()) {
-		/* If we’re suspending, don’t touch hardware; just sleep/freeeze */
+		/* If we're suspending, don't touch hardware; just sleep/freeze. */
 		if (READ_ONCE(pdx->suspended)) {
 			try_to_freeze();
 			schedule_timeout_interruptible(msecs_to_jiffies(1000));
@@ -848,16 +848,9 @@ static void hws_stop_kthread_action(void *data)
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
-	size_t need;
+	/* 64 KiB is plenty for a safe video dummy; hardware needs 64-byte alignment. */
+	const size_t need = ALIGN(64 * 1024, 64);
 	size_t aud_need = ALIGN(hws->audio_pkt_size * 2, 64);
-
-	/*
-	 * Baseline reserved a full hardware-sized video DMA region per channel
-	 * and placed audio at the tail of that region. Keep the same backing
-	 * size here so the shared channel window matches baseline geometry.
-	 */
-	need = ALIGN(hws->max_hw_video_buf_sz ? hws->max_hw_video_buf_sz :
-		     MAX_MM_VIDEO_SIZE, 64);
 
 	/*
 	 * Baseline reserved a 10 KiB capture window per audio input. The
@@ -963,7 +956,7 @@ static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
 		       hws->bar0_base + CVBS_IN_BUF_BASE +
 		       ch * PCIE_BARADDROFSIZE);
 
-	/* half size: use either the current format’s half or half of scratch */
+	/* Half size: use either the current format's half or half of scratch. */
 	{
 		u32 half = hws->video[ch].pix.half_size ?
 			hws->video[ch].pix.half_size :
@@ -1093,7 +1086,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_dbg(&pdev->dev, "Using 64-bit DMA mask\n");
 	}
 
-	/* 3) Optional PCIe tuning (same as before) */
+	/* 3) Apply optional PCIe tuning. */
 	enable_pcie_relaxed_ordering(pdev);
 #ifdef CONFIG_ARCH_TI816X
 	pcie_set_readrq(pdev, 128);
@@ -1270,7 +1263,7 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 }
 
-/* Publish stop so ISR/BH won’t touch ALSA/VB2 anymore. */
+/* Publish stop so ISR/BH will not touch ALSA/VB2 anymore. */
 static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 {
 	unsigned int i;
@@ -1416,10 +1409,10 @@ static void hws_remove(struct pci_dev *pdev)
 	hws_block_hotpaths(hws);
 	hws_stop_kthread_action(hws);
 
-	/* Stop hardware / capture cleanly (your helper) */
+	/* Stop hardware and capture cleanly. */
 	hws_stop_device(hws);
 
-	/* Unregister subsystems you registered */
+	/* Unregister ALSA/debugfs/sysfs resources before V4L2. */
 	device_remove_file(&pdev->dev, &dev_attr_audio_reg_probe);
 	device_remove_file(&pdev->dev, &dev_attr_audio_reg_probe_run);
 	device_remove_file(&pdev->dev, &dev_attr_audio_reg_probe_slots);
@@ -1430,7 +1423,7 @@ static void hws_remove(struct pci_dev *pdev)
 
 	/* Release seeded DMA buffers */
 	hws_free_seed_buffers(hws);
-	/* kthread is stopped by the devm action you added in probe */
+	/* kthread is stopped by the devm action registered in probe. */
 	hws_log_lifecycle_snapshot(hws, "remove", "end");
 	dev_info(&pdev->dev, "lifecycle:remove done (%lluus)\n",
 		 hws_elapsed_us(start_ns));

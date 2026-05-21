@@ -184,7 +184,7 @@ arm_next:
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): armed next buffer, active=%p\n", ch,
 		v->active);
-	/* On success the engine now points at v->active’s DMA address */
+	/* On success the engine now points at v->active's DMA address */
 }
 
 irqreturn_t hws_irq_handler(int irq, void *info)
@@ -209,8 +209,6 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 		}
 		return int_state ? IRQ_HANDLED : IRQ_NONE;
 	}
-	// u32 sys_status = readl(pdx->bar0_base + HWS_REG_SYS_STATUS);
-
 	int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 	if (!int_state || int_state == 0xFFFFFFFF) {
 		dev_dbg(&pdx->pdev->dev,
@@ -290,7 +288,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
 
-		/* Re‐read in case new interrupt bits popped while processing */
+		/* Re-read in case new interrupt bits popped while processing */
 		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		dev_dbg(&pdx->pdev->dev,
 			"irq: loop cnt=%u new INT_STATUS=0x%08x\n", cnt,
