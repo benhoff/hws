@@ -48,28 +48,22 @@ static u32 hws_audio_shared_slot_off(unsigned int ch)
 
 static bool hws_audio_select_buffer(struct hws_pcie_dev *hws, unsigned int ch,
 				    void **cpu_base, dma_addr_t *dma_base,
-				    size_t *size, bool *using_shared_tail)
+				    size_t *size)
 {
 	struct hws_scratch_dma *scratch;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return false;
 
-	if (using_shared_tail)
-		*using_shared_tail = true;
-
-	if (ch >= hws->cur_max_video_ch)
-		return false;
-
-	scratch = &hws->scratch_vid[ch];
-	if (!scratch->cpu || scratch->size < MAX_AUDIO_CAP_SIZE)
+	scratch = &hws->scratch_aud[ch];
+	if (!scratch->cpu || !scratch->size)
 		return false;
 	if (cpu_base)
-		*cpu_base = (char *)scratch->cpu + scratch->size - MAX_AUDIO_CAP_SIZE;
+		*cpu_base = scratch->cpu;
 	if (dma_base)
-		*dma_base = scratch->dma + scratch->size - MAX_AUDIO_CAP_SIZE;
+		*dma_base = scratch->dma;
 	if (size)
-		*size = MAX_AUDIO_CAP_SIZE;
+		*size = scratch->size;
 	return true;
 }
 
@@ -90,7 +84,7 @@ static void hws_audio_trace_probe_work(struct work_struct *work)
 	if (ch >= hws->cur_max_audio_ch || !a->stream_running)
 		return;
 
-	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &probe_len, NULL))
+	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &probe_len))
 		return;
 
 	probe_len = min_t(size_t, probe_len, 4096);
@@ -113,13 +107,12 @@ static void hws_audio_trace_state(struct hws_pcie_dev *hws, unsigned int ch,
 	struct hws_audio *a;
 	dma_addr_t dma;
 	size_t size;
-	bool using_shared_tail;
 
 	if (!hws_audio_trace || !hws || ch >= hws->cur_max_audio_ch)
 		return;
 
 	a = &hws->audio[ch];
-	if (!hws_audio_select_buffer(hws, ch, NULL, &dma, &size, &using_shared_tail))
+	if (!hws_audio_select_buffer(hws, ch, NULL, &dma, &size))
 		return;
 	shared_off = hws_audio_shared_slot_off(ch);
 	audio_off = HWS_AUDIO_REMAP_SLOT_OFF(ch);
@@ -141,8 +134,8 @@ static void hws_audio_trace_state(struct hws_pcie_dev *hws, unsigned int ch,
 	int_decode = readl_relaxed(hws->bar0_base + PCIE_INT_DEC_REG_BASE);
 
 	dev_info(&hws->pdev->dev,
-		 "audio-trace:%s ch%u dma=%pad size=%zu src=%s shared=[%08x/%08x] audio=[%08x/%08x] base=%08x acap=%08x int=%08x gate=%08x br=%08x dec=%08x sys=%08x input=%08x toggle=%u active=%d running=%d irq=%u delivered=%u\n",
-		 tag, ch, &dma, size, using_shared_tail ? "vidtail" : "audio_slot",
+		 "audio-trace:%s ch%u dma=%pad size=%zu src=audio_slot shared=[%08x/%08x] audio=[%08x/%08x] base=%08x acap=%08x int=%08x gate=%08x br=%08x dec=%08x sys=%08x input=%08x toggle=%u active=%d running=%d irq=%u delivered=%u\n",
+		 tag, ch, &dma, size,
 		 shared_hi, shared_lo,
 		 audio_hi, audio_lo, aud_base, acap, int_status, int_en_gate,
 		 bridge_en, int_decode, sys_status, active_status,
@@ -160,16 +153,14 @@ static void hws_audio_program_remap_slot(struct hws_pcie_dev *hws,
 
 static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	size_t size;
 	dma_addr_t dma;
 	u32 lo, hi, pci_addr;
 	u32 audio_table_off;
-	bool using_shared_tail;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
 
-	if (!hws_audio_select_buffer(hws, ch, NULL, &dma, &size, &using_shared_tail))
+	if (!hws_audio_select_buffer(hws, ch, NULL, &dma, NULL))
 		return -ENOMEM;
 
 	lo = lower_32_bits(dma);
@@ -177,8 +168,7 @@ static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws, unsigned int 
 	pci_addr = lo & PCI_E_BAR_ADD_LOWMASK;
 	lo &= PCI_E_BAR_ADD_MASK;
 	audio_table_off = HWS_AUDIO_REMAP_SLOT_OFF(ch);
-	if (!using_shared_tail)
-		hws_audio_program_remap_slot(hws, audio_table_off, hi, lo);
+	hws_audio_program_remap_slot(hws, audio_table_off, hi, lo);
 	writel_relaxed((ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
 		       hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
 	(void)readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
@@ -281,7 +271,7 @@ void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cu
 		return;
 
 	a = &hws->audio[ch];
-	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &size, NULL) ||
+	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &size) ||
 	    !a->stream_running)
 		return;
 
@@ -494,7 +484,7 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 		void *cpu;
 		size_t probe_len;
 
-		if (hws_audio_select_buffer(hws, ch, &cpu, NULL, &probe_len, NULL)) {
+		if (hws_audio_select_buffer(hws, ch, &cpu, NULL, &probe_len)) {
 			probe_len = min_t(size_t, probe_len, 4096);
 			hws->audio[ch].trace_probe_crc = crc32_le(0, cpu, probe_len);
 			schedule_delayed_work(&hws->audio[ch].trace_probe_work,

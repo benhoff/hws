@@ -216,6 +216,7 @@ struct hws_pcie_dev {
 	/* Kernel thread */
 	struct task_struct *main_task;
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
+	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int irq;

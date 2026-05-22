@@ -576,10 +576,10 @@ static bool hws_video_staging_ready(struct hws_pcie_dev *hws, unsigned int ch)
 		return false;
 
 	scratch = &hws->scratch_vid[ch];
-	if (!scratch->cpu || scratch->size <= MAX_AUDIO_CAP_SIZE)
+	if (!scratch->cpu)
 		return false;
 
-	usable = scratch->size - MAX_AUDIO_CAP_SIZE;
+	usable = scratch->size;
 	return usable >= hws->video[ch].pix.sizeimage;
 }
 
@@ -745,8 +745,7 @@ static void hws_video_staging_work(struct work_struct *work)
 		return;
 
 	expected = vid->pix.sizeimage;
-	usable = hws->scratch_vid[vid->channel_index].size > MAX_AUDIO_CAP_SIZE ?
-		hws->scratch_vid[vid->channel_index].size - MAX_AUDIO_CAP_SIZE : 0;
+	usable = hws->scratch_vid[vid->channel_index].size;
 
 	spin_lock_irqsave(&vid->irq_lock, flags);
 	if (vid->staging_active &&

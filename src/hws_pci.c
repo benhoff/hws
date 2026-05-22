@@ -475,8 +475,8 @@ static int hws_debugfs_audio_state_show(struct seq_file *m, void *unused)
 	seq_printf(m, "cur_max_audio_ch=%u\n", hws->cur_max_audio_ch);
 
 	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
-		struct hws_scratch_dma *scratch = &hws->scratch_vid[ch];
-		dma_addr_t audio_tail_dma = 0;
+		struct hws_scratch_dma *video_scratch = &hws->scratch_vid[ch];
+		struct hws_scratch_dma *audio_scratch = &hws->scratch_aud[ch];
 		u32 shared_hi_off = 0x208 + ch * 8;
 		u32 shared_lo_off = 0x20c + ch * 8;
 		u32 audio_hi_off = 0x208 + (8 + ch) * 8;
@@ -485,14 +485,11 @@ static int hws_debugfs_audio_state_show(struct seq_file *m, void *unused)
 		u32 abuf_toggle = readl_relaxed(hws->bar0_base +
 						HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 
-		if (scratch->cpu && scratch->size >= MAX_AUDIO_CAP_SIZE)
-			audio_tail_dma = scratch->dma + scratch->size -
-					 MAX_AUDIO_CAP_SIZE;
-
 		seq_printf(m, "[channel %u]\n", ch);
-		seq_printf(m, "staging_dma=%pad\n", &scratch->dma);
-		seq_printf(m, "staging_size=%zu\n", scratch->size);
-		seq_printf(m, "audio_tail_dma=%pad\n", &audio_tail_dma);
+		seq_printf(m, "staging_dma=%pad\n", &video_scratch->dma);
+		seq_printf(m, "staging_size=%zu\n", video_scratch->size);
+		seq_printf(m, "audio_dma=%pad\n", &audio_scratch->dma);
+		seq_printf(m, "audio_size=%zu\n", audio_scratch->size);
 		seq_printf(m, "shared_hi=0x%08x\n",
 			   readl_relaxed(hws->bar0_base + PCI_ADDR_TABLE_BASE +
 					 shared_hi_off));
@@ -538,19 +535,17 @@ static ssize_t hws_debugfs_audio_scratch_read(struct file *file,
 {
 	struct hws_audio *audio = file->private_data;
 	struct hws_scratch_dma *scratch;
-	void *tail;
 
 	if (!audio || !audio->parent)
 		return -ENODEV;
 
-	scratch = &audio->parent->scratch_vid[audio->channel_index];
-	if (!scratch->cpu || scratch->size < MAX_AUDIO_CAP_SIZE)
+	scratch = &audio->parent->scratch_aud[audio->channel_index];
+	if (!scratch->cpu || !scratch->size)
 		return -ENODATA;
 
-	tail = (char *)scratch->cpu + scratch->size - MAX_AUDIO_CAP_SIZE;
 	dma_rmb();
-	return simple_read_from_buffer(user_buf, count, ppos, tail,
-				       MAX_AUDIO_CAP_SIZE);
+	return simple_read_from_buffer(user_buf, count, ppos, scratch->cpu,
+				       scratch->size);
 }
 
 static const struct file_operations hws_debugfs_bar0_fops = {
@@ -871,9 +866,7 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
 	size_t need = ALIGN((size_t)hws->max_hw_video_buf_sz, 64);
-
-	if (need < MAX_AUDIO_CAP_SIZE)
-		need = ALIGN(MAX_AUDIO_CAP_SIZE + SZ_64K, 64);
+	size_t aud_need = ALIGN((size_t)MAX_AUDIO_CAP_SIZE, 64);
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 #if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
@@ -918,6 +911,42 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 		hws->scratch_vid[ch].cpu = cpu;
 		hws->scratch_vid[ch].size = need;
 	}
+
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
+#if defined(CONFIG_HAS_DMA)
+		dma_addr_t dma = 0;
+		void *cpu = NULL;
+		int attempt;
+
+		for (attempt = 0; attempt < 8; attempt++) {
+			cpu = dma_alloc_coherent(&hws->pdev->dev, aud_need,
+						 &dma, GFP_KERNEL);
+			if (!cpu)
+				break;
+			if (hws_dma_fits_remap_window(dma, aud_need))
+				break;
+
+			dev_dbg(&hws->pdev->dev,
+				"audio scratch: retry ch=%d dma=%pad size=%zu crosses remap window\n",
+				ch, &dma, aud_need);
+			dma_free_coherent(&hws->pdev->dev, aud_need, cpu, dma);
+			cpu = NULL;
+		}
+#else
+		void *cpu = NULL;
+		dma_addr_t dma = 0;
+#endif
+		if (!cpu) {
+			dev_warn(&hws->pdev->dev,
+				 "audio scratch: dma_alloc_coherent failed ch=%d\n",
+				 ch);
+			hws_free_seed_buffers(hws);
+			return -ENOMEM;
+		}
+		hws->scratch_aud[ch].dma = dma;
+		hws->scratch_aud[ch].cpu = cpu;
+		hws->scratch_aud[ch].size = aud_need;
+	}
 	return 0;
 }
 
@@ -936,6 +965,16 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 		}
 	}
 
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
+		if (hws->scratch_aud[ch].cpu) {
+			dma_free_coherent(&hws->pdev->dev,
+					  hws->scratch_aud[ch].size,
+					  hws->scratch_aud[ch].cpu,
+					  hws->scratch_aud[ch].dma);
+			hws->scratch_aud[ch].cpu = NULL;
+			hws->scratch_aud[ch].size = 0;
+		}
+	}
 }
 
 static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
