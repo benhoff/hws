@@ -50,6 +50,7 @@ static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma);
 static struct hwsvideo_buffer *
 hws_take_queued_buffer_locked(struct hws_video *vid);
+static void hws_video_staging_work(struct work_struct *work);
 
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
@@ -167,7 +168,9 @@ void hws_prime_next_locked(struct hws_video *vid)
 	if (!hws || !hws->bar0_base)
 		return;
 
-	if (!READ_ONCE(vid->cap_active) || !vid->active || vid->next_prepared)
+	if (!vid->cap_active || !vid->active || vid->next_prepared)
+		return;
+	if (vid->staging_active)
 		return;
 
 	next = hws_take_queued_buffer_locked(vid);
@@ -195,10 +198,19 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	if (!v)
 		return false;
 	hws = v->parent;
-	if (!hws || READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
+	if (!hws || v->stop_requested || !v->cap_active)
 		return false;
 	spin_lock_irqsave(&v->irq_lock, flags);
-	if (v->active) {
+	if (v->staging_active) {
+		if (!list_empty(&v->capture_queue)) {
+			buf = list_first_entry(&v->capture_queue,
+					       struct hwsvideo_buffer, list);
+			list_del_init(&buf->list);
+			if (v->queued_count)
+				v->queued_count--;
+			buf->slot = 0;
+		}
+	} else if (v->active) {
 		buf = v->active;
 		v->active = NULL;
 		buf->slot = 0;
@@ -210,7 +222,9 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 			v->queued_count--;
 		buf->slot = 0;
 	}
-	if (v->next_prepared) {
+	if (v->staging_active) {
+		v->active = NULL;
+	} else if (v->next_prepared) {
 		next = v->next_prepared;
 		v->next_prepared = NULL;
 		next->slot = 0;
@@ -316,6 +330,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	mutex_init(&vid->state_lock);
 	spin_lock_init(&vid->irq_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
+	INIT_WORK(&vid->staging_work, hws_video_staging_work);
 	atomic_set(&vid->sequence_number, 0);
 	vid->active = NULL;
 
@@ -352,6 +367,8 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	/* capture state */
 	vid->cap_active = false;
 	vid->stop_requested = false;
+	vid->staging_active = false;
+	vid->staging_copy_pending = false;
 	vid->last_buf_half_toggle = 0;
 	vid->half_seen = false;
 	vid->signal_loss_cnt = 0;
@@ -431,6 +448,8 @@ static void hws_video_collect_done_locked(struct hws_video *vid,
 		vid->next_prepared = NULL;
 	}
 
+	vid->staging_copy_pending = false;
+
 	while (!list_empty(&vid->capture_queue)) {
 		b = list_first_entry(&vid->capture_queue, struct hwsvideo_buffer,
 				     list);
@@ -452,10 +471,11 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 
 	/* 1) Stop HW best-effort for this channel */
 	hws_enable_video_capture(vid->parent, vid->channel_index, false);
+	cancel_work_sync(&vid->staging_work);
 
 	/* 2) Flip software state so IRQ/BH will be no-ops if they run */
-	WRITE_ONCE(vid->stop_requested, true);
-	WRITE_ONCE(vid->cap_active, false);
+	vid->stop_requested = true;
+	vid->cap_active = false;
 
 	/* 3) Ensure the IRQ handler finished any in-flight completions */
 	if (vid->parent && vid->parent->irq >= 0)
@@ -518,7 +538,7 @@ void hws_program_dma_for_addr(struct hws_pcie_dev *hws, unsigned int ch,
 	hws_program_dma_window(vid, dma);
 }
 
-void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
+void hws_set_video_capture_hw(struct hws_pcie_dev *hws, unsigned int chan,
 			      bool on)
 {
 	u32 status;
@@ -530,11 +550,243 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	status = on ? (status | BIT(chan)) : (status & ~BIT(chan));
 	writel(status, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+}
 
-	WRITE_ONCE(hws->video[chan].cap_active, on);
+void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
+			      bool on)
+{
+	if (!hws || chan >= hws->max_channels)
+		return;
+
+	hws_set_video_capture_hw(hws, chan, on);
+
+	hws->video[chan].cap_active = on;
 
 	dev_dbg(&hws->pdev->dev, "vcap %s ch%u (reg=0x%08x)\n",
-		on ? "ON" : "OFF", chan, status);
+		on ? "ON" : "OFF", chan,
+		readl(hws->bar0_base + HWS_REG_VCAP_ENABLE));
+}
+
+static bool hws_video_staging_ready(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_scratch_dma *scratch;
+	size_t usable;
+
+	if (!hws || ch >= hws->cur_max_video_ch)
+		return false;
+
+	scratch = &hws->scratch_vid[ch];
+	if (!scratch->cpu || scratch->size <= MAX_AUDIO_CAP_SIZE)
+		return false;
+
+	usable = scratch->size - MAX_AUDIO_CAP_SIZE;
+	return usable >= hws->video[ch].pix.sizeimage;
+}
+
+static void hws_video_program_staging(struct hws_video *vid)
+{
+	struct hws_pcie_dev *hws = vid->parent;
+	unsigned int ch = vid->channel_index;
+	dma_addr_t dma = hws->scratch_vid[ch].dma;
+
+	hws_program_dma_for_addr(hws, ch, dma);
+	iowrite32(lower_32_bits(dma), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+}
+
+static void hws_video_return_direct_buffers_locked(struct hws_video *vid)
+{
+	if (vid->next_prepared) {
+		list_add(&vid->next_prepared->list, &vid->capture_queue);
+		vid->queued_count++;
+		vid->next_prepared = NULL;
+	}
+
+	if (vid->active) {
+		list_add(&vid->active->list, &vid->capture_queue);
+		vid->queued_count++;
+		vid->active = NULL;
+	}
+}
+
+int hws_video_enter_staging(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_video *vid;
+	unsigned long flags;
+	bool enable;
+	bool already_staged;
+	bool copy_pending;
+
+	if (!hws || ch >= hws->cur_max_video_ch)
+		return -EINVAL;
+	if (!hws_video_staging_ready(hws, ch))
+		return -ENOMEM;
+
+	vid = &hws->video[ch];
+
+	hws_set_video_capture_hw(hws, ch, false);
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	already_staged = vid->staging_active;
+	copy_pending = vid->staging_copy_pending;
+	enable = vid->cap_active && !vid->stop_requested;
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	if (already_staged) {
+		if (!copy_pending) {
+			hws_video_program_staging(vid);
+			if (enable) {
+				wmb();
+				hws_set_video_capture_hw(hws, ch, true);
+			}
+		}
+		return 0;
+	}
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	hws_video_return_direct_buffers_locked(vid);
+	vid->staging_active = true;
+	vid->staging_copy_pending = false;
+	enable = vid->cap_active && !vid->stop_requested;
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	hws_video_program_staging(vid);
+
+	if (enable) {
+		wmb();
+		hws_set_video_capture_hw(hws, ch, true);
+	}
+
+	dev_dbg(&hws->pdev->dev, "video ch%u entered staged A/V path\n", ch);
+	return 0;
+}
+
+void hws_video_leave_staging(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_video *vid;
+	struct hwsvideo_buffer *buf = NULL;
+	unsigned long flags;
+	bool enable_direct = false;
+	dma_addr_t dma_addr;
+
+	if (!hws || ch >= hws->cur_max_video_ch)
+		return;
+
+	vid = &hws->video[ch];
+	hws_set_video_capture_hw(hws, ch, false);
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	vid->staging_active = false;
+	vid->staging_copy_pending = false;
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	cancel_work_sync(&vid->staging_work);
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	if (vid->cap_active && !vid->stop_requested &&
+	    !vid->active && !list_empty(&vid->capture_queue)) {
+		buf = hws_take_queued_buffer_locked(vid);
+		vid->active = buf;
+		enable_direct = true;
+	}
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	if (!enable_direct || !buf)
+		return;
+
+	dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+	hws_program_dma_for_addr(hws, ch, dma_addr);
+	iowrite32(lower_32_bits(dma_addr), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
+	wmb();
+	hws_set_video_capture_hw(hws, ch, true);
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	hws_prime_next_locked(vid);
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	dev_dbg(&hws->pdev->dev, "video ch%u left staged A/V path\n", ch);
+}
+
+void hws_video_handle_staged_vdone(struct hws_video *vid)
+{
+	struct hws_pcie_dev *hws;
+	unsigned long flags;
+	bool schedule = false;
+
+	if (!vid)
+		return;
+
+	hws = vid->parent;
+	hws_set_video_capture_hw(hws, vid->channel_index, false);
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	if (vid->staging_active && !vid->staging_copy_pending) {
+		vid->staging_copy_pending = true;
+		schedule = true;
+	}
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	if (schedule)
+		schedule_work(&vid->staging_work);
+}
+
+static void hws_video_staging_work(struct work_struct *work)
+{
+	struct hws_video *vid = container_of(work, struct hws_video, staging_work);
+	struct hws_pcie_dev *hws = vid->parent;
+	struct hwsvideo_buffer *buf = NULL;
+	struct vb2_v4l2_buffer *vb2v;
+	unsigned long flags;
+	size_t expected, usable, plane_size;
+	void *dst;
+	bool reenable;
+
+	if (!hws || vid->channel_index >= hws->cur_max_video_ch)
+		return;
+
+	expected = vid->pix.sizeimage;
+	usable = hws->scratch_vid[vid->channel_index].size > MAX_AUDIO_CAP_SIZE ?
+		hws->scratch_vid[vid->channel_index].size - MAX_AUDIO_CAP_SIZE : 0;
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	if (vid->staging_active &&
+	    vid->cap_active &&
+	    !vid->stop_requested &&
+	    !list_empty(&vid->capture_queue))
+		buf = hws_take_queued_buffer_locked(vid);
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	if (buf) {
+		vb2v = &buf->vb;
+		plane_size = vb2_plane_size(&vb2v->vb2_buf, 0);
+		dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+		if (expected <= usable && expected <= plane_size && dst) {
+			dma_rmb();
+			memcpy(dst, hws->scratch_vid[vid->channel_index].cpu, expected);
+			vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
+			vb2v->sequence =
+				(u32)atomic_inc_return(&vid->sequence_number);
+			vb2v->vb2_buf.timestamp = ktime_get_ns();
+			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
+		} else {
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "staged video ch%u drop: expected=%zu usable=%zu plane=%zu dst=%p\n",
+					     vid->channel_index, expected, usable,
+					     plane_size, dst);
+			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
+		}
+	}
+
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	vid->staging_copy_pending = false;
+	reenable = vid->staging_active && vid->cap_active && !vid->stop_requested;
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
+
+	if (reenable) {
+		hws_video_program_staging(vid);
+		wmb();
+		hws_set_video_capture_hw(hws, vid->channel_index, true);
+	}
 }
 
 static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
@@ -695,7 +947,7 @@ void check_video_format(struct hws_pcie_dev *pdx)
 			/* No active video; optionally feed neutral frames to keep streaming. */
 			if (pdx->video[i].signal_loss_cnt == 0)
 				pdx->video[i].signal_loss_cnt = 1;
-			if (READ_ONCE(pdx->video[i].cap_active))
+			if (pdx->video[i].cap_active)
 				hws_force_no_signal_frame(&pdx->video[i],
 							  "monitor_nosignal");
 		} else {
@@ -829,11 +1081,11 @@ static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch)
 	 *
 	 * Example skeleton:
 	 *
-	 *   u32 sw_rate = READ_ONCE(hws->sw_fps[ch]); // incremented elsewhere
+	 *   u32 sw_rate = hws->sw_fps[ch]; // incremented elsewhere
 	 *   if (sw_rate > THRESHOLD) {
 	 *       u32 fps = pick_fps_from_rate(sw_rate);
 	 *       hws_write_if_diff(hws, HWS_REG_OUT_FRAME_RATE(ch), fps);
-	 *       WRITE_ONCE(hws->sw_fps[ch], 0);
+	 *       hws->sw_fps[ch] = 0;
 	 *   }
 	 */
 	(void)hws;
@@ -887,10 +1139,10 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	INIT_LIST_HEAD(&done);
 	queue_busy = vb2_is_busy(&v->buffer_queue);
 
-	WRITE_ONCE(v->stop_requested, true);
-	WRITE_ONCE(v->cap_active, false);
+	v->stop_requested = true;
+	v->cap_active = false;
 	/* Publish software stop first so the IRQ completion path sees the stop
-	 * before we touch MMIO or the lists. Pairs with READ_ONCE() checks in the
+	 * before we touch MMIO or the lists. Pairs with flag checks in the
 	 * VDONE handler and hws_arm_next() to prevent completions while modes
 	 * change.
 	 */
@@ -901,6 +1153,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	if (v->parent && v->parent->irq >= 0)
 		synchronize_irq(v->parent->irq);
+	cancel_work_sync(&v->staging_work);
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	hws_video_collect_done_locked(v, &done);
@@ -930,7 +1183,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		v4l2_event_queue(v->video_device, &ev);
 		vb2_queue_error(&v->buffer_queue);
 	} else {
-		WRITE_ONCE(v->stop_requested, false);
+		v->stop_requested = false;
 	}
 
 	/* Program HW with new resolution */
@@ -943,7 +1196,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		    ch * PCIE_BARADDROFSIZE);
 
 	/* Reset per-channel toggles/counters */
-	WRITE_ONCE(v->last_buf_half_toggle, 0);
+	v->last_buf_half_toggle = 0;
 	atomic_set(&v->sequence_number, 0);
 
 	mutex_unlock(&v->state_lock);
@@ -1116,11 +1369,12 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	struct hwsvideo_buffer *buf = to_hwsbuf(vb);
 	struct hws_pcie_dev *hws = vid->parent;
 	unsigned long flags;
+	bool stage;
 
 	dev_dbg(&hws->pdev->dev,
 		"buffer_queue(ch=%u): vb=%p sizeimage=%u q_active=%d\n",
 		vid->channel_index, vb, vid->pix.sizeimage,
-		READ_ONCE(vid->cap_active));
+		vid->cap_active);
 
 	/* Initialize buffer slot */
 	buf->slot = 0;
@@ -1128,9 +1382,15 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	spin_lock_irqsave(&vid->irq_lock, flags);
 	list_add_tail(&buf->list, &vid->capture_queue);
 	vid->queued_count++;
+	stage = vid->staging_active;
 
 	/* If streaming and no in-flight buffer, prime HW immediately */
-	if (READ_ONCE(vid->cap_active) && !vid->active) {
+	if (vid->cap_active && stage) {
+		/*
+		 * In staged A/V mode the hardware target is channel-owned
+		 * memory. Queued vb2 buffers are consumed by the staging worker.
+		 */
+	} else if (vid->cap_active && !vid->active) {
 		dma_addr_t dma_addr;
 
 		dev_dbg(&hws->pdev->dev,
@@ -1149,7 +1409,7 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 		wmb(); /* ensure descriptors visible before enabling capture */
 		hws_enable_video_capture(hws, vid->channel_index, true);
 		hws_prime_next_locked(vid);
-	} else if (READ_ONCE(vid->cap_active) && vid->active) {
+	} else if (vid->cap_active && vid->active) {
 		hws_prime_next_locked(vid);
 	}
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
@@ -1200,10 +1460,15 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	lockdep_assert_held(&v->state_lock);
 	/* init per-stream state */
-	WRITE_ONCE(v->stop_requested, false);
-	WRITE_ONCE(v->cap_active, true);
-	WRITE_ONCE(v->half_seen, false);
-	WRITE_ONCE(v->last_buf_half_toggle, 0);
+	v->stop_requested = false;
+	v->cap_active = true;
+	v->half_seen = false;
+	v->last_buf_half_toggle = 0;
+
+	if (v->staging_active ||
+	    (v->channel_index < hws->cur_max_audio_ch &&
+	     hws->audio[v->channel_index].stream_running))
+		return hws_video_enter_staging(hws, v->channel_index);
 
 	/* Try to prime a buffer, but it's OK if none are queued yet */
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -1275,8 +1540,8 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	spin_lock_irqsave(&v->irq_lock, flags);
 	list_for_each_entry(b, &v->capture_queue, list)
 		queued++;
-	cap_active = READ_ONCE(v->cap_active);
-	stop_requested = READ_ONCE(v->stop_requested);
+	cap_active = v->cap_active;
+	stop_requested = v->stop_requested;
 	active = v->active;
 	next_prepared = v->next_prepared;
 	tracked = v->queued_count;
@@ -1303,10 +1568,15 @@ static void hws_stop_streaming(struct vb2_queue *q)
 
 	/* 1) Quiesce SW/HW first */
 	lockdep_assert_held(&v->state_lock);
-	WRITE_ONCE(v->cap_active, false);
-	WRITE_ONCE(v->stop_requested, true);
+	v->cap_active = false;
+	v->stop_requested = true;
 
 	hws_enable_video_capture(v->parent, v->channel_index, false);
+	cancel_work_sync(&v->staging_work);
+	v->staging_copy_pending = false;
+	if (v->channel_index >= hws->cur_max_audio_ch ||
+	    !hws->audio[v->channel_index].stream_running)
+		v->staging_active = false;
 
 	/* 2) Collect in-flight + queued under the IRQ lock */
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -1449,6 +1719,9 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
 
+		cancel_work_sync(&ch->staging_work);
+		ch->staging_copy_pending = false;
+		ch->staging_active = false;
 		hws_video_release_registration(ch);
 		v4l2_ctrl_handler_free(&ch->control_handler);
 	}
@@ -1487,6 +1760,8 @@ int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
 			if (r && !ret)
 				ret = r;
 		} else {
+			cancel_work_sync(&vid->staging_work);
+			vid->staging_copy_pending = false;
 			dev_dbg(&hws->pdev->dev,
 				"video:%s:ch=%d idle (%lluus)\n",
 				reason, i, hws_elapsed_us(ch_start_ns));

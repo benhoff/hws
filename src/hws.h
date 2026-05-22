@@ -69,6 +69,7 @@ struct hws_video {
 	struct list_head capture_queue;
 	struct hwsvideo_buffer *active;
 	struct hwsvideo_buffer *next_prepared;
+	struct work_struct staging_work;
 
 	/* Locking */
 	struct mutex state_lock;
@@ -98,6 +99,8 @@ struct hws_video {
 	/* Per-channel capture state */
 	bool cap_active;
 	bool stop_requested;
+	bool staging_active;
+	bool staging_copy_pending;
 	u8 last_buf_half_toggle;
 	bool half_seen;
 	atomic_t sequence_number;
@@ -194,7 +197,8 @@ struct hws_pcie_dev {
 	u32 max_hw_video_buf_sz;
 	u8 max_channels;
 	u8 cur_max_video_ch;
-	u8 cur_max_linein_ch;
+	/* Independently capturable embedded audio inputs exposed as ALSA PCMs. */
+	u8 cur_max_audio_ch;
 	bool start_run;
 
 	bool buf_allocated;
@@ -212,7 +216,6 @@ struct hws_pcie_dev {
 	/* Kernel thread */
 	struct task_struct *main_task;
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
-	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int irq;

@@ -30,20 +30,23 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 
 	dev_dbg(&hws->pdev->dev,
 		"arm_next(ch=%u): stop=%d cap=%d queued=%d\n",
-		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
+		ch, v->stop_requested, v->cap_active,
 		!list_empty(&v->capture_queue));
 
-	if (READ_ONCE(hws->suspended)) {
+	if (hws->suspended) {
 		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): suspended\n", ch);
 		return -EBUSY;
 	}
 
-	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)) {
+	if (v->stop_requested || !v->cap_active) {
 		dev_dbg(&hws->pdev->dev,
 			"arm_next(ch=%u): stop=%d cap=%d -> cancel\n", ch,
 			v->stop_requested, v->cap_active);
 		return -ECANCELED;
 	}
+
+	if (v->staging_active)
+		return 0;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (list_empty(&v->capture_queue)) {
@@ -65,7 +68,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	wmb();
 
 	/* Avoid MMIO during suspend */
-	if (READ_ONCE(hws->suspended)) {
+	if (hws->suspended) {
 		unsigned long f;
 
 		dev_dbg(&hws->pdev->dev,
@@ -107,7 +110,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): stop=%d cap=%d active=%p\n",
-		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
+		ch, v->stop_requested, v->cap_active,
 		v->active);
 
 	int ret;
@@ -115,11 +118,18 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): entry stop=%d cap=%d\n", ch,
 		v->stop_requested, v->cap_active);
-	if (READ_ONCE(hws->suspended))
+	if (hws->suspended)
 		return;
 
-	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
+	if (v->stop_requested || !v->cap_active)
 		return;
+
+	if (v->staging_active) {
+		dev_dbg(&hws->pdev->dev,
+			"bh_video(ch=%u): staged frame complete\n", ch);
+		hws_video_handle_staged_vdone(v);
+		return;
+	}
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	done = v->active;
@@ -160,7 +170,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
 	}
 
-	if (READ_ONCE(hws->suspended))
+	if (hws->suspended)
 		return;
 
 	if (promoted) {
@@ -201,7 +211,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	}
 
 	/* Fast path: if suspended, quietly ack and exit */
-	if (READ_ONCE(pdx->suspended)) {
+	if (pdx->suspended) {
 		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		if (int_state) {
 			writel(int_state, pdx->bar0_base + HWS_REG_INT_STATUS);
@@ -226,36 +236,35 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			if (!(int_state & vbit))
 				continue;
 
-			if (READ_ONCE(pdx->video[ch].cap_active) &&
-			    !READ_ONCE(pdx->video[ch].stop_requested)) {
+			if (pdx->video[ch].cap_active &&
+			    !pdx->video[ch].stop_requested) {
 				if (hws_toggle_debug) {
 					u32 toggle =
 					    readl_relaxed(pdx->bar0_base +
 						  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-					WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
-						   toggle);
+					pdx->video[ch].last_buf_half_toggle = toggle;
 				}
 				dma_rmb();
-				WRITE_ONCE(pdx->video[ch].half_seen, true);
+				pdx->video[ch].half_seen = true;
 				dev_dbg(&pdx->pdev->dev,
 					"irq: VDONE ch=%u toggle=%u handling inline (cap=%d)\n",
 					ch,
-					READ_ONCE(pdx->video[ch].last_buf_half_toggle),
-					READ_ONCE(pdx->video[ch].cap_active));
+					pdx->video[ch].last_buf_half_toggle,
+					pdx->video[ch].cap_active);
 				hws_video_handle_vdone(&pdx->video[ch]);
 			} else {
 				dev_dbg(&pdx->pdev->dev,
 					"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
 					ch,
-					READ_ONCE(pdx->video[ch].cap_active),
-					READ_ONCE(pdx->video[ch].stop_requested));
+					pdx->video[ch].cap_active,
+					pdx->video[ch].stop_requested);
 			}
 
 			writel(vbit, pdx->bar0_base + HWS_REG_INT_STATUS);
 			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
 
-		for (unsigned int ch = 0; ch < pdx->cur_max_linein_ch; ++ch) {
+		for (unsigned int ch = 0; ch < pdx->cur_max_audio_ch; ++ch) {
 			u32 abit = HWS_INT_ADONE_BIT(ch);
 			u8 cur_toggle;
 
@@ -263,8 +272,8 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 				continue;
 
 			/* Only service running streams */
-			if (!READ_ONCE(pdx->audio[ch].cap_active) ||
-			    !READ_ONCE(pdx->audio[ch].stream_running)) {
+			if (!pdx->audio[ch].cap_active ||
+			    !pdx->audio[ch].stream_running) {
 				writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
 				(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 				continue;
@@ -277,7 +286,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			 */
 			cur_toggle = readl_relaxed(pdx->bar0_base +
 						    HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-			WRITE_ONCE(pdx->audio[ch].last_period_toggle, cur_toggle);
+			pdx->audio[ch].last_period_toggle = cur_toggle;
 			if (unlikely(hws_toggle_debug))
 				dev_dbg(&pdx->pdev->dev,
 					"irq: ADONE ch=%u toggle=%u\n", ch,

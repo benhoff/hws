@@ -73,16 +73,16 @@ void hws_trace_bar0_snapshot(struct hws_pcie_dev *hws, const char *tag)
 				       table_off + PCIE_BARADDROFSIZE));
 	}
 
-	for (ch = 0; ch < hws->cur_max_linein_ch && ch < MAX_VID_CHANNELS; ch++) {
+	for (ch = 0; ch < hws->cur_max_audio_ch && ch < MAX_VID_CHANNELS; ch++) {
 		dev_info(&hws->pdev->dev,
 			 "bar0-snap:%s ach%u base=%08x toggle=%08x stream=%u active=%u irq=%u delivered=%u\n",
 			 tag, ch,
 			 readl_relaxed(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch)),
 			 readl_relaxed(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)),
-			 READ_ONCE(hws->audio[ch].stream_running),
-			 READ_ONCE(hws->audio[ch].cap_active),
-			 READ_ONCE(hws->audio[ch].irq_count),
-			 READ_ONCE(hws->audio[ch].delivered_count));
+			 hws->audio[ch].stream_running,
+			 hws->audio[ch].cap_active,
+			 hws->audio[ch].irq_count,
+			 hws->audio[ch].delivered_count);
 	}
 }
 
@@ -109,7 +109,7 @@ static int hws_reg_probe_append_snapshot(struct hws_pcie_dev *hws, char *buf,
 	n += scnprintf(buf + n, len - n, "INT_STATUS=0x%08x\n",
 		       readl_relaxed(hws->bar0_base + HWS_REG_INT_STATUS));
 
-	for (ch = 0; ch < hws->cur_max_linein_ch && n < len; ch++) {
+	for (ch = 0; ch < hws->cur_max_audio_ch && n < len; ch++) {
 		n += scnprintf(buf + n, len - n,
 			       "ch%u.audio_base=0x%08x shared_hi=0x%08x shared_lo=0x%08x audio_hi=0x%08x audio_lo=0x%08x abuf_toggle=0x%08x stream=%u active=%u irq=%u delivered=%u\n",
 			       ch,
@@ -123,10 +123,10 @@ static int hws_reg_probe_append_snapshot(struct hws_pcie_dev *hws, char *buf,
 			       readl_relaxed(hws->bar0_base + PCI_ADDR_TABLE_BASE +
 					     0x20c + (8 + ch) * 8),
 			       readl_relaxed(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)),
-			       READ_ONCE(hws->audio[ch].stream_running),
-			       READ_ONCE(hws->audio[ch].cap_active),
-			       READ_ONCE(hws->audio[ch].irq_count),
-			       READ_ONCE(hws->audio[ch].delivered_count));
+			       hws->audio[ch].stream_running,
+			       hws->audio[ch].cap_active,
+			       hws->audio[ch].irq_count,
+			       hws->audio[ch].delivered_count);
 	}
 
 	return n;
@@ -142,15 +142,15 @@ static int hws_reg_probe_append_busy(struct hws_pcie_dev *hws, char *buf,
 		return 0;
 
 	for (ch = 0; ch < hws->cur_max_video_ch && n < len; ch++) {
-		if (!READ_ONCE(hws->video[ch].cap_active))
+		if (!hws->video[ch].cap_active)
 			continue;
 
 		n += scnprintf(buf + n, len - n, "busy=video ch%u active\n", ch);
 		return n;
 	}
 
-	for (ch = 0; ch < hws->cur_max_linein_ch && n < len; ch++) {
-		if (!READ_ONCE(hws->audio[ch].stream_running))
+	for (ch = 0; ch < hws->cur_max_audio_ch && n < len; ch++) {
+		if (!hws->audio[ch].stream_running)
 			continue;
 
 		n += scnprintf(buf + n, len - n, "busy=audio ch%u running\n",
@@ -202,7 +202,7 @@ static int hws_reg_probe_append_write_probe(struct hws_pcie_dev *hws, char *buf,
 		       "PCIE_INT_DEC.probe orig=0x%08x test=0x%08x readback=0x%08x restored=0x%08x\n",
 		       orig, 0x00000000, readback, restored);
 
-	for (ch = 0; ch < hws->cur_max_linein_ch && n < len; ch++) {
+	for (ch = 0; ch < hws->cur_max_audio_ch && n < len; ch++) {
 		u32 reg = HWS_REG_AUD_DMA_ADDR(ch);
 		u32 test = ((ch + 1) * PCIEBAR_AXI_BASE + 0x00123000);
 
@@ -472,10 +472,11 @@ static int hws_debugfs_audio_state_show(struct seq_file *m, void *unused)
 
 	seq_printf(m, "pci=%s\n", pci_name(hws->pdev));
 	seq_printf(m, "cur_max_video_ch=%u\n", hws->cur_max_video_ch);
-	seq_printf(m, "cur_max_linein_ch=%u\n", hws->cur_max_linein_ch);
+	seq_printf(m, "cur_max_audio_ch=%u\n", hws->cur_max_audio_ch);
 
-	for (ch = 0; ch < hws->cur_max_linein_ch; ch++) {
-		struct hws_scratch_dma *scratch = &hws->scratch_aud[ch];
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
+		struct hws_scratch_dma *scratch = &hws->scratch_vid[ch];
+		dma_addr_t audio_tail_dma = 0;
 		u32 shared_hi_off = 0x208 + ch * 8;
 		u32 shared_lo_off = 0x20c + ch * 8;
 		u32 audio_hi_off = 0x208 + (8 + ch) * 8;
@@ -484,9 +485,14 @@ static int hws_debugfs_audio_state_show(struct seq_file *m, void *unused)
 		u32 abuf_toggle = readl_relaxed(hws->bar0_base +
 						HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 
+		if (scratch->cpu && scratch->size >= MAX_AUDIO_CAP_SIZE)
+			audio_tail_dma = scratch->dma + scratch->size -
+					 MAX_AUDIO_CAP_SIZE;
+
 		seq_printf(m, "[channel %u]\n", ch);
-		seq_printf(m, "scratch_dma=%pad\n", &scratch->dma);
-		seq_printf(m, "scratch_size=%zu\n", scratch->size);
+		seq_printf(m, "staging_dma=%pad\n", &scratch->dma);
+		seq_printf(m, "staging_size=%zu\n", scratch->size);
+		seq_printf(m, "audio_tail_dma=%pad\n", &audio_tail_dma);
 		seq_printf(m, "shared_hi=0x%08x\n",
 			   readl_relaxed(hws->bar0_base + PCI_ADDR_TABLE_BASE +
 					 shared_hi_off));
@@ -510,12 +516,12 @@ static int hws_debugfs_audio_state_show(struct seq_file *m, void *unused)
 			   readl_relaxed(hws->bar0_base + HWS_REG_ACTIVE_STATUS));
 		seq_printf(m, "abuf_toggle=%u\n", abuf_toggle);
 		seq_printf(m, "stream_running=%u\n",
-			   READ_ONCE(hws->audio[ch].stream_running));
+			   hws->audio[ch].stream_running);
 		seq_printf(m, "cap_active=%u\n",
-			   READ_ONCE(hws->audio[ch].cap_active));
-		seq_printf(m, "irq_count=%u\n", READ_ONCE(hws->audio[ch].irq_count));
+			   hws->audio[ch].cap_active);
+		seq_printf(m, "irq_count=%u\n", hws->audio[ch].irq_count);
 		seq_printf(m, "delivered_count=%u\n",
-			   READ_ONCE(hws->audio[ch].delivered_count));
+			   hws->audio[ch].delivered_count);
 	}
 
 	return 0;
@@ -532,17 +538,19 @@ static ssize_t hws_debugfs_audio_scratch_read(struct file *file,
 {
 	struct hws_audio *audio = file->private_data;
 	struct hws_scratch_dma *scratch;
+	void *tail;
 
 	if (!audio || !audio->parent)
 		return -ENODEV;
 
-	scratch = &audio->parent->scratch_aud[audio->channel_index];
-	if (!scratch->cpu || !scratch->size)
+	scratch = &audio->parent->scratch_vid[audio->channel_index];
+	if (!scratch->cpu || scratch->size < MAX_AUDIO_CAP_SIZE)
 		return -ENODATA;
 
+	tail = (char *)scratch->cpu + scratch->size - MAX_AUDIO_CAP_SIZE;
 	dma_rmb();
-	return simple_read_from_buffer(user_buf, count, ppos, scratch->cpu,
-				       scratch->size);
+	return simple_read_from_buffer(user_buf, count, ppos, tail,
+				       MAX_AUDIO_CAP_SIZE);
 }
 
 static const struct file_operations hws_debugfs_bar0_fops = {
@@ -600,7 +608,7 @@ static void hws_debugfs_init(struct hws_pcie_dev *hws)
 	debugfs_create_file("audio_state", 0400, hws->debugfs_dir, hws,
 			    &hws_debugfs_audio_state_fops);
 
-	for (ch = 0; ch < hws->cur_max_linein_ch; ch++) {
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
 		snprintf(name, sizeof(name), "audio_scratch_ch%u", ch);
 		debugfs_create_file(name, 0400, hws->debugfs_dir, &hws->audio[ch],
 				    &hws_debugfs_audio_scratch_fops);
@@ -675,35 +683,33 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 	case 0x8524:
 	case 0x6504:
 		hdev->cur_max_video_ch = 4;
-		hdev->cur_max_linein_ch = 1;
+		hdev->cur_max_audio_ch = 4;
 		break;
 	case 0x8504:
-		/*
-		 * Baseline exposed one ALSA capture device per video input on
-		 * the X4 HDMI board, so keep four audio inputs here to match
-		 * the expected userspace-visible topology.
-		 */
 		hdev->cur_max_video_ch = 4;
-		hdev->cur_max_linein_ch = 4;
+		hdev->cur_max_audio_ch = 4;
 		break;
 	case 0x8532:
 		hdev->cur_max_video_ch = 2;
-		hdev->cur_max_linein_ch = 1;
+		hdev->cur_max_audio_ch = 2;
 		break;
 	case 0x8512:
 	case 0x6502:
 		hdev->cur_max_video_ch = 2;
-		hdev->cur_max_linein_ch = 0;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	case 0x8501:
 		hdev->cur_max_video_ch = 1;
-		hdev->cur_max_linein_ch = 0;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	default:
 		hdev->cur_max_video_ch = 4;
-		hdev->cur_max_linein_ch = 0;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	}
+
+	if (hdev->cur_max_audio_ch > hdev->cur_max_video_ch)
+		hdev->cur_max_audio_ch = hdev->cur_max_video_ch;
 
 	/* universal buffer capacity */
 	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
@@ -742,7 +748,7 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 	if (!hws->bar0_base) {
 		dev_dbg(dev,
 			"lifecycle:%s:%s bar0-unmapped suspended=%d start_run=%d pci_lost=%d irq=%d\n",
-			action, phase, READ_ONCE(hws->suspended), hws->start_run,
+			action, phase, hws->suspended, hws->start_run,
 			hws->pci_lost, hws->irq);
 		return;
 	}
@@ -755,7 +761,7 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 
 	dev_dbg(dev,
 		"lifecycle:%s:%s suspended=%d start_run=%d pci_lost=%d irq=%d INT_EN=0x%08x INT_STATUS=0x%08x VCAP=0x%08x SYS=0x%08x DEC=0x%08x\n",
-		action, phase, READ_ONCE(hws->suspended), hws->start_run,
+		action, phase, hws->suspended, hws->start_run,
 		hws->pci_lost, hws->irq, int_en, int_status, vcap,
 		sys_status, dec_mode);
 }
@@ -803,7 +809,7 @@ static int main_ks_thread_handle(void *data)
 
 	while (!kthread_should_stop()) {
 		/* If we're suspending, don't touch hardware; just sleep/freeze. */
-		if (READ_ONCE(pdx->suspended)) {
+		if (pdx->suspended) {
 			try_to_freeze();
 			schedule_timeout_interruptible(msecs_to_jiffies(1000));
 			continue;
@@ -831,13 +837,13 @@ static void hws_stop_kthread_action(void *data)
 	if (!hws)
 		return;
 
-	t = READ_ONCE(hws->main_task);
+	t = hws->main_task;
 	if (!IS_ERR_OR_NULL(t)) {
 		start_ns = ktime_get_mono_fast_ns();
 		dev_dbg(&hws->pdev->dev,
 			"lifecycle:kthread-stop:begin task=%s[%d]\n",
 			t->comm, t->pid);
-		WRITE_ONCE(hws->main_task, NULL);
+		hws->main_task = NULL;
 		kthread_stop(t);
 		dev_dbg(&hws->pdev->dev,
 			"lifecycle:kthread-stop:done (%lluus)\n",
@@ -845,28 +851,53 @@ static void hws_stop_kthread_action(void *data)
 	}
 }
 
+static bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
+{
+	dma_addr_t end;
+
+	if (!size)
+		return false;
+
+	end = dma + size - 1;
+	if (end < dma)
+		return false;
+
+	return upper_32_bits(dma) == upper_32_bits(end) &&
+	       (lower_32_bits(dma) & PCI_E_BAR_ADD_MASK) ==
+	       (lower_32_bits(end) & PCI_E_BAR_ADD_MASK);
+}
+
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
-	/* 64 KiB is plenty for a safe video dummy; hardware needs 64-byte alignment. */
-	const size_t need = ALIGN(64 * 1024, 64);
-	size_t aud_need = ALIGN(hws->audio_pkt_size * 2, 64);
+	size_t need = ALIGN((size_t)hws->max_hw_video_buf_sz, 64);
 
-	/*
-	 * Baseline reserved a 10 KiB capture window per audio input. The
-	 * hardware only delivers 4 KiB packets, but it toggles within a larger
-	 * two-half buffer, so keep the larger legacy window here as well.
-	 */
-	if (aud_need < MAX_AUDIO_CAP_SIZE)
-		aud_need = MAX_AUDIO_CAP_SIZE;
+	if (need < MAX_AUDIO_CAP_SIZE)
+		need = ALIGN(MAX_AUDIO_CAP_SIZE + SZ_64K, 64);
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 #if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
-		void *cpu = dma_alloc_coherent(&hws->pdev->dev, need,
-					       &hws->scratch_vid[ch].dma,
-					       GFP_KERNEL);
+		dma_addr_t dma = 0;
+		void *cpu = NULL;
+		int attempt;
+
+		for (attempt = 0; attempt < 8; attempt++) {
+			cpu = dma_alloc_coherent(&hws->pdev->dev, need, &dma,
+						 GFP_KERNEL);
+			if (!cpu)
+				break;
+			if (hws_dma_fits_remap_window(dma, need))
+				break;
+
+			dev_dbg(&hws->pdev->dev,
+				"scratch: retry ch=%d dma=%pad size=%zu crosses remap window\n",
+				ch, &dma, need);
+			dma_free_coherent(&hws->pdev->dev, need, cpu, dma);
+			cpu = NULL;
+		}
 #else
 		void *cpu = NULL;
+		dma_addr_t dma = 0;
 #endif
 		if (!cpu) {
 			dev_warn(&hws->pdev->dev,
@@ -883,27 +914,9 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 			}
 			return -ENOMEM;
 		}
-		hws->scratch_vid[ch].cpu  = cpu;
+		hws->scratch_vid[ch].dma  = dma;
+		hws->scratch_vid[ch].cpu = cpu;
 		hws->scratch_vid[ch].size = need;
-	}
-
-	for (ch = 0; ch < hws->cur_max_linein_ch; ch++) {
-#if defined(CONFIG_HAS_DMA)
-		void *cpu = dma_alloc_coherent(&hws->pdev->dev, aud_need,
-					       &hws->scratch_aud[ch].dma,
-					       GFP_KERNEL);
-#else
-		void *cpu = NULL;
-#endif
-		if (!cpu) {
-			dev_warn(&hws->pdev->dev,
-				 "audio scratch: dma_alloc_coherent failed ch=%d\n",
-				 ch);
-			hws_free_seed_buffers(hws);
-			return -ENOMEM;
-		}
-		hws->scratch_aud[ch].cpu = cpu;
-		hws->scratch_aud[ch].size = aud_need;
 	}
 	return 0;
 }
@@ -923,16 +936,6 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 		}
 	}
 
-	for (ch = 0; ch < hws->cur_max_linein_ch; ch++) {
-		if (hws->scratch_aud[ch].cpu) {
-			dma_free_coherent(&hws->pdev->dev,
-					  hws->scratch_aud[ch].size,
-					  hws->scratch_aud[ch].cpu,
-					  hws->scratch_aud[ch].dma);
-			hws->scratch_aud[ch].cpu = NULL;
-			hws->scratch_aud[ch].size = 0;
-		}
-	}
 }
 
 static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
@@ -1031,7 +1034,7 @@ static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 
 static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 {
-	WRITE_ONCE(hws->suspended, true);
+	hws->suspended = true;
 	if (hws->irq >= 0)
 		disable_irq(hws->irq);
 
@@ -1271,16 +1274,16 @@ static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 	for (i = 0; i < hws->cur_max_video_ch; ++i) {
 		struct hws_video *v = &hws->video[i];
 
-		WRITE_ONCE(v->cap_active,     false);
-		WRITE_ONCE(v->stop_requested, true);
+		v->cap_active = false;
+		v->stop_requested = true;
 	}
 
-	for (i = 0; i < hws->cur_max_linein_ch; ++i) {
+	for (i = 0; i < hws->cur_max_audio_ch; ++i) {
 		struct hws_audio *a = &hws->audio[i];
 
-		WRITE_ONCE(a->stream_running, false);
-		WRITE_ONCE(a->cap_active,     false);
-		WRITE_ONCE(a->stop_requested, true);
+		a->stream_running = false;
+		a->cap_active = false;
+		a->stop_requested = true;
 	}
 
 	smp_wmb(); /* make flags visible before we touch MMIO/queues */
@@ -1304,7 +1307,7 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 	/* Ack any latched VDONE/ADONE. */
 	for (i = 0; i < hws->cur_max_video_ch; ++i)
 		ackmask |= HWS_INT_VDONE_BIT(i);
-	for (i = 0; i < hws->cur_max_linein_ch; ++i)
+	for (i = 0; i < hws->cur_max_audio_ch; ++i)
 		ackmask |= HWS_INT_ADONE_BIT(i);
 	if (ackmask) {
 		writel(ackmask, hws->bar0_base + HWS_REG_INT_STATUS);
@@ -1501,7 +1504,7 @@ static int hws_pm_resume(struct device *dev)
 	if (hws->irq >= 0)
 		enable_irq(hws->irq);
 
-	WRITE_ONCE(hws->suspended, false);
+	hws->suspended = false;
 	dev_dbg(dev, "lifecycle:pm_resume:irq-unsuspend (%lluus)\n",
 		hws_elapsed_us(step_ns));
 

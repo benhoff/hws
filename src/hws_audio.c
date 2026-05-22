@@ -52,39 +52,24 @@ static bool hws_audio_select_buffer(struct hws_pcie_dev *hws, unsigned int ch,
 {
 	struct hws_scratch_dma *scratch;
 
-	if (!hws || ch >= hws->cur_max_linein_ch)
+	if (!hws || ch >= hws->cur_max_audio_ch)
 		return false;
 
 	if (using_shared_tail)
-		*using_shared_tail = false;
+		*using_shared_tail = true;
 
-	if (ch < hws->cur_max_video_ch &&
-	    hws->scratch_vid[ch].cpu &&
-	    hws->scratch_vid[ch].size >= MAX_AUDIO_CAP_SIZE &&
-	    !READ_ONCE(hws->video[ch].cap_active)) {
-		if (cpu_base)
-			*cpu_base = (char *)hws->scratch_vid[ch].cpu +
-				    hws->scratch_vid[ch].size - MAX_AUDIO_CAP_SIZE;
-		if (dma_base)
-			*dma_base = hws->scratch_vid[ch].dma +
-				    hws->scratch_vid[ch].size - MAX_AUDIO_CAP_SIZE;
-		if (size)
-			*size = MAX_AUDIO_CAP_SIZE;
-		if (using_shared_tail)
-			*using_shared_tail = true;
-		return true;
-	}
-
-	scratch = &hws->scratch_aud[ch];
-	if (!scratch->cpu || !scratch->size)
+	if (ch >= hws->cur_max_video_ch)
 		return false;
 
+	scratch = &hws->scratch_vid[ch];
+	if (!scratch->cpu || scratch->size < MAX_AUDIO_CAP_SIZE)
+		return false;
 	if (cpu_base)
-		*cpu_base = scratch->cpu;
+		*cpu_base = (char *)scratch->cpu + scratch->size - MAX_AUDIO_CAP_SIZE;
 	if (dma_base)
-		*dma_base = scratch->dma;
+		*dma_base = scratch->dma + scratch->size - MAX_AUDIO_CAP_SIZE;
 	if (size)
-		*size = scratch->size;
+		*size = MAX_AUDIO_CAP_SIZE;
 	return true;
 }
 
@@ -102,7 +87,7 @@ static void hws_audio_trace_probe_work(struct work_struct *work)
 		return;
 
 	ch = a->channel_index;
-	if (ch >= hws->cur_max_linein_ch || !READ_ONCE(a->stream_running))
+	if (ch >= hws->cur_max_audio_ch || !a->stream_running)
 		return;
 
 	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &probe_len, NULL))
@@ -113,7 +98,7 @@ static void hws_audio_trace_probe_work(struct work_struct *work)
 	dev_info(&hws->pdev->dev,
 		 "audio-trace:probe ch%u crc=%08x->%08x len=%zu irq=%u delivered=%u int=%08x toggle=%u\n",
 		 ch, a->trace_probe_crc, crc_now, probe_len,
-		 READ_ONCE(a->irq_count), READ_ONCE(a->delivered_count),
+		 a->irq_count, a->delivered_count,
 		 readl_relaxed(hws->bar0_base + HWS_REG_INT_STATUS),
 		 readl_relaxed(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01);
 }
@@ -130,7 +115,7 @@ static void hws_audio_trace_state(struct hws_pcie_dev *hws, unsigned int ch,
 	size_t size;
 	bool using_shared_tail;
 
-	if (!hws_audio_trace || !hws || ch >= hws->cur_max_linein_ch)
+	if (!hws_audio_trace || !hws || ch >= hws->cur_max_audio_ch)
 		return;
 
 	a = &hws->audio[ch];
@@ -157,12 +142,12 @@ static void hws_audio_trace_state(struct hws_pcie_dev *hws, unsigned int ch,
 
 	dev_info(&hws->pdev->dev,
 		 "audio-trace:%s ch%u dma=%pad size=%zu src=%s shared=[%08x/%08x] audio=[%08x/%08x] base=%08x acap=%08x int=%08x gate=%08x br=%08x dec=%08x sys=%08x input=%08x toggle=%u active=%d running=%d irq=%u delivered=%u\n",
-		 tag, ch, &dma, size, using_shared_tail ? "vidtail" : "audscratch",
+		 tag, ch, &dma, size, using_shared_tail ? "vidtail" : "audio_slot",
 		 shared_hi, shared_lo,
 		 audio_hi, audio_lo, aud_base, acap, int_status, int_en_gate,
 		 bridge_en, int_decode, sys_status, active_status,
-		 abuf_toggle, READ_ONCE(a->cap_active), READ_ONCE(a->stream_running),
-		 READ_ONCE(a->irq_count), READ_ONCE(a->delivered_count));
+		 abuf_toggle, a->cap_active, a->stream_running,
+		 a->irq_count, a->delivered_count);
 }
 
 static void hws_audio_program_remap_slot(struct hws_pcie_dev *hws,
@@ -181,7 +166,7 @@ static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws, unsigned int 
 	u32 audio_table_off;
 	bool using_shared_tail;
 
-	if (!hws || ch >= hws->cur_max_linein_ch)
+	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
 
 	if (!hws_audio_select_buffer(hws, ch, NULL, &dma, &size, &using_shared_tail))
@@ -192,15 +177,8 @@ static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws, unsigned int 
 	pci_addr = lo & PCI_E_BAR_ADD_LOWMASK;
 	lo &= PCI_E_BAR_ADD_MASK;
 	audio_table_off = HWS_AUDIO_REMAP_SLOT_OFF(ch);
-	hws_audio_program_remap_slot(hws, audio_table_off, hi, lo);
-	if (using_shared_tail) {
-		hws_audio_program_remap_slot(hws, 0x208 + ch * 8, hi, lo);
-		/*
-		 * The shared slot cache now no longer matches hardware. Force the
-		 * next video stream-on for this channel to reprogram its window.
-		 */
-		WRITE_ONCE(hws->video[ch].window_valid, false);
-	}
+	if (!using_shared_tail)
+		hws_audio_program_remap_slot(hws, audio_table_off, hi, lo);
 	writel_relaxed((ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
 		       hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
 	(void)readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
@@ -215,7 +193,7 @@ void hws_audio_seed_channels(struct hws_pcie_dev *hws)
 	if (!hws || !hws->bar0_base)
 		return;
 
-	for (ch = 0; ch < hws->cur_max_linein_ch; ch++) {
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
 		int ret = hws_audio_seed_capture_buffer(hws, ch);
 
 		if (ret && hws_audio_trace)
@@ -245,18 +223,18 @@ static void hws_audio_deliver_packet(struct hws_audio *a, const void *src)
 	unsigned int elapsed = 0;
 	char *dst;
 
-	ss = READ_ONCE(a->pcm_substream);
+	ss = a->pcm_substream;
 	if (!ss)
 		return;
 
-	rt = READ_ONCE(ss->runtime);
+	rt = ss->runtime;
 	if (!rt || !rt->dma_area)
 		return;
 
-	frame_bytes = READ_ONCE(a->frame_bytes);
-	packet_bytes = READ_ONCE(a->hw_packet_bytes);
-	ring_frames = READ_ONCE(a->ring_size_byframes);
-	period_frames = READ_ONCE(a->period_size_byframes);
+	frame_bytes = a->frame_bytes;
+	packet_bytes = a->hw_packet_bytes;
+	ring_frames = a->ring_size_byframes;
+	period_frames = a->period_size_byframes;
 	if (!frame_bytes || !packet_bytes || !ring_frames || !period_frames)
 		return;
 	if (packet_bytes % frame_bytes)
@@ -299,15 +277,15 @@ void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cu
 	size_t offset;
 	u32 irq_count;
 
-	if (!hws || ch >= hws->cur_max_linein_ch)
+	if (!hws || ch >= hws->cur_max_audio_ch)
 		return;
 
 	a = &hws->audio[ch];
 	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &size, NULL) ||
-	    !READ_ONCE(a->stream_running))
+	    !a->stream_running)
 		return;
 
-	WRITE_ONCE(a->last_period_toggle, cur_toggle);
+	a->last_period_toggle = cur_toggle;
 	irq_count = ++a->irq_count;
 	if (hws_audio_trace && irq_count == 1)
 		hws_trace_bar0_snapshot(hws, "audio.first_irq");
@@ -337,7 +315,7 @@ void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cu
 
 static void hws_audio_hw_stop(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	if (!hws || ch >= hws->cur_max_linein_ch)
+	if (!hws || ch >= hws->cur_max_audio_ch)
 		return;
 
 	/* Disable the channel */
@@ -400,16 +378,16 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 {
 	struct hws_audio *aud;
 
-	if (!pdev || ch < 0 || ch >= pdev->cur_max_linein_ch)
+	if (!pdev || ch < 0 || ch >= pdev->cur_max_audio_ch)
 		return;
 
 	aud = &pdev->audio[ch];
 
 	/* 1) Make IRQ path a no-op first */
 	cancel_delayed_work_sync(&aud->trace_probe_work);
-	WRITE_ONCE(aud->stream_running, false);
-	WRITE_ONCE(aud->cap_active,     false);
-	WRITE_ONCE(aud->stop_requested, true);
+	aud->stream_running = false;
+	aud->cap_active = false;
+	aud->stop_requested = true;
 	smp_wmb();  /* publish flags before touching HW */
 
 	/* 2) Quiesce hardware (disable ch, flush, ack pending ADONE) */
@@ -449,18 +427,23 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	int ret;
 	u32 gate, bridge;
 
-	if (!hws || ch >= hws->cur_max_linein_ch)
+	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
 
 	/* Already running? Re-assert HW if needed. */
-	if (READ_ONCE(hws->audio[ch].stream_running)) {
+	if (hws->audio[ch].stream_running) {
 		if (!hws_check_audio_capture(hws, ch)) {
 			ret = hws_check_card_status(hws);
 			if (ret)
 				return ret;
-			ret = hws_audio_seed_capture_buffer(hws, ch);
+			ret = hws_video_enter_staging(hws, ch);
 			if (ret)
 				return ret;
+			ret = hws_audio_seed_capture_buffer(hws, ch);
+			if (ret) {
+				hws_video_leave_staging(hws, ch);
+				return ret;
+			}
 			hws_enable_audio_capture(hws, ch, true);
 			hws_audio_trace_state(hws, ch, "restart");
 		}
@@ -489,18 +472,24 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 				 ch, gate, gate_after, bridge, bridge_after, dec_after);
 	}
 
-	ret = hws_audio_seed_capture_buffer(hws, ch);
+	ret = hws_video_enter_staging(hws, ch);
 	if (ret)
 		return ret;
+
+	ret = hws_audio_seed_capture_buffer(hws, ch);
+	if (ret) {
+		hws_video_leave_staging(hws, ch);
+		return ret;
+	}
 	hws_trace_bar0_snapshot(hws, "audio.seed");
 
 	/* Flip state visible to IRQ */
 	cancel_delayed_work_sync(&hws->audio[ch].trace_probe_work);
-	WRITE_ONCE(hws->audio[ch].stop_requested, false);
-	WRITE_ONCE(hws->audio[ch].stream_running, true);
-	WRITE_ONCE(hws->audio[ch].cap_active, true);
-	WRITE_ONCE(hws->audio[ch].irq_count, 0);
-	WRITE_ONCE(hws->audio[ch].delivered_count, 0);
+	hws->audio[ch].stop_requested = false;
+	hws->audio[ch].stream_running = true;
+	hws->audio[ch].cap_active = true;
+	hws->audio[ch].irq_count = 0;
+	hws->audio[ch].delivered_count = 0;
 	if (hws_audio_trace) {
 		void *cpu;
 		size_t probe_len;
@@ -537,7 +526,7 @@ static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 {
 	u32 mask = 0;
 
-	for (unsigned int ch = 0; ch < hws->cur_max_linein_ch; ch++)
+	for (unsigned int ch = 0; ch < hws->cur_max_audio_ch; ch++)
 		mask |= HWS_INT_ADONE_BIT(ch);
 	if (mask) {
 		writel(mask, hws->bar0_base + HWS_REG_INT_ACK);
@@ -547,17 +536,17 @@ static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 
 void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	if (!hws || ch >= hws->cur_max_linein_ch)
+	if (!hws || ch >= hws->cur_max_audio_ch)
 		return;
 
-	if (!READ_ONCE(hws->audio[ch].stream_running))
+	if (!hws->audio[ch].stream_running)
 		return;
 
 	/* 1) Publish software state so IRQ path becomes a no-op */
 	cancel_delayed_work_sync(&hws->audio[ch].trace_probe_work);
-	WRITE_ONCE(hws->audio[ch].stream_running, false);
-	WRITE_ONCE(hws->audio[ch].cap_active,     false);
-	WRITE_ONCE(hws->audio[ch].stop_requested, true);
+	hws->audio[ch].stream_running = false;
+	hws->audio[ch].cap_active = false;
+	hws->audio[ch].stop_requested = true;
 	smp_wmb(); /* make sure flags are visible before HW disable */
 
 	/* 2) Disable channel in HW */
@@ -571,6 +560,7 @@ void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	hws->audio[ch].ring_wpos_byframes = 0;
 	hws->audio[ch].period_used_byframes = 0;
 	spin_unlock(&hws->audio[ch].ring_lock);
+	hws_video_leave_staging(hws, ch);
 
 	dev_dbg(&hws->pdev->dev, "audio capture stopped on ch %u\n", ch);
 }
@@ -580,7 +570,7 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 {
 	u32 reg, mask = BIT(ch);
 
-	if (!hws || ch >= hws->cur_max_linein_ch || hws->pci_lost)
+	if (!hws || ch >= hws->cur_max_audio_ch || hws->pci_lost)
 		return;
 
 	reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
@@ -599,7 +589,7 @@ static snd_pcm_uframes_t hws_pcie_audio_pointer(struct snd_pcm_substream *substr
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
 
-	return READ_ONCE(a->ring_wpos_byframes);
+	return a->ring_wpos_byframes;
 }
 
 int hws_pcie_audio_open(struct snd_pcm_substream *substream)
@@ -710,7 +700,7 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 
 	if (!hws)
 		return -EINVAL;
-	if (!hws->cur_max_linein_ch)
+	if (!hws->cur_max_audio_ch)
 		return 0;
 
 	/* ---- Create a single ALSA card for this PCI function ---- */
@@ -730,7 +720,7 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 	strscpy(card->longname,  card->shortname, sizeof(card->longname));
 
 	/* ---- Create one PCM capture device per HDMI input ---- */
-	for (i = 0; i < hws->cur_max_linein_ch; i++) {
+	for (i = 0; i < hws->cur_max_audio_ch; i++) {
 		char pcm_name[32];
 
 		snprintf(pcm_name, sizeof(pcm_name), "HDMI In %d", i);
@@ -783,7 +773,7 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 	/* Store the single card handle (optional: also mirror to each channel if you like) */
 	hws->snd_card = card;
 	dev_info(&hws->pdev->dev, "audio registration complete (%d HDMI inputs)\n",
-		 hws->cur_max_linein_ch);
+		 hws->cur_max_audio_ch);
 	return 0;
 
 error_card:
@@ -801,17 +791,17 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 	if (hws->snd_card)
 		snd_card_disconnect(hws->snd_card);
 
-	for (unsigned int i = 0; i < hws->cur_max_linein_ch; i++) {
+	for (unsigned int i = 0; i < hws->cur_max_audio_ch; i++) {
 		struct hws_audio *a = &hws->audio[i];
 
 		/* Flip flags first so IRQ path won’t call ALSA anymore */
-		WRITE_ONCE(a->stream_running, false);
-		WRITE_ONCE(a->cap_active,     false);
-		WRITE_ONCE(a->stop_requested, true);
+		a->stream_running = false;
+		a->cap_active = false;
+		a->stop_requested = true;
 		/* Publish stop flags before disabling capture in HW.
 		 * Ensures that any CPU/core handling an ADONE IRQ or bottom half
 		 * observes stream_running/cap_active=false before it sees the
-		 * effect of the MMIO write below. Pairs with READ_ONCE() checks
+		 * effect of the MMIO write below. Pairs with flag checks
 		 * in the IRQ/BH paths so ALSA callbacks are never invoked after
 		 * the stream has been marked stopped.
 		 */
@@ -827,7 +817,7 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 	}
 
 	dev_info(&hws->pdev->dev, "audio unregistered (%u channels)\n",
-		 hws->cur_max_linein_ch);
+		 hws->cur_max_audio_ch);
 }
 
 int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws)
@@ -840,9 +830,9 @@ int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws)
 		return 0;
 
 	/* Iterate audio channels and suspend each unique PCM device */
-	for (i = 0; i < hws->cur_max_linein_ch && i < ARRAY_SIZE(hws->audio); i++) {
+	for (i = 0; i < hws->cur_max_audio_ch && i < ARRAY_SIZE(hws->audio); i++) {
 		struct hws_audio *a = &hws->audio[i];
-		struct snd_pcm_substream *ss = READ_ONCE(a->pcm_substream);
+		struct snd_pcm_substream *ss = a->pcm_substream;
 		struct snd_pcm *pcm;
 		bool already = false;
 
