@@ -426,14 +426,9 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 			ret = hws_check_card_status(hws);
 			if (ret)
 				return ret;
-			ret = hws_video_enter_staging(hws, ch);
+			ret = hws_audio_seed_capture_buffer(hws, ch);
 			if (ret)
 				return ret;
-			ret = hws_audio_seed_capture_buffer(hws, ch);
-			if (ret) {
-				hws_video_leave_staging(hws, ch);
-				return ret;
-			}
 			hws_enable_audio_capture(hws, ch, true);
 			hws_audio_trace_state(hws, ch, "restart");
 		}
@@ -462,15 +457,9 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 				 ch, gate, gate_after, bridge, bridge_after, dec_after);
 	}
 
-	ret = hws_video_enter_staging(hws, ch);
+	ret = hws_audio_seed_capture_buffer(hws, ch);
 	if (ret)
 		return ret;
-
-	ret = hws_audio_seed_capture_buffer(hws, ch);
-	if (ret) {
-		hws_video_leave_staging(hws, ch);
-		return ret;
-	}
 	hws_trace_bar0_snapshot(hws, "audio.seed");
 
 	/* Flip state visible to IRQ */
@@ -550,7 +539,6 @@ void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	hws->audio[ch].ring_wpos_byframes = 0;
 	hws->audio[ch].period_used_byframes = 0;
 	spin_unlock(&hws->audio[ch].ring_lock);
-	hws_video_leave_staging(hws, ch);
 
 	dev_dbg(&hws->pdev->dev, "audio capture stopped on ch %u\n", ch);
 }

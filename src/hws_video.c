@@ -1464,9 +1464,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	v->half_seen = false;
 	v->last_buf_half_toggle = 0;
 
-	if (v->staging_active ||
-	    (v->channel_index < hws->cur_max_audio_ch &&
-	     hws->audio[v->channel_index].stream_running))
+	if (v->staging_active)
 		return hws_video_enter_staging(hws, v->channel_index);
 
 	/* Try to prime a buffer, but it's OK if none are queued yet */
@@ -1573,9 +1571,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	hws_enable_video_capture(v->parent, v->channel_index, false);
 	cancel_work_sync(&v->staging_work);
 	v->staging_copy_pending = false;
-	if (v->channel_index >= hws->cur_max_audio_ch ||
-	    !hws->audio[v->channel_index].stream_running)
-		v->staging_active = false;
+	v->staging_active = false;
 
 	/* 2) Collect in-flight + queued under the IRQ lock */
 	spin_lock_irqsave(&v->irq_lock, flags);
