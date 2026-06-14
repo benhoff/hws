@@ -16,7 +16,7 @@ the fastest way to answer:
 
 Defaults:
   --video-device /dev/video3
-  --audio-devices hw:5,0,hw:5,1,hw:5,2,hw:5,3
+  --audio-devices "hw:5,0 hw:5,1 hw:5,2 hw:5,3"
   --duration 4
   --skip-video
 
@@ -48,6 +48,19 @@ log() {
 
 have_cmd() {
 	command -v "$1" >/dev/null 2>&1
+}
+
+expand_audio_device_list() {
+	local spec=$1
+	local token
+
+	spec=${spec//,hw:/ hw:}
+	spec=${spec//,plughw:/ plughw:}
+	spec=${spec//;/ }
+
+	for token in $spec; do
+		[ -n "$token" ] && printf '%s\n' "$token"
+	done
 }
 
 summary_value() {
@@ -137,7 +150,10 @@ parse_args() {
 			shift 2
 			;;
 		--audio-devices)
-			IFS=',' read -r -a AUDIO_DEVICES <<<"$2"
+			AUDIO_DEVICES=()
+			while IFS= read -r dev; do
+				[ -n "$dev" ] && AUDIO_DEVICES+=("$dev")
+			done < <(expand_audio_device_list "$2")
 			shift 2
 			;;
 		--duration)
