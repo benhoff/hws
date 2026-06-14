@@ -5,7 +5,9 @@
 #include "hws_reg.h"
 
 #include <linux/crc32.h>
+#include <linux/ktime.h>
 #include <linux/moduleparam.h>
+#include <linux/slab.h>
 #include <sound/core.h>
 #include <sound/pcm_params.h>
 #include <sound/control.h>
@@ -28,7 +30,7 @@ static const struct snd_pcm_hardware audio_pcm_hardware = {
 	.period_bytes_min = 512,
 	.period_bytes_max = 16 * 1024,
 	.periods_min = 2,
-	.periods_max = 64,
+	.periods_max = 255,
 };
 
 static bool hws_audio_trace;
@@ -39,6 +41,172 @@ MODULE_PARM_DESC(audio_trace,
 bool hws_audio_trace_enabled(void)
 {
 	return hws_audio_trace;
+}
+
+static size_t hws_audio_sample_slot_size(const struct hws_audio *a)
+{
+	return a->hw_packet_bytes ? a->hw_packet_bytes : MAX_DMA_AUDIO_PK_SIZE;
+}
+
+static void hws_audio_sample_bank_clear_locked(struct hws_audio *a)
+{
+	a->sample_captured = 0;
+	a->sample_total_packets = 0;
+	a->sample_quiet_packets = 0;
+	a->sample_dropped_full = 0;
+	a->sample_last_peak = 0;
+	a->sample_max_peak = 0;
+	a->sample_next_seq = 0;
+	memset(a->sample_meta, 0, sizeof(a->sample_meta));
+	if (a->sample_data)
+		memset(a->sample_data, 0, a->sample_data_size);
+}
+
+void hws_audio_sample_bank_reset(struct hws_audio *a, bool arm)
+{
+	unsigned long flags;
+
+	if (!a)
+		return;
+
+	spin_lock_irqsave(&a->sample_lock, flags);
+	hws_audio_sample_bank_clear_locked(a);
+	a->sample_armed = arm && a->sample_data;
+	spin_unlock_irqrestore(&a->sample_lock, flags);
+}
+
+void hws_audio_sample_bank_set_armed(struct hws_audio *a, bool armed)
+{
+	unsigned long flags;
+
+	if (!a)
+		return;
+
+	spin_lock_irqsave(&a->sample_lock, flags);
+	a->sample_armed = armed && a->sample_data &&
+		a->sample_captured < a->sample_limit;
+	spin_unlock_irqrestore(&a->sample_lock, flags);
+}
+
+int hws_audio_sample_bank_set_limit(struct hws_audio *a, u32 limit)
+{
+	unsigned long flags;
+
+	if (!a || !limit || limit > HWS_AUDIO_SAMPLE_MAX_SLOTS)
+		return -EINVAL;
+
+	spin_lock_irqsave(&a->sample_lock, flags);
+	a->sample_limit = limit;
+	if (a->sample_captured >= a->sample_limit)
+		a->sample_armed = false;
+	spin_unlock_irqrestore(&a->sample_lock, flags);
+	return 0;
+}
+
+void hws_audio_sample_bank_set_threshold(struct hws_audio *a, u32 threshold)
+{
+	unsigned long flags;
+
+	if (!a)
+		return;
+
+	if (threshold > 32768)
+		threshold = 32768;
+
+	spin_lock_irqsave(&a->sample_lock, flags);
+	a->sample_threshold = threshold;
+	spin_unlock_irqrestore(&a->sample_lock, flags);
+}
+
+void hws_audio_sample_bank_free(struct hws_audio *a)
+{
+	unsigned long flags;
+	void *data;
+
+	if (!a)
+		return;
+
+	spin_lock_irqsave(&a->sample_lock, flags);
+	a->sample_armed = false;
+	data = a->sample_data;
+	a->sample_data = NULL;
+	a->sample_data_size = 0;
+	hws_audio_sample_bank_clear_locked(a);
+	spin_unlock_irqrestore(&a->sample_lock, flags);
+
+	kvfree(data);
+}
+
+static void hws_audio_sample_bank_maybe_record(struct hws_audio *a,
+					       const void *src, size_t bytes,
+					       u8 toggle)
+{
+	const s16 *samples = src;
+	unsigned int sample_count = bytes / sizeof(*samples);
+	struct hws_audio_sample_meta *meta;
+	unsigned long flags;
+	size_t slot_size;
+	u64 sum_abs = 0;
+	u32 peak = 0;
+	u32 slot;
+
+	if (!a || !src || !READ_ONCE(a->sample_armed))
+		return;
+
+	for (unsigned int i = 0; i < sample_count; i++) {
+		int value = samples[i];
+		u32 magnitude = value < 0 ? -value : value;
+
+		if (magnitude > peak)
+			peak = magnitude;
+		sum_abs += magnitude;
+	}
+
+	spin_lock_irqsave(&a->sample_lock, flags);
+	if (!a->sample_armed)
+		goto out;
+
+	a->sample_total_packets++;
+	a->sample_last_peak = peak;
+	if (peak > a->sample_max_peak)
+		a->sample_max_peak = peak;
+
+	if (!peak || peak < a->sample_threshold) {
+		a->sample_quiet_packets++;
+		goto out;
+	}
+
+	if (a->sample_captured >= a->sample_limit) {
+		a->sample_dropped_full++;
+		a->sample_armed = false;
+		goto out;
+	}
+
+	slot_size = hws_audio_sample_slot_size(a);
+	if (!a->sample_data || bytes > slot_size ||
+	    (a->sample_captured + 1) * slot_size > a->sample_data_size) {
+		a->sample_dropped_full++;
+		a->sample_armed = false;
+		goto out;
+	}
+
+	slot = a->sample_captured++;
+	meta = &a->sample_meta[slot];
+	meta->seq = a->sample_next_seq++;
+	meta->ktime_ns = ktime_get_ns();
+	meta->irq_count = a->irq_count;
+	meta->delivered_count = a->delivered_count;
+	meta->bytes = bytes;
+	meta->peak = peak;
+	meta->sum_abs = sum_abs;
+	meta->toggle = toggle;
+	memcpy(a->sample_data + slot * slot_size, src, bytes);
+
+	if (a->sample_captured >= a->sample_limit)
+		a->sample_armed = false;
+
+out:
+	spin_unlock_irqrestore(&a->sample_lock, flags);
 }
 
 static u32 hws_audio_shared_slot_off(unsigned int ch)
@@ -58,6 +226,7 @@ static bool hws_audio_select_buffer(struct hws_pcie_dev *hws, unsigned int ch,
 	scratch = &hws->scratch_aud[ch];
 	if (!scratch->cpu || !scratch->size)
 		return false;
+
 	if (cpu_base)
 		*cpu_base = scratch->cpu;
 	if (dma_base)
@@ -134,7 +303,7 @@ static void hws_audio_trace_state(struct hws_pcie_dev *hws, unsigned int ch,
 	int_decode = readl_relaxed(hws->bar0_base + PCIE_INT_DEC_REG_BASE);
 
 	dev_info(&hws->pdev->dev,
-		 "audio-trace:%s ch%u dma=%pad size=%zu src=audio_slot shared=[%08x/%08x] audio=[%08x/%08x] base=%08x acap=%08x int=%08x gate=%08x br=%08x dec=%08x sys=%08x input=%08x toggle=%u active=%d running=%d irq=%u delivered=%u\n",
+		 "audio-trace:%s ch%u dma=%pad size=%zu src=audscratch shared=[%08x/%08x] audio=[%08x/%08x] base=%08x acap=%08x int=%08x gate=%08x br=%08x dec=%08x sys=%08x input=%08x toggle=%u active=%d running=%d irq=%u delivered=%u\n",
 		 tag, ch, &dma, size,
 		 shared_hi, shared_lo,
 		 audio_hi, audio_lo, aud_base, acap, int_status, int_en_gate,
@@ -292,6 +461,8 @@ void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cu
 		}
 
 	dma_rmb();
+	hws_audio_sample_bank_maybe_record(a, (char *)cpu + offset,
+					   a->hw_packet_bytes, cur_toggle);
 	hws_audio_deliver_packet(a, (char *)cpu + offset);
 	if (hws_audio_trace && ++a->delivered_count <= 8)
 		dev_info(&hws->pdev->dev,
@@ -340,12 +511,33 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 	aud->parent        = pdev;
 	aud->channel_index = ch;
 	spin_lock_init(&aud->ring_lock);
+	spin_lock_init(&aud->sample_lock);
 
 	/* defaults */
 	aud->output_sample_rate = 48000;
 	aud->channel_count      = 2;
 	aud->bits_per_sample    = 16;
 	aud->hw_packet_bytes    = pdev->audio_pkt_size;
+	aud->sample_limit = HWS_AUDIO_SAMPLE_DEFAULT_LIMIT;
+	aud->sample_threshold = HWS_AUDIO_SAMPLE_DEFAULT_THRESHOLD;
+	aud->sample_data_size =
+		HWS_AUDIO_SAMPLE_MAX_SLOTS * hws_audio_sample_slot_size(aud);
+	if (ch < pdev->cur_max_audio_ch) {
+		aud->sample_data = kvcalloc(HWS_AUDIO_SAMPLE_MAX_SLOTS,
+					    hws_audio_sample_slot_size(aud),
+					    GFP_KERNEL);
+		if (!aud->sample_data) {
+			dev_warn(&pdev->pdev->dev,
+				 "audio sample bank allocation failed ch=%d\n",
+				 ch);
+			aud->sample_data_size = 0;
+		}
+#ifdef HWS_AUDIO_SAMPLE_DEBUG
+		else {
+			aud->sample_armed = true;
+		}
+#endif
+	}
 
 	/* ALSA linkage */
 	aud->pcm_substream = NULL;
@@ -403,6 +595,7 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 	aud->last_period_toggle = 0xFF;
 	aud->irq_count = 0;
 	aud->delivered_count = 0;
+	hws_audio_sample_bank_free(aud);
 }
 
 static inline bool hws_check_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
@@ -595,13 +788,12 @@ int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream,
 			     struct snd_pcm_hw_params *hw_params)
 {
-	/* Using preallocation done at registration time; nothing to do. */
-	return 0;
+	return snd_pcm_lib_malloc_pages(substream, params_buffer_bytes(hw_params));
 }
 
 int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
 {
-	return 0;
+	return snd_pcm_lib_free_pages(substream);
 }
 
 int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
@@ -727,11 +919,15 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 		strscpy(pcm->name, pcm_name, sizeof(pcm->name));
 		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &hws_pcie_pcm_ops);
 
-		/* ALSA-managed ring buffer for software packet delivery. */
+		/*
+		 * snd_pcm_lib_malloc_pages() requires a valid DMA buffer type.
+		 * Keep allocation dynamic at HW_PARAMS time, but advertise the
+		 * maximum buffer size up front for modern ALSA.
+		 */
 		ret = snd_pcm_set_managed_buffer_all(pcm,
 						     SNDRV_DMA_TYPE_DEV,
 						     &hws->pdev->dev,
-						     audio_pcm_hardware.buffer_bytes_max,
+						     0,
 						     audio_pcm_hardware.buffer_bytes_max);
 		if (ret < 0) {
 			dev_err(&hws->pdev->dev,
@@ -785,6 +981,7 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 		 */
 		smp_wmb();
 		hws_enable_audio_capture(hws, i, false);
+		hws_audio_sample_bank_free(a);
 	}
 	/* Flush and ack any pending audio interrupts across all channels */
 	readl(hws->bar0_base + HWS_REG_INT_STATUS);

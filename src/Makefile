@@ -16,6 +16,10 @@ EXTRA_LDFLAGS += -S
 ccflags-y += -fno-ipa-icf -w
 ccflags-y += -I$(src)
 
+ifeq ($(DEBUG),1)
+ccflags-y += -DHWS_AUDIO_SAMPLE_DEBUG
+endif
+
 ifneq ($(KERNELRELEASE),)
 KERNELDIR ?= /lib/modules/$(KERNELRELEASE)/build
 else
@@ -59,4 +63,3 @@ ifdef HAVE_CLANG_TIDY
 else
 	@echo ">> clang-tidy not available, skipping tidy checks"
 endif
-

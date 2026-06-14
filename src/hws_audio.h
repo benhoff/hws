@@ -12,6 +12,11 @@ bool hws_audio_trace_enabled(void);
 void hws_audio_seed_channels(struct hws_pcie_dev *hws);
 void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
 				u8 cur_toggle);
+void hws_audio_sample_bank_reset(struct hws_audio *a, bool arm);
+void hws_audio_sample_bank_set_armed(struct hws_audio *a, bool armed);
+int hws_audio_sample_bank_set_limit(struct hws_audio *a, u32 limit);
+void hws_audio_sample_bank_set_threshold(struct hws_audio *a, u32 threshold);
+void hws_audio_sample_bank_free(struct hws_audio *a);
 void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 			      unsigned int ch,
 			      bool enable);

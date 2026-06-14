@@ -16,6 +16,9 @@
 #include <linux/freezer.h>
 #include <linux/pci_regs.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/string.h>
+#include <linux/uaccess.h>
 
 #include <media/v4l2-ctrls.h>
 
@@ -519,6 +522,52 @@ static int hws_debugfs_audio_state_show(struct seq_file *m, void *unused)
 		seq_printf(m, "irq_count=%u\n", hws->audio[ch].irq_count);
 		seq_printf(m, "delivered_count=%u\n",
 			   hws->audio[ch].delivered_count);
+		{
+			struct hws_audio *audio = &hws->audio[ch];
+			unsigned long flags;
+			bool sample_armed;
+			u32 sample_limit;
+			u32 sample_threshold;
+			u32 sample_captured;
+			u32 sample_total_packets;
+			u32 sample_quiet_packets;
+			u32 sample_dropped_full;
+			u32 sample_last_peak;
+			u32 sample_max_peak;
+			size_t sample_data_size;
+
+			spin_lock_irqsave(&audio->sample_lock, flags);
+			sample_armed = audio->sample_armed;
+			sample_limit = audio->sample_limit;
+			sample_threshold = audio->sample_threshold;
+			sample_captured = audio->sample_captured;
+			sample_total_packets = audio->sample_total_packets;
+			sample_quiet_packets = audio->sample_quiet_packets;
+			sample_dropped_full = audio->sample_dropped_full;
+			sample_last_peak = audio->sample_last_peak;
+			sample_max_peak = audio->sample_max_peak;
+			sample_data_size = audio->sample_data_size;
+			spin_unlock_irqrestore(&audio->sample_lock, flags);
+
+			seq_printf(m, "sample_bank_bytes=%zu\n",
+				   sample_data_size);
+			seq_printf(m, "sample_armed=%u\n", sample_armed);
+			seq_printf(m, "sample_limit=%u\n", sample_limit);
+			seq_printf(m, "sample_threshold=%u\n",
+				   sample_threshold);
+			seq_printf(m, "sample_captured=%u\n",
+				   sample_captured);
+			seq_printf(m, "sample_total_packets=%u\n",
+				   sample_total_packets);
+			seq_printf(m, "sample_quiet_packets=%u\n",
+				   sample_quiet_packets);
+			seq_printf(m, "sample_dropped_full=%u\n",
+				   sample_dropped_full);
+			seq_printf(m, "sample_last_peak=%u\n",
+				   sample_last_peak);
+			seq_printf(m, "sample_max_peak=%u\n",
+				   sample_max_peak);
+		}
 	}
 
 	return 0;
@@ -548,6 +597,231 @@ static ssize_t hws_debugfs_audio_scratch_read(struct file *file,
 				       scratch->size);
 }
 
+static ssize_t hws_debugfs_audio_samples_read(struct file *file,
+					      char __user *user_buf, size_t count,
+					      loff_t *ppos)
+{
+	struct hws_audio *audio = file->private_data;
+	unsigned long flags;
+	unsigned int captured;
+	size_t slot_size;
+	size_t alloc_size;
+	size_t copied = 0;
+	void *snapshot;
+	ssize_t ret;
+
+	if (!audio || !audio->parent)
+		return -ENODEV;
+	if (!audio->sample_data)
+		return -ENODATA;
+
+	spin_lock_irqsave(&audio->sample_lock, flags);
+	if (audio->sample_armed) {
+		spin_unlock_irqrestore(&audio->sample_lock, flags);
+		return -EBUSY;
+	}
+	captured = audio->sample_captured;
+	slot_size = audio->hw_packet_bytes ? audio->hw_packet_bytes :
+		MAX_DMA_AUDIO_PK_SIZE;
+	spin_unlock_irqrestore(&audio->sample_lock, flags);
+
+	if (!captured)
+		return 0;
+
+	alloc_size = captured * slot_size;
+	snapshot = kvzalloc(alloc_size, GFP_KERNEL);
+	if (!snapshot)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&audio->sample_lock, flags);
+	captured = min_t(unsigned int, captured, audio->sample_captured);
+	for (unsigned int i = 0; i < captured; i++) {
+		size_t bytes = audio->sample_meta[i].bytes;
+
+		if (!bytes || bytes > slot_size)
+			bytes = slot_size;
+		if (copied + bytes > alloc_size)
+			break;
+		memcpy((char *)snapshot + copied,
+		       audio->sample_data + i * slot_size, bytes);
+		copied += bytes;
+	}
+	spin_unlock_irqrestore(&audio->sample_lock, flags);
+
+	ret = simple_read_from_buffer(user_buf, count, ppos, snapshot, copied);
+	kvfree(snapshot);
+	return ret;
+}
+
+static ssize_t hws_debugfs_audio_sample_ctl_read(struct file *file,
+						 char __user *user_buf,
+						 size_t count, loff_t *ppos)
+{
+	struct hws_audio *audio = file->private_data;
+	unsigned long flags;
+	char buf[512];
+	int n = 0;
+	bool armed;
+	u32 limit;
+	u32 threshold;
+	u32 captured;
+	u32 total_packets;
+	u32 quiet_packets;
+	u32 dropped_full;
+	u32 last_peak;
+	u32 max_peak;
+	size_t bytes;
+	size_t slot_size;
+
+	if (!audio || !audio->parent)
+		return -ENODEV;
+
+	spin_lock_irqsave(&audio->sample_lock, flags);
+	armed = audio->sample_armed;
+	limit = audio->sample_limit;
+	threshold = audio->sample_threshold;
+	captured = audio->sample_captured;
+	total_packets = audio->sample_total_packets;
+	quiet_packets = audio->sample_quiet_packets;
+	dropped_full = audio->sample_dropped_full;
+	last_peak = audio->sample_last_peak;
+	max_peak = audio->sample_max_peak;
+	bytes = audio->sample_data_size;
+	slot_size = audio->hw_packet_bytes ? audio->hw_packet_bytes :
+		MAX_DMA_AUDIO_PK_SIZE;
+	spin_unlock_irqrestore(&audio->sample_lock, flags);
+
+	n += scnprintf(buf + n, sizeof(buf) - n,
+		       "commands: arm [limit] [threshold], flush, clear, limit N, threshold N\n");
+#ifdef HWS_AUDIO_SAMPLE_DEBUG
+	n += scnprintf(buf + n, sizeof(buf) - n, "debug_auto_arm=1\n");
+	n += scnprintf(buf + n, sizeof(buf) - n, "debug_autostart=1\n");
+#else
+	n += scnprintf(buf + n, sizeof(buf) - n, "debug_auto_arm=0\n");
+	n += scnprintf(buf + n, sizeof(buf) - n, "debug_autostart=0\n");
+#endif
+	n += scnprintf(buf + n, sizeof(buf) - n,
+		       "armed=%u\nlimit=%u\nthreshold=%u\ncaptured=%u\n",
+		       armed, limit, threshold, captured);
+	n += scnprintf(buf + n, sizeof(buf) - n,
+		       "slot_bytes=%zu\nbank_bytes=%zu\n",
+		       slot_size, bytes);
+	n += scnprintf(buf + n, sizeof(buf) - n,
+		       "total_packets=%u\nquiet_packets=%u\ndropped_full=%u\n",
+		       total_packets, quiet_packets, dropped_full);
+	n += scnprintf(buf + n, sizeof(buf) - n,
+		       "last_peak=%u\nmax_peak=%u\n",
+		       last_peak, max_peak);
+	return simple_read_from_buffer(user_buf, count, ppos, buf, n);
+}
+
+static ssize_t hws_debugfs_audio_sample_ctl_write(struct file *file,
+						  const char __user *user_buf,
+						  size_t count, loff_t *ppos)
+{
+	struct hws_audio *audio = file->private_data;
+	char *buf;
+	char *cmd;
+	u32 limit;
+	u32 threshold;
+	int fields;
+	int ret = 0;
+
+	if (!audio || !audio->parent)
+		return -ENODEV;
+	if (count > 96)
+		return -EINVAL;
+
+	buf = memdup_user_nul(user_buf, count);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+	cmd = strim(buf);
+
+	fields = sscanf(cmd, "arm %u %u", &limit, &threshold);
+	if (sysfs_streq(cmd, "arm") || fields >= 1) {
+		if (fields >= 1) {
+			ret = hws_audio_sample_bank_set_limit(audio, limit);
+			if (ret)
+				goto out;
+		}
+		if (fields >= 2)
+			hws_audio_sample_bank_set_threshold(audio, threshold);
+		hws_audio_sample_bank_reset(audio, true);
+	} else if (sysfs_streq(cmd, "flush") ||
+		   sysfs_streq(cmd, "stop") ||
+		   sysfs_streq(cmd, "disarm")) {
+		hws_audio_sample_bank_set_armed(audio, false);
+	} else if (sysfs_streq(cmd, "clear") ||
+		   sysfs_streq(cmd, "reset")) {
+		hws_audio_sample_bank_reset(audio, false);
+	} else if (sscanf(cmd, "limit %u", &limit) == 1) {
+		ret = hws_audio_sample_bank_set_limit(audio, limit);
+		if (ret)
+			goto out;
+	} else if (sscanf(cmd, "threshold %u", &threshold) == 1) {
+		hws_audio_sample_bank_set_threshold(audio, threshold);
+	} else {
+		ret = -EINVAL;
+	}
+
+out:
+	kvfree(buf);
+	return ret ? ret : count;
+}
+
+static int hws_debugfs_audio_sample_meta_show(struct seq_file *m, void *unused)
+{
+	struct hws_audio *audio = m->private;
+	struct hws_audio_sample_meta *meta;
+	unsigned long flags;
+	unsigned int captured;
+	u32 threshold;
+	size_t slot_size;
+
+	if (!audio || !audio->parent)
+		return -ENODEV;
+
+	meta = kcalloc(HWS_AUDIO_SAMPLE_MAX_SLOTS, sizeof(*meta), GFP_KERNEL);
+	if (!meta)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&audio->sample_lock, flags);
+	captured = audio->sample_captured;
+	threshold = audio->sample_threshold;
+	slot_size = audio->hw_packet_bytes ? audio->hw_packet_bytes :
+		MAX_DMA_AUDIO_PK_SIZE;
+	memcpy(meta, audio->sample_meta, sizeof(audio->sample_meta));
+	spin_unlock_irqrestore(&audio->sample_lock, flags);
+
+	seq_printf(m, "channel=%d\n", audio->channel_index);
+	seq_printf(m, "captured=%u\n", captured);
+	seq_printf(m, "threshold=%u\n", threshold);
+	seq_printf(m, "slot_bytes=%zu\n", slot_size);
+	seq_puts(m, "slot\tseq\tktime_ns\tirq\tdelivered\ttoggle\tbytes\tpeak\tsum_abs\n");
+	for (unsigned int i = 0; i < captured; i++) {
+		seq_printf(m, "%u\t%llu\t%llu\t%u\t%u\t%u\t%u\t%u\t%llu\n",
+			   i,
+			   meta[i].seq,
+			   meta[i].ktime_ns,
+			   meta[i].irq_count,
+			   meta[i].delivered_count,
+			   meta[i].toggle,
+			   meta[i].bytes,
+			   meta[i].peak,
+			   meta[i].sum_abs);
+	}
+
+	kfree(meta);
+	return 0;
+}
+
+static int hws_debugfs_audio_sample_meta_open(struct inode *inode,
+					      struct file *file)
+{
+	return single_open(file, hws_debugfs_audio_sample_meta_show,
+			   inode->i_private);
+}
+
 static const struct file_operations hws_debugfs_bar0_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
@@ -568,6 +842,29 @@ static const struct file_operations hws_debugfs_audio_scratch_fops = {
 	.open = simple_open,
 	.read = hws_debugfs_audio_scratch_read,
 	.llseek = default_llseek,
+};
+
+static const struct file_operations hws_debugfs_audio_samples_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = hws_debugfs_audio_samples_read,
+	.llseek = default_llseek,
+};
+
+static const struct file_operations hws_debugfs_audio_sample_ctl_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = hws_debugfs_audio_sample_ctl_read,
+	.write = hws_debugfs_audio_sample_ctl_write,
+	.llseek = default_llseek,
+};
+
+static const struct file_operations hws_debugfs_audio_sample_meta_fops = {
+	.owner = THIS_MODULE,
+	.open = hws_debugfs_audio_sample_meta_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
 };
 
 static void hws_debugfs_cleanup(struct hws_pcie_dev *hws)
@@ -607,7 +904,40 @@ static void hws_debugfs_init(struct hws_pcie_dev *hws)
 		snprintf(name, sizeof(name), "audio_scratch_ch%u", ch);
 		debugfs_create_file(name, 0400, hws->debugfs_dir, &hws->audio[ch],
 				    &hws_debugfs_audio_scratch_fops);
+
+		snprintf(name, sizeof(name), "audio_samples_ch%u", ch);
+		debugfs_create_file(name, 0400, hws->debugfs_dir, &hws->audio[ch],
+				    &hws_debugfs_audio_samples_fops);
+
+		snprintf(name, sizeof(name), "audio_sample_ctl_ch%u", ch);
+		debugfs_create_file(name, 0600, hws->debugfs_dir, &hws->audio[ch],
+				    &hws_debugfs_audio_sample_ctl_fops);
+
+		snprintf(name, sizeof(name), "audio_sample_meta_ch%u", ch);
+		debugfs_create_file(name, 0400, hws->debugfs_dir, &hws->audio[ch],
+				    &hws_debugfs_audio_sample_meta_fops);
 	}
+}
+
+static void hws_audio_debug_autostart(struct hws_pcie_dev *hws)
+{
+#ifdef HWS_AUDIO_SAMPLE_DEBUG
+	unsigned int ch;
+
+	if (!hws)
+		return;
+
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
+		int ret;
+
+		hws_audio_sample_bank_reset(&hws->audio[ch], true);
+		ret = hws_start_audio_capture(hws, ch);
+		if (ret)
+			dev_warn(&hws->pdev->dev,
+				 "audio sample debug autostart ch%u failed: %d\n",
+				 ch, ret);
+	}
+#endif
 }
 
 /* register layout inside HWS_REG_DEVICE_INFO */
@@ -1206,6 +1536,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	}
 	audio_registered = true;
 	hws_debugfs_init(hws);
+	hws_audio_debug_autostart(hws);
 	ret = device_create_file(&pdev->dev, &dev_attr_audio_reg_probe);
 	if (ret)
 		dev_warn(&pdev->dev, "audio_reg_probe sysfs create failed: %d\n",

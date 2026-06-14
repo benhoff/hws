@@ -137,6 +137,21 @@ static inline void hws_set_current_dv_timings(struct hws_video *vid,
 	};
 }
 
+#define HWS_AUDIO_SAMPLE_MAX_SLOTS 100U
+#define HWS_AUDIO_SAMPLE_DEFAULT_LIMIT 100U
+#define HWS_AUDIO_SAMPLE_DEFAULT_THRESHOLD 256U
+
+struct hws_audio_sample_meta {
+	u64 seq;
+	u64 ktime_ns;
+	u32 irq_count;
+	u32 delivered_count;
+	u32 bytes;
+	u32 peak;
+	u64 sum_abs;
+	u8 toggle;
+};
+
 struct hws_audio {
 	/* linkage */
 	struct hws_pcie_dev *parent;
@@ -163,6 +178,22 @@ struct hws_audio {
 	u32 delivered_count;
 	struct delayed_work trace_probe_work;
 	u32 trace_probe_crc;
+
+	/* Debug-only bounded RAM sample bank, exposed through debugfs. */
+	spinlock_t sample_lock;
+	bool sample_armed;
+	u32 sample_limit;
+	u32 sample_threshold;
+	u32 sample_captured;
+	u32 sample_total_packets;
+	u32 sample_quiet_packets;
+	u32 sample_dropped_full;
+	u32 sample_last_peak;
+	u32 sample_max_peak;
+	u64 sample_next_seq;
+	struct hws_audio_sample_meta sample_meta[HWS_AUDIO_SAMPLE_MAX_SLOTS];
+	u8 *sample_data;
+	size_t sample_data_size;
 
 	/* PCM format */
 	u32 output_sample_rate;
