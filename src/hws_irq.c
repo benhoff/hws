@@ -13,6 +13,7 @@
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws.h"
+#include "hws_audio.h"
 
 #define MAX_INT_LOOPS 100
 
@@ -251,6 +252,36 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			}
 
 			writel(vbit, pdx->bar0_base + HWS_REG_INT_STATUS);
+			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
+		}
+
+		for (unsigned int ch = 0; ch < pdx->cur_max_audio_ch; ++ch) {
+			u32 abit = HWS_INT_ADONE_BIT(ch);
+			u8 cur_toggle;
+
+			if (!(int_state & abit))
+				continue;
+
+			/* Only service running streams */
+			if (!pdx->audio[ch].cap_active ||
+			    !pdx->audio[ch].stream_running) {
+				writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
+				(void)readl_relaxed(pdx->bar0_base +
+						    HWS_REG_INT_STATUS);
+				continue;
+			}
+
+			/*
+			 * Baseline read ABUF_TOGGLE for every ADONE interrupt.
+			 * The register reports the half the device is filling
+			 * now, so the completed packet is the opposite half.
+			 */
+			cur_toggle = readl_relaxed(pdx->bar0_base +
+						   HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+			pdx->audio[ch].last_period_toggle = cur_toggle;
+
+			hws_audio_handle_interrupt(pdx, ch, cur_toggle);
+			writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
 			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
 
