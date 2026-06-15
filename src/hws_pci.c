@@ -18,6 +18,7 @@
 #include <media/v4l2-ctrls.h>
 
 #include "hws.h"
+#include "hws_audio.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws_irq.h"
@@ -98,24 +99,35 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 	case 0x9534:
 	case 0x6524:
 	case 0x8524:
-	case 0x8504:
 	case 0x6504:
 		hdev->cur_max_video_ch = 4;
+		hdev->cur_max_audio_ch = 4;
+		break;
+	case 0x8504:
+		hdev->cur_max_video_ch = 4;
+		hdev->cur_max_audio_ch = 4;
 		break;
 	case 0x8532:
 		hdev->cur_max_video_ch = 2;
+		hdev->cur_max_audio_ch = 2;
 		break;
 	case 0x8512:
 	case 0x6502:
 		hdev->cur_max_video_ch = 2;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	case 0x8501:
 		hdev->cur_max_video_ch = 1;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	default:
 		hdev->cur_max_video_ch = 4;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	}
+
+	if (hdev->cur_max_audio_ch > hdev->cur_max_video_ch)
+		hdev->cur_max_audio_ch = hdev->cur_max_video_ch;
 
 	/* universal buffer capacity */
 	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
@@ -138,6 +150,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 }
 
 static void hws_stop_device(struct hws_pcie_dev *hws);
+static void hws_free_seed_buffers(struct hws_pcie_dev *hws);
 
 static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 				       const char *action,
@@ -153,7 +166,7 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 	if (!hws->bar0_base) {
 		dev_dbg(dev,
 			"lifecycle:%s:%s bar0-unmapped suspended=%d start_run=%d pci_lost=%d irq=%d\n",
-			action, phase, READ_ONCE(hws->suspended), hws->start_run,
+			action, phase, hws->suspended, hws->start_run,
 			hws->pci_lost, hws->irq);
 		return;
 	}
@@ -166,12 +179,12 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 
 	dev_dbg(dev,
 		"lifecycle:%s:%s suspended=%d start_run=%d pci_lost=%d irq=%d INT_EN=0x%08x INT_STATUS=0x%08x VCAP=0x%08x SYS=0x%08x DEC=0x%08x\n",
-		action, phase, READ_ONCE(hws->suspended), hws->start_run,
+		action, phase, hws->suspended, hws->start_run,
 		hws->pci_lost, hws->irq, int_en, int_status, vcap,
 		sys_status, dec_mode);
 }
 
-static int read_chip_id(struct hws_pcie_dev *hdev)
+static int read_chip_id(struct hws_pcie_dev *hdev, bool reset_runtime)
 {
 	u32 reg;
 	/* mirror PCI IDs for later switches */
@@ -185,11 +198,14 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->support_yv12 = FIELD_GET(DEVINFO_YV12, reg);
 	hdev->port_id = FIELD_GET(DEVINFO_PORTID, reg);
 
-	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
-	hdev->max_channels = 4;
-	hdev->buf_allocated = false;
-	hdev->main_task = NULL;
-	hdev->start_run = false;
+	if (reset_runtime) {
+		hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
+		hdev->max_channels = 4;
+		hdev->buf_allocated = false;
+		hdev->main_task = NULL;
+		hdev->audio_pkt_size = MAX_DMA_AUDIO_PK_SIZE;
+		hdev->start_run = false;
+	}
 	hdev->pci_lost = 0;
 
 	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);
@@ -213,7 +229,7 @@ static int main_ks_thread_handle(void *data)
 
 	while (!kthread_should_stop()) {
 		/* If we're suspending, don't touch hardware; just sleep/freeze. */
-		if (READ_ONCE(pdx->suspended)) {
+		if (pdx->suspended) {
 			try_to_freeze();
 			schedule_timeout_interruptible(msecs_to_jiffies(1000));
 			continue;
@@ -241,13 +257,13 @@ static void hws_stop_kthread_action(void *data)
 	if (!hws)
 		return;
 
-	t = READ_ONCE(hws->main_task);
+	t = hws->main_task;
 	if (!IS_ERR_OR_NULL(t)) {
 		start_ns = ktime_get_mono_fast_ns();
 		dev_dbg(&hws->pdev->dev,
 			"lifecycle:kthread-stop:begin task=%s[%d]\n",
 			t->comm, t->pid);
-		WRITE_ONCE(hws->main_task, NULL);
+		hws->main_task = NULL;
 		kthread_stop(t);
 		dev_dbg(&hws->pdev->dev,
 			"lifecycle:kthread-stop:done (%lluus)\n",
@@ -255,19 +271,51 @@ static void hws_stop_kthread_action(void *data)
 	}
 }
 
+static bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
+{
+	dma_addr_t end;
+
+	if (!size)
+		return false;
+
+	end = dma + size - 1;
+	if (end < dma)
+		return false;
+
+	return upper_32_bits(dma) == upper_32_bits(end) &&
+	       (lower_32_bits(dma) & PCI_E_BAR_ADD_MASK) ==
+	       (lower_32_bits(end) & PCI_E_BAR_ADD_MASK);
+}
+
 static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
-	/* 64 KiB is plenty for a safe dummy; hardware needs 64-byte alignment. */
-	const size_t need = ALIGN(64 * 1024, 64);
+	size_t need = ALIGN((size_t)hws->max_hw_video_buf_sz, 64);
+	size_t aud_need = ALIGN((size_t)MAX_AUDIO_CAP_SIZE, 64);
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 #if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
-		void *cpu = dma_alloc_coherent(&hws->pdev->dev, need,
-					       &hws->scratch_vid[ch].dma,
-					       GFP_KERNEL);
+		dma_addr_t dma = 0;
+		void *cpu = NULL;
+		int attempt;
+
+		for (attempt = 0; attempt < 8; attempt++) {
+			cpu = dma_alloc_coherent(&hws->pdev->dev, need, &dma,
+						 GFP_KERNEL);
+			if (!cpu)
+				break;
+			if (hws_dma_fits_remap_window(dma, need))
+				break;
+
+			dev_dbg(&hws->pdev->dev,
+				"scratch: retry ch=%d dma=%pad size=%zu crosses remap window\n",
+				ch, &dma, need);
+			dma_free_coherent(&hws->pdev->dev, need, cpu, dma);
+			cpu = NULL;
+		}
 #else
 		void *cpu = NULL;
+		dma_addr_t dma = 0;
 #endif
 		if (!cpu) {
 			dev_warn(&hws->pdev->dev,
@@ -284,8 +332,45 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 			}
 			return -ENOMEM;
 		}
-		hws->scratch_vid[ch].cpu  = cpu;
+		hws->scratch_vid[ch].dma  = dma;
+		hws->scratch_vid[ch].cpu = cpu;
 		hws->scratch_vid[ch].size = need;
+	}
+
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
+#if defined(CONFIG_HAS_DMA)
+		dma_addr_t dma = 0;
+		void *cpu = NULL;
+		int attempt;
+
+		for (attempt = 0; attempt < 8; attempt++) {
+			cpu = dma_alloc_coherent(&hws->pdev->dev, aud_need,
+						 &dma, GFP_KERNEL);
+			if (!cpu)
+				break;
+			if (hws_dma_fits_remap_window(dma, aud_need))
+				break;
+
+			dev_dbg(&hws->pdev->dev,
+				"audio scratch: retry ch=%d dma=%pad size=%zu crosses remap window\n",
+				ch, &dma, aud_need);
+			dma_free_coherent(&hws->pdev->dev, aud_need, cpu, dma);
+			cpu = NULL;
+		}
+#else
+		void *cpu = NULL;
+		dma_addr_t dma = 0;
+#endif
+		if (!cpu) {
+			dev_warn(&hws->pdev->dev,
+				 "audio scratch: dma_alloc_coherent failed ch=%d\n",
+				 ch);
+			hws_free_seed_buffers(hws);
+			return -ENOMEM;
+		}
+		hws->scratch_aud[ch].dma = dma;
+		hws->scratch_aud[ch].cpu = cpu;
+		hws->scratch_aud[ch].size = aud_need;
 	}
 	return 0;
 }
@@ -302,6 +387,17 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 					  hws->scratch_vid[ch].dma);
 			hws->scratch_vid[ch].cpu = NULL;
 			hws->scratch_vid[ch].size = 0;
+		}
+	}
+
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
+		if (hws->scratch_aud[ch].cpu) {
+			dma_free_coherent(&hws->pdev->dev,
+					  hws->scratch_aud[ch].size,
+					  hws->scratch_aud[ch].cpu,
+					  hws->scratch_aud[ch].dma);
+			hws->scratch_aud[ch].cpu = NULL;
+			hws->scratch_aud[ch].size = 0;
 		}
 	}
 }
@@ -353,14 +449,46 @@ static void hws_seed_all_channels(struct hws_pcie_dev *hws)
 
 static void hws_irq_mask_gate(struct hws_pcie_dev *hws)
 {
+	writel(0x00000000, hws->bar0_base + PCIEBR_EN_REG_BASE);
+	(void)readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
 	writel(0x00000000, hws->bar0_base + INT_EN_REG_BASE);
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
 static void hws_irq_unmask_gate(struct hws_pcie_dev *hws)
 {
+	/*
+	 * Baseline reopened the full interrupt fabric together:
+	 * route -> bridge enable -> interrupt gate.
+	 */
+	writel(0x00000000, hws->bar0_base + PCIE_INT_DEC_REG_BASE);
+	(void)readl(hws->bar0_base + PCIE_INT_DEC_REG_BASE);
+	writel(0x00000001, hws->bar0_base + PCIEBR_EN_REG_BASE);
+	(void)readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
 	writel(HWS_INT_EN_MASK, hws->bar0_base + INT_EN_REG_BASE);
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
+}
+
+void hws_enable_global_irq(struct hws_pcie_dev *hws)
+{
+	u32 ctl;
+
+	if (!hws || !hws->bar0_base)
+		return;
+
+	ctl = readl(hws->bar0_base + HWS_REG_CTL);
+	ctl |= HWS_CTL_IRQ_ENABLE_BIT;
+	writel(ctl, hws->bar0_base + HWS_REG_CTL);
+	(void)readl(hws->bar0_base + HWS_REG_CTL);
+}
+
+void hws_restore_irq_fabric(struct hws_pcie_dev *hws)
+{
+	if (!hws || !hws->bar0_base)
+		return;
+
+	hws_enable_global_irq(hws);
+	hws_irq_unmask_gate(hws);
 }
 
 static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
@@ -375,7 +503,7 @@ static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 
 static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 {
-	WRITE_ONCE(hws->suspended, true);
+	hws->suspended = true;
 	if (hws->irq >= 0)
 		disable_irq(hws->irq);
 
@@ -392,6 +520,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	int i, ret, irq;
 	unsigned long irqf = 0;
 	bool v4l2_registered = false;
+	bool audio_registered = false;
 
 	/* devres-backed device object */
 	hws = devm_kzalloc(&pdev->dev, sizeof(*hws), GFP_KERNEL);
@@ -435,16 +564,20 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 #endif
 
 	/* 4) Identify chip & capabilities */
-	read_chip_id(hws);
+	read_chip_id(hws, true);
 	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n",
 		 pdev->vendor, pdev->device);
-	hws_init_video_sys(hws, false);
 
-	/* 5) Init channels (video state, locks, vb2, ctrls) */
+	/* 5) Init channels (video/audio state, locks, vb2, ctrls) */
 	for (i = 0; i < hws->max_channels; i++) {
 		ret = hws_video_init_channel(hws, i);
 		if (ret) {
 			dev_err(&pdev->dev, "video channel init failed (ch=%d)\n", i);
+			goto err_unwind_channels;
+		}
+		ret = hws_audio_init_channel(hws, i);
+		if (ret) {
+			dev_err(&pdev->dev, "audio channel init failed (ch=%d)\n", i);
 			goto err_unwind_channels;
 		}
 	}
@@ -454,23 +587,17 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	if (!ret)
 		hws_seed_all_channels(hws);
 
-	/* 7) Start-run sequence. */
-	hws_init_video_sys(hws, false);
-
-	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
+	/* 7) Force legacy INTx; baseline requested IRQ before InitVideoSys. */
 	pci_intx(pdev, 1);
 	irqf = IRQF_SHARED;
 	irq = pdev->irq;
 	hws->irq = irq;
 	dev_info(&pdev->dev, "IRQ mode: legacy INTx (shared), irq=%d\n", irq);
 
-	/* B) Mask the device's global/bridge gate (INT_EN_REG_BASE) */
-	hws_irq_mask_gate(hws);
-
-	/* C) Clear any sticky pending interrupt status (W1C) before we arm the line */
+	/* 8) Clear any sticky pending interrupt status (W1C) before we arm the line */
 	hws_irq_clear_pending(hws);
 
-	/* D) Request the legacy shared interrupt line (no vectors/MSI/MSI-X) */
+	/* 9) Request the legacy shared interrupt line (no vectors/MSI/MSI-X) */
 	ret = devm_request_irq(&pdev->dev, irq, hws_irq_handler, irqf,
 			       dev_name(&pdev->dev), hws);
 	if (ret) {
@@ -478,28 +605,28 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		goto err_unwind_channels;
 	}
 
-	/* E) Set the global interrupt enable bit in main control register */
-	{
-		u32 ctl_reg = readl(hws->bar0_base + HWS_REG_CTL);
+	/* 10) Set the global interrupt enable bit in main control register */
+	hws_enable_global_irq(hws);
 
-		ctl_reg |= HWS_CTL_IRQ_ENABLE_BIT;
-		writel(ctl_reg, hws->bar0_base + HWS_REG_CTL);
-		(void)readl(hws->bar0_base + HWS_REG_CTL); /* flush write */
-		dev_info(&pdev->dev, "Global IRQ enable bit set in control register\n");
-	}
-
-	/* F) Open the global gate just like legacy did */
-	hws_irq_unmask_gate(hws);
+	/* 11) Single start-run sequence (like baseline InitVideoSys) */
+	hws_init_video_sys(hws, false);
 	dev_info(&pdev->dev, "INT_EN_GATE readback=0x%08x\n",
 		 readl(hws->bar0_base + INT_EN_REG_BASE));
 
-	/* 11) Register V4L2 */
+	/* 12) Register V4L2/ALSA */
 	ret = hws_video_register(hws);
 	if (ret) {
 		dev_err(&pdev->dev, "video_register: %d\n", ret);
 		goto err_unwind_channels;
 	}
 	v4l2_registered = true;
+	ret = hws_audio_register(hws);
+	if (ret) {
+		dev_err(&pdev->dev, "audio_register: %d\n", ret);
+		hws_video_unregister(hws);
+		goto err_unwind_channels;
+	}
+	audio_registered = true;
 
 	/* 12) Background monitor thread (managed) */
 	hws->main_task = kthread_run(main_ks_thread_handle, hws, "hws-mon");
@@ -521,14 +648,18 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 err_unregister_va:
 	hws_stop_device(hws);
-	hws_video_unregister(hws);
+	if (audio_registered)
+		hws_audio_unregister(hws);
+	if (v4l2_registered)
+		hws_video_unregister(hws);
 	hws_free_seed_buffers(hws);
 	return ret;
 err_unwind_channels:
 	hws_free_seed_buffers(hws);
-	if (!v4l2_registered) {
-		while (--i >= 0)
+	while (--i >= 0) {
+		if (!v4l2_registered)
 			hws_video_cleanup_channel(hws, i);
+		hws_audio_cleanup_channel(hws, i, true);
 	}
 	return ret;
 }
@@ -573,7 +704,7 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 }
 
-/* Publish stop so ISR/BH will not touch video buffers anymore. */
+/* Publish stop so ISR/BH will not touch ALSA/VB2 anymore. */
 static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 {
 	unsigned int i;
@@ -581,8 +712,16 @@ static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 	for (i = 0; i < hws->cur_max_video_ch; ++i) {
 		struct hws_video *v = &hws->video[i];
 
-		WRITE_ONCE(v->cap_active,     false);
-		WRITE_ONCE(v->stop_requested, true);
+		v->cap_active = false;
+		v->stop_requested = true;
+	}
+
+	for (i = 0; i < hws->cur_max_audio_ch; ++i) {
+		struct hws_audio *a = &hws->audio[i];
+
+		a->stream_running = false;
+		a->cap_active = false;
+		a->stop_requested = true;
 	}
 
 	smp_wmb(); /* make flags visible before we touch MMIO/queues */
@@ -597,14 +736,17 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 
 	/* Mask device enables: no new DMA starts. */
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	writel(0x0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush */
 
 	/* Let any in-flight DMAs finish (best-effort). */
 	(void)hws_check_busy(hws);
 
-	/* Ack any latched VDONE. */
+	/* Ack any latched VDONE/ADONE. */
 	for (i = 0; i < hws->cur_max_video_ch; ++i)
 		ackmask |= HWS_INT_VDONE_BIT(i);
+	for (i = 0; i < hws->cur_max_audio_ch; ++i)
+		ackmask |= HWS_INT_ADONE_BIT(i);
 	if (ackmask) {
 		writel(ackmask, hws->bar0_base + HWS_REG_INT_STATUS);
 		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
@@ -711,7 +853,8 @@ static void hws_remove(struct pci_dev *pdev)
 	/* Stop hardware and capture cleanly. */
 	hws_stop_device(hws);
 
-	/* Unregister V4L2 resources. */
+	/* Unregister ALSA resources before V4L2. */
+	hws_audio_unregister(hws);
 	hws_video_unregister(hws);
 
 	/* Release seeded DMA buffers */
@@ -727,11 +870,16 @@ static int hws_pm_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct hws_pcie_dev *hws = pci_get_drvdata(pdev);
+	int aret;
 	int vret;
 	u64 start_ns = ktime_get_mono_fast_ns();
 	u64 step_ns;
 
 	dev_info(dev, "lifecycle:pm_suspend begin\n");
+	aret = hws_audio_pm_suspend_all(hws);
+	if (aret)
+		dev_warn(dev, "lifecycle:pm_suspend audio quiesce returned %d\n",
+			 aret);
 	vret = hws_quiesce_for_transition(hws, "pm_suspend", false);
 
 	step_ns = ktime_get_mono_fast_ns();
@@ -776,10 +924,12 @@ static int hws_pm_resume(struct device *dev)
 
 	/* Reinitialize chip-side capabilities / registers */
 	step_ns = ktime_get_mono_fast_ns();
-	read_chip_id(hws);
+	read_chip_id(hws, false);
 	/* Re-seed BAR remaps/DMA windows and restart the capture core */
 	hws_seed_all_channels(hws);
+	hws_enable_global_irq(hws);
 	hws_init_video_sys(hws, true);
+	hws_audio_pm_resume(hws);
 	hws_irq_clear_pending(hws);
 	dev_dbg(dev, "lifecycle:pm_resume:chip-reinit (%lluus)\n",
 		hws_elapsed_us(step_ns));
@@ -789,7 +939,7 @@ static int hws_pm_resume(struct device *dev)
 	if (hws->irq >= 0)
 		enable_irq(hws->irq);
 
-	WRITE_ONCE(hws->suspended, false);
+	hws->suspended = false;
 	dev_dbg(dev, "lifecycle:pm_resume:irq-unsuspend (%lluus)\n",
 		hws_elapsed_us(step_ns));
 
