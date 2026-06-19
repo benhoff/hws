@@ -58,6 +58,9 @@ struct hwsvideo_buffer {
 	int slot;
 };
 
+#define HWS_VIDEO_DIRECT_SLOT (-1)
+#define HWS_VIDEO_BOUNCE_SLOTS 2
+
 struct hws_video {
 	/* Linkage */
 	struct hws_pcie_dev *parent;
@@ -110,6 +113,7 @@ struct hws_video {
 	u32 last_dma_page;
 	u32 last_pci_addr;
 	u32 last_half16;
+	u8 next_bounce_slot;
 
 	/* Misc counters */
 	int signal_loss_cnt;
@@ -167,6 +171,7 @@ struct hws_scratch_dma {
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
+	bool owned;
 };
 
 struct hws_pcie_dev {
