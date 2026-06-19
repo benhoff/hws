@@ -341,6 +341,7 @@ static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws,
 int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	int ret;
+	u32 gate, bridge;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
@@ -354,6 +355,13 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 			ret = hws_guard_audio_video_remap_page(hws, ch);
 			if (ret)
 				return ret;
+			hws_enable_global_irq(hws);
+
+			gate = readl(hws->bar0_base + INT_EN_REG_BASE);
+			bridge = readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
+			if (!bridge || !(gate & HWS_INT_ADONE_BIT(ch)))
+				hws_restore_irq_fabric(hws);
+
 			ret = hws_audio_seed_capture_buffer(hws, ch);
 			if (ret)
 				return ret;
@@ -370,6 +378,13 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	ret = hws_guard_audio_video_remap_page(hws, ch);
 	if (ret)
 		return ret;
+
+	hws_enable_global_irq(hws);
+
+	gate = readl(hws->bar0_base + INT_EN_REG_BASE);
+	bridge = readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
+	if (!bridge || !(gate & HWS_INT_ADONE_BIT(ch)))
+		hws_restore_irq_fabric(hws);
 
 	ret = hws_audio_seed_capture_buffer(hws, ch);
 	if (ret)

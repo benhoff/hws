@@ -219,4 +219,7 @@ struct hws_pcie_dev {
 	int pci_lost;
 };
 
+void hws_enable_global_irq(struct hws_pcie_dev *hws);
+void hws_restore_irq_fabric(struct hws_pcie_dev *hws);
+
 #endif
