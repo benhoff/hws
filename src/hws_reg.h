@@ -96,11 +96,15 @@
 #define HWS_REG_HDCP_STATUS            (CVBS_IN_BASE +  8  * PCIE_BARADDROFSIZE)
 #define HWS_REG_DMA_MAX_SIZE   (CVBS_IN_BASE +  9 * PCIE_BARADDROFSIZE)
 
-/* Buffer addresses (written once during init/reset). */
-/* Base of host-visible buffer. */
-#define HWS_REG_VBUF1_ADDR            (CVBS_IN_BASE + 25 * PCIE_BARADDROFSIZE)
-/* Per-channel DMA address. */
-#define HWS_REG_DMA_ADDR(ch)          (CVBS_IN_BASE + (26 + (ch)) * PCIE_BARADDROFSIZE)
+/*
+ * Buffer base registers follow the vendor/baseline layout:
+ *
+ *   video base: CVBS_IN_BUF_BASE + ch * 4
+ *   audio base: CVBS_IN_BUF_BASE + (8 + ch) * 4
+ *
+ * Do not add a video doorbell at CVBS_IN_BASE + (26 + ch) * 4.  Those
+ * offsets alias the audio base bank for low video channel numbers.
+ */
 /* Per-channel audio DMA address window. */
 #define HWS_REG_AUD_DMA_ADDR(ch)      (CVBS_IN_BUF_BASE + ((8 + (ch)) * PCIE_BARADDROFSIZE))
 

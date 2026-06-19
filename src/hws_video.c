@@ -60,14 +60,6 @@ module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
 MODULE_PARM_DESC(dma_window_verify,
 		 "Read back DMA window registers after programming (debug)");
 
-void hws_set_dma_doorbell(struct hws_pcie_dev *hws, unsigned int ch,
-			  dma_addr_t dma, const char *tag)
-{
-	iowrite32(lower_32_bits(dma), hws->bar0_base + HWS_REG_DMA_ADDR(ch));
-	dev_dbg(&hws->pdev->dev, "dma_doorbell ch%u: dma=0x%llx tag=%s\n", ch,
-		(u64)dma, tag ? tag : "");
-}
-
 static void hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 {
 	const u32 addr_mask = PCI_E_BAR_ADD_MASK;
@@ -171,8 +163,6 @@ void hws_prime_next_locked(struct hws_video *vid)
 	vid->next_prepared = next;
 	dma = vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
 	hws_program_dma_for_addr(hws, vid->channel_index, dma);
-	iowrite32(lower_32_bits(dma),
-		  hws->bar0_base + HWS_REG_DMA_ADDR(vid->channel_index));
 	dev_dbg(&hws->pdev->dev,
 		"ch%u pre-armed next buffer %p dma=0x%llx\n",
 		vid->channel_index, next, (u64)dma);
@@ -184,7 +174,7 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	unsigned long flags;
 	struct hwsvideo_buffer *buf = NULL, *next = NULL;
 	bool have_next = false;
-	bool doorbell = false;
+	bool programmed = false;
 
 	if (!v)
 		return false;
@@ -240,12 +230,11 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	if (have_next && next) {
 		dma_addr_t dma =
 		    vb2_dma_contig_plane_dma_addr(&next->vb.vb2_buf, 0);
+
 		hws_program_dma_for_addr(hws, v->channel_index, dma);
-		hws_set_dma_doorbell(hws, v->channel_index, dma,
-				     tag ? tag : "nosignal_zero");
-		doorbell = true;
+		programmed = true;
 	}
-	if (doorbell) {
+	if (programmed) {
 		wmb(); /* ensure descriptors visible before enabling capture */
 		hws_enable_video_capture(hws, v->channel_index, true);
 	}
@@ -1131,8 +1120,6 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 		dma_addr = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
 		hws_program_dma_for_addr(vid->parent, vid->channel_index,
 					 dma_addr);
-		iowrite32(lower_32_bits(dma_addr),
-			  hws->bar0_base + HWS_REG_DMA_ADDR(vid->channel_index));
 
 		wmb(); /* ensure descriptors visible before enabling capture */
 		hws_enable_video_capture(hws, vid->channel_index, true);
@@ -1217,9 +1204,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 
 			dma_addr = vb2_dma_contig_plane_dma_addr(prog_vb2, 0);
 			hws_program_dma_for_addr(hws, v->channel_index, dma_addr);
-			iowrite32(lower_32_bits(dma_addr),
-				  hws->bar0_base +
-				  HWS_REG_DMA_ADDR(v->channel_index));
 			dev_dbg(&hws->pdev->dev,
 				"start_streaming: ch=%u programmed buffer %p dma=0x%08x\n",
 				v->channel_index, to_program,
