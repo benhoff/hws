@@ -86,6 +86,9 @@ static bool hws_video_dma_shares_channel_page(struct hws_video *vid,
 	ch = vid->channel_index;
 	if (ch >= hws->cur_max_audio_ch)
 		return true;
+	if (!READ_ONCE(hws->audio[ch].stream_running) &&
+	    !READ_ONCE(hws->audio[ch].cap_active))
+		return true;
 
 	aud = &hws->scratch_aud[vid->channel_index];
 	if (!aud->cpu || !aud->size)
@@ -308,7 +311,7 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	if (!v)
 		return false;
 	hws = v->parent;
-	if (!hws || v->stop_requested || !v->cap_active)
+	if (!hws || READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
 		return false;
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->active) {
@@ -564,8 +567,8 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	hws_enable_video_capture(vid->parent, vid->channel_index, false);
 
 	/* 2) Flip software state so IRQ/BH will be no-ops if they run */
-	vid->stop_requested = true;
-	vid->cap_active = false;
+	WRITE_ONCE(vid->stop_requested, true);
+	WRITE_ONCE(vid->cap_active, false);
 
 	/* 3) Ensure the IRQ handler finished any in-flight completions */
 	if (vid->parent && vid->parent->irq >= 0)
@@ -647,7 +650,7 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	writel(status, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 
-	hws->video[chan].cap_active = on;
+	WRITE_ONCE(hws->video[chan].cap_active, on);
 
 	dev_dbg(&hws->pdev->dev, "vcap %s ch%u (reg=0x%08x)\n",
 		on ? "ON" : "OFF", chan, status);
@@ -764,7 +767,6 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 	writel(0x13, hws->bar0_base + HWS_REG_DEC_MODE);
 	hws_ack_all_irqs(hws);
 	hws_open_irq_fabric(hws);
-
 	/* 6) record that we're now running */
 	hws->start_run = true;
 }
@@ -807,7 +809,7 @@ void check_video_format(struct hws_pcie_dev *pdx)
 			/* No active video; optionally feed neutral frames to keep streaming. */
 			if (pdx->video[i].signal_loss_cnt == 0)
 				pdx->video[i].signal_loss_cnt = 1;
-			if (pdx->video[i].cap_active)
+			if (READ_ONCE(pdx->video[i].cap_active))
 				hws_force_no_signal_frame(&pdx->video[i],
 							  "monitor_nosignal");
 		} else {
@@ -877,7 +879,7 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 
 	vid = &hws->video[ch];
 
-	/* 1) Input frame rate (read-only). */
+	/* 1) Input frame rate (read-only; log or export via debugfs if wanted) */
 	in_fps = readl(hws->bar0_base + HWS_REG_FRAME_RATE(ch));
 	/* dev_dbg(&hws->pdev->dev, "ch%u input fps=%u\n", ch, in_fps); */
 	(void)in_fps;
@@ -941,11 +943,11 @@ static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch)
 	 *
 	 * Example skeleton:
 	 *
-	 *   u32 sw_rate = hws->sw_fps[ch]; // incremented elsewhere
+	 *   u32 sw_rate = READ_ONCE(hws->sw_fps[ch]); // incremented elsewhere
 	 *   if (sw_rate > THRESHOLD) {
 	 *       u32 fps = pick_fps_from_rate(sw_rate);
 	 *       hws_write_if_diff(hws, HWS_REG_OUT_FRAME_RATE(ch), fps);
-	 *       hws->sw_fps[ch] = 0;
+	 *       WRITE_ONCE(hws->sw_fps[ch], 0);
 	 *   }
 	 */
 	(void)hws;
@@ -999,10 +1001,10 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	INIT_LIST_HEAD(&done);
 	queue_busy = vb2_is_busy(&v->buffer_queue);
 
-	v->stop_requested = true;
-	v->cap_active = false;
+	WRITE_ONCE(v->stop_requested, true);
+	WRITE_ONCE(v->cap_active, false);
 	/* Publish software stop first so the IRQ completion path sees the stop
-	 * before we touch MMIO or the lists. Pairs with flag checks in the
+	 * before we touch MMIO or the lists. Pairs with READ_ONCE() checks in the
 	 * VDONE handler and hws_arm_next() to prevent completions while modes
 	 * change.
 	 */
@@ -1042,7 +1044,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		v4l2_event_queue(v->video_device, &ev);
 		vb2_queue_error(&v->buffer_queue);
 	} else {
-		v->stop_requested = false;
+		WRITE_ONCE(v->stop_requested, false);
 	}
 
 	/* Program HW with new resolution */
@@ -1055,7 +1057,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		    ch * PCIE_BARADDROFSIZE);
 
 	/* Reset per-channel toggles/counters */
-	v->last_buf_half_toggle = 0;
+	WRITE_ONCE(v->last_buf_half_toggle, 0);
 	atomic_set(&v->sequence_number, 0);
 
 	mutex_unlock(&v->state_lock);
@@ -1234,7 +1236,7 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	dev_dbg(&hws->pdev->dev,
 		"buffer_queue(ch=%u): vb=%p sizeimage=%u q_active=%d\n",
 		vid->channel_index, vb, vid->pix.sizeimage,
-		vid->cap_active);
+		READ_ONCE(vid->cap_active));
 
 	/* Initialize buffer slot */
 	buf->slot = HWS_VIDEO_DIRECT_SLOT;
@@ -1262,9 +1264,9 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 			goto out_unlock;
 		}
 
-	wmb(); /* ensure descriptors visible before enabling capture */
-	hws_enable_video_capture(hws, vid->channel_index, true);
-	hws_prime_next_locked(vid);
+		wmb(); /* ensure descriptors visible before enabling capture */
+		hws_enable_video_capture(hws, vid->channel_index, true);
+		hws_prime_next_locked(vid);
 	} else if (READ_ONCE(vid->cap_active) && vid->active) {
 		hws_prime_next_locked(vid);
 	}
@@ -1318,10 +1320,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 
 	lockdep_assert_held(&v->state_lock);
 	/* init per-stream state */
-	v->stop_requested = false;
-	v->cap_active = true;
-	v->half_seen = false;
-	v->last_buf_half_toggle = 0;
+	WRITE_ONCE(v->stop_requested, false);
+	WRITE_ONCE(v->cap_active, true);
+	WRITE_ONCE(v->half_seen, false);
+	WRITE_ONCE(v->last_buf_half_toggle, 0);
 
 	/* Try to prime a buffer, but it's OK if none are queued yet */
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -1403,8 +1405,8 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	spin_lock_irqsave(&v->irq_lock, flags);
 	list_for_each_entry(b, &v->capture_queue, list)
 		queued++;
-	cap_active = v->cap_active;
-	stop_requested = v->stop_requested;
+	cap_active = READ_ONCE(v->cap_active);
+	stop_requested = READ_ONCE(v->stop_requested);
 	active = v->active;
 	next_prepared = v->next_prepared;
 	tracked = v->queued_count;
@@ -1431,8 +1433,8 @@ static void hws_stop_streaming(struct vb2_queue *q)
 
 	/* 1) Quiesce SW/HW first */
 	lockdep_assert_held(&v->state_lock);
-	v->cap_active = false;
-	v->stop_requested = true;
+	WRITE_ONCE(v->cap_active, false);
+	WRITE_ONCE(v->stop_requested, true);
 
 	hws_enable_video_capture(v->parent, v->channel_index, false);
 
