@@ -60,6 +60,12 @@ module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
 MODULE_PARM_DESC(dma_window_verify,
 		 "Read back DMA window registers after programming (debug)");
 
+static const char * const hws_dma_mode_menu[] = {
+	[HWS_DMA_MODE_AUTO] = "Auto",
+	[HWS_DMA_MODE_DIRECT_ONLY] = "Direct Only",
+	NULL,
+};
+
 static bool hws_dma_same_remap_page(dma_addr_t a, dma_addr_t b)
 {
 	return upper_32_bits(a) == upper_32_bits(b) &&
@@ -119,6 +125,13 @@ static int hws_select_video_dma(struct hws_video *vid,
 		buf->slot = HWS_VIDEO_DIRECT_SLOT;
 		*dma = direct_dma;
 		return 0;
+	}
+
+	if (vid->dma_mode == HWS_DMA_MODE_DIRECT_ONLY) {
+		dev_warn_ratelimited(&hws->pdev->dev,
+				     "ch%u direct-only DMA rejected buffer %pad because it conflicts with active audio remap page\n",
+				     vid->channel_index, &direct_dma);
+		return -EBUSY;
 	}
 
 	arena = &hws->scratch_vid[vid->channel_index];
@@ -373,9 +386,19 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 static int hws_ctrls_init(struct hws_video *vid)
 {
 	struct v4l2_ctrl_handler *hdl = &vid->control_handler;
+	const struct v4l2_ctrl_config dma_mode_ctrl = {
+		.ops = &hws_ctrl_ops,
+		.id = HWS_CID_DMA_MODE,
+		.name = "DMA Mode",
+		.type = V4L2_CTRL_TYPE_MENU,
+		.min = HWS_DMA_MODE_AUTO,
+		.max = HWS_DMA_MODE_DIRECT_ONLY,
+		.def = HWS_DMA_MODE_AUTO,
+		.qmenu = hws_dma_mode_menu,
+	};
 
-	/* Create BCHS controls. */
-	v4l2_ctrl_handler_init(hdl, 4);
+	/* Create BCHS and DMA policy controls. */
+	v4l2_ctrl_handler_init(hdl, 5);
 
 	vid->ctrl_brightness = v4l2_ctrl_new_std(hdl, &hws_ctrl_ops,
 						 V4L2_CID_BRIGHTNESS,
@@ -398,6 +421,8 @@ static int hws_ctrls_init(struct hws_video *vid)
 					  MIN_VAMP_HUE_UNITS,
 					  MAX_VAMP_HUE_UNITS, 1,
 					  HWS_HUE_DEFAULT);
+
+	vid->ctrl_dma_mode = v4l2_ctrl_new_custom(hdl, &dma_mode_ctrl, NULL);
 	if (hdl->error) {
 		int err = hdl->error;
 
@@ -438,6 +463,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->queued_count = 0;
 	vid->window_valid = false;
 	vid->next_bounce_slot = 0;
+	vid->dma_mode = HWS_DMA_MODE_AUTO;
 
 	/* Default format. */
 	vid->pix.width = 1920;

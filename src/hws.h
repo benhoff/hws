@@ -61,6 +61,13 @@ struct hwsvideo_buffer {
 #define HWS_VIDEO_DIRECT_SLOT (-1)
 #define HWS_VIDEO_BOUNCE_SLOTS 2
 
+#define HWS_CID_DMA_MODE (V4L2_CID_USER_BASE + 0x1000)
+
+enum hws_dma_mode {
+	HWS_DMA_MODE_AUTO = 0,
+	HWS_DMA_MODE_DIRECT_ONLY = 1,
+};
+
 struct hws_video {
 	/* Linkage */
 	struct hws_pcie_dev *parent;
@@ -90,6 +97,7 @@ struct hws_video {
 	struct v4l2_ctrl *ctrl_contrast;
 	struct v4l2_ctrl *ctrl_saturation;
 	struct v4l2_ctrl *ctrl_hue;
+	struct v4l2_ctrl *ctrl_dma_mode;
 
 	/* Capture queue status */
 	struct hws_pix_state pix;
@@ -114,6 +122,7 @@ struct hws_video {
 	u32 last_pci_addr;
 	u32 last_half16;
 	u8 next_bounce_slot;
+	enum hws_dma_mode dma_mode;
 
 	/* Misc counters */
 	int signal_loss_cnt;

@@ -676,6 +676,12 @@ static int hws_s_ctrl(struct v4l2_ctrl *ctrl)
 		vid->current_hue = ctrl->val;
 		program = true;
 		break;
+	case HWS_CID_DMA_MODE:
+		if (vid->dma_mode != ctrl->val && vid->buffer_queue.ops &&
+		    vb2_is_busy(&vid->buffer_queue))
+			return -EBUSY;
+		vid->dma_mode = ctrl->val;
+		break;
 	default:
 		return -EINVAL;
 	}
