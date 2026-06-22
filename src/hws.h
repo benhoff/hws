@@ -8,9 +8,13 @@
 #include <linux/kthread.h>
 #include <linux/pci.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/sizes.h>
 #include <linux/atomic.h>
+
+#include <sound/pcm.h>
+#include <sound/core.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -18,6 +22,8 @@
 #include <media/videobuf2-dma-sg.h>
 
 #include "hws_reg.h"
+
+struct snd_pcm_substream;
 
 struct hwsmem_param {
 	u32 index;
@@ -51,6 +57,9 @@ struct hwsvideo_buffer {
 	struct list_head list;
 	int slot;
 };
+
+#define HWS_VIDEO_DIRECT_SLOT (-1)
+#define HWS_VIDEO_BOUNCE_SLOTS 2
 
 struct hws_video {
 	/* Linkage */
@@ -104,6 +113,7 @@ struct hws_video {
 	u32 last_dma_page;
 	u32 last_pci_addr;
 	u32 last_half16;
+	u8 next_bounce_slot;
 
 	/* Misc counters */
 	int signal_loss_cnt;
@@ -126,15 +136,48 @@ static inline void hws_set_current_dv_timings(struct hws_video *vid,
 	};
 }
 
+struct hws_audio {
+	/* linkage */
+	struct hws_pcie_dev *parent;
+	int channel_index;
+
+	/* ALSA */
+	struct snd_pcm_substream *pcm_substream;
+	spinlock_t ring_lock; /* protects ring and period position fields */
+	snd_pcm_uframes_t ring_size_byframes;
+	snd_pcm_uframes_t ring_wpos_byframes;
+	snd_pcm_uframes_t period_size_byframes;
+	snd_pcm_uframes_t period_used_byframes;
+	size_t frame_bytes;
+	size_t hw_packet_bytes;
+
+	/* stream state */
+	bool cap_active;
+	bool stream_running;
+	bool stop_requested;
+
+	/* minimal HW packet tracking */
+	u8 last_period_toggle;
+	u32 irq_count;
+	u32 delivered_count;
+
+	/* PCM format */
+	u32 output_sample_rate;
+	u16 channel_count;
+	u16 bits_per_sample;
+};
+
 struct hws_scratch_dma {
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
+	bool owned;
 };
 
 struct hws_pcie_dev {
 	/* Core objects */
 	struct pci_dev *pdev;
+	struct hws_audio audio[MAX_VID_CHANNELS];
 	struct hws_video video[MAX_VID_CHANNELS];
 
 	/* BAR and workqueues */
@@ -152,16 +195,22 @@ struct hws_pcie_dev {
 	u32 max_hw_video_buf_sz;
 	u8 max_channels;
 	u8 cur_max_video_ch;
+	/* Independently capturable embedded audio inputs exposed as ALSA PCMs. */
+	u8 cur_max_audio_ch;
 	bool start_run;
 
 	bool buf_allocated;
+	u32 audio_pkt_size;
 
 	/* V4L2 framework objects */
 	struct v4l2_device v4l2_device;
 
+	struct snd_card *snd_card;
+
 	/* Kernel thread */
 	struct task_struct *main_task;
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
+	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int irq;
