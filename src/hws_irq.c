@@ -7,8 +7,6 @@
 #include <linux/minmax.h>
 #include <linux/string.h>
 
-#include <media/videobuf2-dma-contig.h>
-
 #include "hws_irq.h"
 #include "hws_reg.h"
 #include "hws_video.h"
@@ -80,11 +78,22 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 		return -EBUSY;
 	}
 
-	/* Program the video DMA window for the selected buffer. */
+	/* Program the baseline DMA window; use arena bounce if needed. */
 	{
-		dma_addr_t dma_addr =
-		    vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
-		hws_program_dma_for_addr(hws, ch, dma_addr);
+		int ret = hws_program_dma_for_buffer(hws, ch, buf);
+
+		if (ret) {
+			unsigned long f;
+
+			spin_lock_irqsave(&v->irq_lock, f);
+			if (v->active == buf) {
+				v->active = NULL;
+				list_add(&buf->list, &v->capture_queue);
+				v->queued_count++;
+			}
+			spin_unlock_irqrestore(&v->irq_lock, f);
+			return ret;
+		}
 	}
 
 	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): programmed buffer %p\n", ch,
@@ -102,13 +111,12 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hwsvideo_buffer *done;
 	unsigned long flags;
 	bool promoted = false;
+	int ret;
 
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): stop=%d cap=%d active=%p\n",
 		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
 		v->active);
-
-	int ret;
 
 	dev_dbg(&hws->pdev->dev,
 		"bh_video(ch=%u): entry stop=%d cap=%d\n", ch,
@@ -131,23 +139,15 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	/* 1) Complete the buffer the HW just finished (if any) */
 	if (done) {
 		struct vb2_v4l2_buffer *vb2v = &done->vb;
-		size_t expected = v->pix.sizeimage;
-		size_t plane_size = vb2_plane_size(&vb2v->vb2_buf, 0);
 
-		if (expected > plane_size) {
+		ret = hws_video_prepare_done_buffer(v, done);
+		if (ret) {
 			dev_warn_ratelimited(&hws->pdev->dev,
-					     "bh_video(ch=%u): sizeimage %zu > plane %zu, dropping seq=%u\n",
-					     ch, expected, plane_size,
-					     (u32)atomic_read(&v->sequence_number) + 1);
+					     "bh_video(ch=%u): failed to prepare completed buffer ret=%d\n",
+					     ch, ret);
 			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
 			goto arm_next;
 		}
-		vb2_set_plane_payload(&vb2v->vb2_buf, 0, expected);
-
-		dma_rmb();	/* device writes visible before userspace sees it */
-
-		vb2v->sequence = (u32)atomic_inc_return(&v->sequence_number);
-		vb2v->vb2_buf.timestamp = ktime_get_ns();
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
 			ch, done, vb2v->sequence, v->half_seen,
@@ -166,8 +166,12 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			"bh_video(ch=%u): promoted pre-armed buffer active=%p\n",
 			ch, v->active);
 		spin_lock_irqsave(&v->irq_lock, flags);
-		hws_prime_next_locked(v);
+		ret = hws_prime_next_locked(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
+		if (ret)
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "bh_video(ch=%u): failed to pre-arm next buffer ret=%d\n",
+					     ch, ret);
 		return;
 	}
 
@@ -177,6 +181,16 @@ arm_next:
 	if (ret == -EAGAIN) {
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): no queued buffer to arm\n", ch);
+		return;
+	}
+	if (ret) {
+		dev_warn_ratelimited(&hws->pdev->dev,
+				     "bh_video(ch=%u): stopping video queue after DMA arm failure ret=%d\n",
+				     ch, ret);
+		hws_enable_video_capture(hws, ch, false);
+		WRITE_ONCE(v->cap_active, false);
+		WRITE_ONCE(v->stop_requested, true);
+		vb2_queue_error(&v->buffer_queue);
 		return;
 	}
 	dev_dbg(&hws->pdev->dev,

@@ -52,6 +52,37 @@ static bool hws_audio_select_buffer(struct hws_pcie_dev *hws, unsigned int ch,
 	return true;
 }
 
+static int hws_guard_audio_video_remap_page(struct hws_pcie_dev *hws,
+					    unsigned int ch)
+{
+	struct hws_video *vid;
+	dma_addr_t audio_dma;
+	u32 audio_hi, audio_page;
+
+	if (!hws || ch >= hws->cur_max_audio_ch)
+		return -EINVAL;
+	if (ch >= hws->cur_max_video_ch)
+		return 0;
+
+	vid = &hws->video[ch];
+	if (!READ_ONCE(vid->cap_active) || !vid->window_valid)
+		return 0;
+
+	if (!hws_audio_select_buffer(hws, ch, NULL, &audio_dma, NULL))
+		return -ENOMEM;
+
+	audio_hi = upper_32_bits(audio_dma);
+	audio_page = lower_32_bits(audio_dma) & PCI_E_BAR_ADD_MASK;
+	if (audio_hi == vid->last_dma_hi && audio_page == vid->last_dma_page)
+		return 0;
+
+	dev_warn_ratelimited(&hws->pdev->dev,
+			     "audio ch%u DMA page differs from active video remap slot; refusing shared-window conflict (audio=%pad video_hi=0x%08x video_page=0x%08x)\n",
+			     ch, &audio_dma, vid->last_dma_hi,
+			     vid->last_dma_page);
+	return -EBUSY;
+}
+
 static void hws_audio_program_remap_slot(struct hws_pcie_dev *hws,
 					 u32 table_off, u32 hi, u32 page_lo)
 {
@@ -320,6 +351,9 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 			ret = hws_check_card_status(hws);
 			if (ret)
 				return ret;
+			ret = hws_guard_audio_video_remap_page(hws, ch);
+			if (ret)
+				return ret;
 			ret = hws_audio_seed_capture_buffer(hws, ch);
 			if (ret)
 				return ret;
@@ -330,6 +364,10 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	}
 
 	ret = hws_check_card_status(hws);
+	if (ret)
+		return ret;
+
+	ret = hws_guard_audio_video_remap_page(hws, ch);
 	if (ret)
 		return ret;
 

@@ -97,20 +97,27 @@
 #define HWS_REG_DMA_MAX_SIZE   (CVBS_IN_BASE +  9 * PCIE_BARADDROFSIZE)
 
 /*
- * Video DMA setup uses one BAR remap-table slot per capture channel. The
- * remap-table slot supplies the host DMA page, while CVBS_IN_BUF_BASE +
- * ch * 4 supplies the device-side buffer offset within that page.
+ * Buffer base registers follow the vendor/baseline layout:
+ *
+ *   video base: CVBS_IN_BUF_BASE + ch * 4
+ *   audio base: CVBS_IN_BUF_BASE + (8 + ch) * 4
+ *
+ * Do not add a video doorbell at CVBS_IN_BASE + (26 + ch) * 4.  Those
+ * offsets alias the audio base bank for low video channel numbers.
  */
-#define HWS_VIDEO_REMAP_SLOT_OFF(ch)  (0x208 + ((ch) * 8))
-
 /* Per-channel audio DMA address window. */
 #define HWS_REG_AUD_DMA_ADDR(ch)      (CVBS_IN_BUF_BASE + ((8 + (ch)) * PCIE_BARADDROFSIZE))
 
+#define HWS_VIDEO_REMAP_SLOT_OFF(ch)  (0x208 + ((ch) * 8))
+
 /*
- * Audio uses the second bank of BAR remap windows, matching the AXI slot
- * indices starting at 8.
+ * BAR remap slots are selected by the high bits of the programmed device-side
+ * base address.  Both video and audio program (ch + 1) * PCIEBAR_AXI_BASE, so
+ * audio shares the same remap slot as video for that channel.  The audio base
+ * registers live at CVBS_IN_BUF_BASE + (8 + ch) * 4, but that is a register
+ * bank offset, not a second remap-table bank.
  */
-#define HWS_AUDIO_REMAP_SLOT_OFF(ch)  (0x208 + ((8 + (ch)) * 8))
+#define HWS_AUDIO_REMAP_SLOT_OFF(ch)  HWS_VIDEO_REMAP_SLOT_OFF(ch)
 
 /* Per-channel live buffer toggles (read-only). */
 #define HWS_REG_VBUF_TOGGLE(ch)       (CVBS_IN_BASE + (32 + (ch)) * PCIE_BARADDROFSIZE)
