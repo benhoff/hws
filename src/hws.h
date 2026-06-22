@@ -209,6 +209,8 @@ struct hws_pcie_dev {
 
 	/* Kernel thread */
 	struct task_struct *main_task;
+	struct mutex scratch_lock;
+	unsigned int scratch_users[MAX_VID_CHANNELS];
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
 	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];
 
@@ -218,5 +220,8 @@ struct hws_pcie_dev {
 	/* Error flags */
 	int pci_lost;
 };
+
+int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
+void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
 
 #endif

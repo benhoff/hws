@@ -291,11 +291,13 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_removal)
 {
 	struct hws_audio *aud;
+	bool was_running;
 
 	if (!pdev || ch < 0 || ch >= pdev->cur_max_audio_ch)
 		return;
 
 	aud = &pdev->audio[ch];
+	was_running = aud->stream_running;
 
 	/* 1) Make IRQ path a no-op first */
 	aud->stream_running = false;
@@ -326,6 +328,8 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 	aud->last_period_toggle = 0xFF;
 	aud->irq_count = 0;
 	aud->delivered_count = 0;
+	if (was_running)
+		hws_release_channel_scratch(pdev, ch);
 }
 
 static inline bool hws_check_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
@@ -363,17 +367,27 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 		return 0;
 	}
 
-	ret = hws_check_card_status(hws);
+	ret = hws_alloc_channel_scratch(hws, ch);
 	if (ret)
 		return ret;
+
+	ret = hws_check_card_status(hws);
+	if (ret) {
+		hws_release_channel_scratch(hws, ch);
+		return ret;
+	}
 
 	ret = hws_guard_audio_video_remap_page(hws, ch);
-	if (ret)
+	if (ret) {
+		hws_release_channel_scratch(hws, ch);
 		return ret;
+	}
 
 	ret = hws_audio_seed_capture_buffer(hws, ch);
-	if (ret)
+	if (ret) {
+		hws_release_channel_scratch(hws, ch);
 		return ret;
+	}
 
 	/* Flip state visible to IRQ */
 	hws->audio[ch].stop_requested = false;
@@ -449,6 +463,7 @@ void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	spin_unlock(&hws->audio[ch].ring_lock);
 
 	dev_dbg(&hws->pdev->dev, "audio capture stopped on ch %u\n", ch);
+	hws_release_channel_scratch(hws, ch);
 }
 
 void hws_enable_audio_capture(struct hws_pcie_dev *hws,

@@ -282,16 +282,75 @@ static bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
 	       (lower_32_bits(end) & PCI_E_BAR_ADD_MASK);
 }
 
-static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
+static size_t hws_video_scratch_bytes(void)
 {
-	int ch;
-	int max_ch = max_t(int, hws->cur_max_video_ch, hws->cur_max_audio_ch);
-	size_t video_need = ALIGN((size_t)MAX_VIDEO_SCALER_SIZE, 64);
-	size_t aud_need = ALIGN((size_t)MAX_AUDIO_CAP_SIZE, 64);
-	size_t aud_off = HWS_VIDEO_BOUNCE_SLOTS * video_need;
-	size_t arena_need = ALIGN(aud_off + aud_need, 64);
+	return HWS_VIDEO_BOUNCE_SLOTS * ALIGN((size_t)MAX_VIDEO_SCALER_SIZE, 64);
+}
 
-	for (ch = 0; ch < max_ch; ch++) {
+static size_t hws_audio_scratch_bytes(void)
+{
+	return ALIGN((size_t)MAX_AUDIO_CAP_SIZE, 64);
+}
+
+static void hws_clear_scratch(struct hws_scratch_dma *scratch)
+{
+	scratch->cpu = NULL;
+	scratch->dma = 0;
+	scratch->size = 0;
+	scratch->owned = false;
+}
+
+static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
+					    unsigned int ch)
+{
+	struct hws_scratch_dma *vid;
+	struct hws_scratch_dma *aud;
+
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return;
+
+	vid = &hws->scratch_vid[ch];
+	aud = &hws->scratch_aud[ch];
+
+	if (ch < hws->cur_max_video_ch) {
+		hws->video[ch].window_valid = false;
+		hws->video[ch].next_bounce_slot = 0;
+	}
+	hws->scratch_users[ch] = 0;
+
+	if (aud->cpu && aud->owned)
+		dma_free_coherent(&hws->pdev->dev, aud->size, aud->cpu,
+				  aud->dma);
+	hws_clear_scratch(aud);
+
+	if (vid->cpu && vid->owned)
+		dma_free_coherent(&hws->pdev->dev, vid->size, vid->cpu,
+				  vid->dma);
+	hws_clear_scratch(vid);
+}
+
+int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	size_t aud_off = hws_video_scratch_bytes();
+	size_t arena_need = aud_off;
+	bool has_audio;
+
+	if (!hws || ch >= max_t(unsigned int, hws->cur_max_video_ch,
+				hws->cur_max_audio_ch))
+		return -EINVAL;
+
+	has_audio = ch < hws->cur_max_audio_ch;
+	if (has_audio)
+		arena_need = ALIGN(aud_off + hws_audio_scratch_bytes(), 64);
+
+	mutex_lock(&hws->scratch_lock);
+	if (hws->scratch_vid[ch].cpu) {
+		hws->scratch_users[ch]++;
+		mutex_unlock(&hws->scratch_lock);
+		return 0;
+	}
+
+	{
 #if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
 		dma_addr_t dma = 0;
 		void *cpu = NULL;
@@ -319,9 +378,9 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 #endif
 		if (!cpu) {
 			dev_warn(&hws->pdev->dev,
-				 "scratch arena: dma_alloc_coherent failed ch=%d\n",
+				 "scratch arena: dma_alloc_coherent failed ch=%u\n",
 				 ch);
-			hws_free_seed_buffers(hws);
+			mutex_unlock(&hws->scratch_lock);
 			return -ENOMEM;
 		}
 
@@ -330,47 +389,47 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 		hws->scratch_vid[ch].size = arena_need;
 		hws->scratch_vid[ch].owned = true;
 
-		if (ch < hws->cur_max_audio_ch) {
+		if (has_audio) {
 			hws->scratch_aud[ch].dma = dma + aud_off;
 			hws->scratch_aud[ch].cpu = (u8 *)cpu + aud_off;
-			hws->scratch_aud[ch].size = aud_need;
+			hws->scratch_aud[ch].size = hws_audio_scratch_bytes();
 			hws->scratch_aud[ch].owned = false;
 		}
 	}
+	hws->scratch_users[ch] = 1;
+
+	dev_dbg(&hws->pdev->dev,
+		"scratch arena: allocated ch=%u size=%zu audio=%d\n",
+		ch, arena_need, has_audio);
+	mutex_unlock(&hws->scratch_lock);
 	return 0;
+}
+
+void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return;
+
+	mutex_lock(&hws->scratch_lock);
+	if (hws->scratch_users[ch] > 0)
+		hws->scratch_users[ch]--;
+	if (!hws->scratch_users[ch])
+		hws_free_channel_scratch_locked(hws, ch);
+	mutex_unlock(&hws->scratch_lock);
 }
 
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 {
 	int ch;
 
-	for (ch = 0; ch < MAX_VID_CHANNELS; ch++) {
-		if (hws->scratch_vid[ch].cpu) {
-			if (hws->scratch_vid[ch].owned)
-				dma_free_coherent(&hws->pdev->dev,
-						  hws->scratch_vid[ch].size,
-						  hws->scratch_vid[ch].cpu,
-						  hws->scratch_vid[ch].dma);
-			hws->scratch_vid[ch].cpu = NULL;
-			hws->scratch_vid[ch].dma = 0;
-			hws->scratch_vid[ch].size = 0;
-			hws->scratch_vid[ch].owned = false;
-		}
-	}
+	if (!hws)
+		return;
 
+	mutex_lock(&hws->scratch_lock);
 	for (ch = 0; ch < MAX_VID_CHANNELS; ch++) {
-		if (hws->scratch_aud[ch].cpu) {
-			if (hws->scratch_aud[ch].owned)
-				dma_free_coherent(&hws->pdev->dev,
-						  hws->scratch_aud[ch].size,
-						  hws->scratch_aud[ch].cpu,
-						  hws->scratch_aud[ch].dma);
-			hws->scratch_aud[ch].cpu = NULL;
-			hws->scratch_aud[ch].dma = 0;
-			hws->scratch_aud[ch].size = 0;
-			hws->scratch_aud[ch].owned = false;
-		}
+		hws_free_channel_scratch_locked(hws, ch);
 	}
+	mutex_unlock(&hws->scratch_lock);
 }
 
 static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
@@ -468,6 +527,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws->pdev = pdev;
 	hws->irq = -1;
 	hws->suspended = false;
+	mutex_init(&hws->scratch_lock);
 	pci_set_drvdata(pdev, hws);
 
 	/* 1) Enable device + bus mastering (managed) */
@@ -522,12 +582,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		}
 	}
 
-	/* 6) Allocate scratch DMA and seed BAR table + channel base/half (legacy SetDMAAddress) */
-	ret = hws_alloc_seed_buffers(hws);
-	if (!ret)
-		hws_seed_all_channels(hws);
-
-	/* 7) Start-run sequence. */
+	/* 6) Start-run sequence. Scratch DMA is allocated on stream start. */
 	hws_init_video_sys(hws, false);
 
 	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
