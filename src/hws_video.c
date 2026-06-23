@@ -112,6 +112,31 @@ static int hws_select_video_dma(struct hws_video *vid,
 		return -ENODEV;
 
 	direct_dma = vb2_dma_contig_plane_dma_addr(&buf->vb.vb2_buf, 0);
+	if (hws_video_only_zerocopy) {
+		unsigned int ch = vid->channel_index;
+
+		if (ch < hws->cur_max_audio_ch &&
+		    READ_ONCE(hws->audio[ch].stream_running)) {
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "video ch%u zero-copy denied while audio is running\n",
+					     ch);
+			return -EBUSY;
+		}
+
+		if (!hws_dma_fits_remap_window(direct_dma,
+					       vid->pix.sizeimage)) {
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "video ch%u zero-copy buffer %pad size=%u crosses remap window\n",
+					     ch, &direct_dma,
+					     vid->pix.sizeimage);
+			return -ERANGE;
+		}
+
+		buf->slot = HWS_VIDEO_DIRECT_SLOT;
+		*dma = direct_dma;
+		return 0;
+	}
+
 	if (hws_video_dma_shares_channel_page(vid, direct_dma)) {
 		buf->slot = HWS_VIDEO_DIRECT_SLOT;
 		*dma = direct_dma;

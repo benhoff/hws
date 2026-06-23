@@ -28,6 +28,11 @@
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
 
+bool hws_video_only_zerocopy;
+module_param_named(video_only_zerocopy, hws_video_only_zerocopy, bool, 0644);
+MODULE_PARM_DESC(video_only_zerocopy,
+		 "Force video-only direct DMA; reject audio and video bounce-copy paths");
+
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
 	return div_u64(ktime_get_mono_fast_ns() - start_ns, 1000);
@@ -264,22 +269,6 @@ static void hws_stop_kthread_action(void *data)
 			"lifecycle:kthread-stop:done (%lluus)\n",
 			hws_elapsed_us(start_ns));
 	}
-}
-
-static bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
-{
-	dma_addr_t end;
-
-	if (!size)
-		return false;
-
-	end = dma + size - 1;
-	if (end < dma)
-		return false;
-
-	return upper_32_bits(dma) == upper_32_bits(end) &&
-	       (lower_32_bits(dma) & PCI_E_BAR_ADD_MASK) ==
-	       (lower_32_bits(end) & PCI_E_BAR_ADD_MASK);
 }
 
 static size_t hws_video_scratch_bytes(void)

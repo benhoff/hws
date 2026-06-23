@@ -349,6 +349,13 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
 
+	if (hws_video_only_zerocopy && ch < hws->cur_max_video_ch) {
+		dev_warn_ratelimited(&hws->pdev->dev,
+				     "audio ch%u denied by video-only zero-copy policy\n",
+				     ch);
+		return -EBUSY;
+	}
+
 	/* Already running? Re-assert HW if needed. */
 	if (hws->audio[ch].stream_running) {
 		if (!hws_check_audio_capture(hws, ch)) {

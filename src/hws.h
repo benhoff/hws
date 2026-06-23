@@ -221,6 +221,24 @@ struct hws_pcie_dev {
 	int pci_lost;
 };
 
+extern bool hws_video_only_zerocopy;
+
+static inline bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
+{
+	dma_addr_t end;
+
+	if (!size)
+		return false;
+
+	end = dma + size - 1;
+	if (end < dma)
+		return false;
+
+	return upper_32_bits(dma) == upper_32_bits(end) &&
+	       (lower_32_bits(dma) & PCI_E_BAR_ADD_MASK) ==
+	       (lower_32_bits(end) & PCI_E_BAR_ADD_MASK);
+}
+
 int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
 void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
 
