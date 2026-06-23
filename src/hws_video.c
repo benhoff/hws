@@ -306,6 +306,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 	vid->queued_count = 0;
 	vid->window_valid = false;
+	vid->next_bounce_slot = 0;
 
 	/* Default format. */
 	vid->pix.width = 1920;
@@ -556,17 +557,18 @@ static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
 				       hws->bar0_base + CVBS_IN_BUF_BASE +
 				       ch * PCIE_BARADDROFSIZE);
 
-			/* Half-frame length in /16 units.
-			 * Prefer the current channel's computed half_size if available.
-			 * Fall back to half of the probe-owned scratch buffer.
+			/*
+			 * Half-frame length in /16 units. Prefer the current
+			 * format and fall back to the video bounce window,
+			 * not the full per-channel arena that also contains audio.
 			 */
 			{
 				u32 half_bytes = hws->video[ch].pix.half_size ?
-				    hws->video[ch].pix.half_size :
-				    (u32)(hws->scratch_vid[ch].size / 2);
+					hws->video[ch].pix.half_size :
+					(u32)(MAX_VIDEO_SCALER_SIZE / 2);
+
 				writel_relaxed(half_bytes / 16,
-					       hws->bar0_base +
-					       CVBS_IN_BUF_BASE2 +
+					       hws->bar0_base + CVBS_IN_BUF_BASE2 +
 					       ch * PCIE_BARADDROFSIZE);
 			}
 		}
@@ -1163,9 +1165,39 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		list_for_each_entry_safe(b, tmp, &queued, list) {
 			list_del_init(&b->list);
 			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
+			}
+			return ret;
+		}
+
+	ret = hws_alloc_channel_scratch(hws, v->channel_index);
+	if (ret) {
+		struct hwsvideo_buffer *b, *tmp;
+		unsigned long f;
+		LIST_HEAD(queued);
+
+		spin_lock_irqsave(&v->irq_lock, f);
+		if (v->active) {
+			list_add_tail(&v->active->list, &queued);
+			v->active = NULL;
+		}
+		if (v->next_prepared) {
+			list_add_tail(&v->next_prepared->list, &queued);
+			v->next_prepared = NULL;
+		}
+		while (!list_empty(&v->capture_queue)) {
+			b = list_first_entry(&v->capture_queue,
+					     struct hwsvideo_buffer, list);
+			list_move_tail(&b->list, &queued);
+		}
+		spin_unlock_irqrestore(&v->irq_lock, f);
+
+		list_for_each_entry_safe(b, tmp, &queued, list) {
+			list_del_init(&b->list);
+			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
 		}
 		return ret;
 	}
+
 	(void)hws_read_active_state(hws, v->channel_index,
 				       &v->pix.interlaced);
 
@@ -1292,6 +1324,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 		"video:streamoff:done ch=%u completed=%u (%lluus)\n",
 		v->channel_index, done_cnt, hws_elapsed_us(start_ns));
 	hws_log_video_state(v, "streamoff", "end");
+	hws_release_channel_scratch(hws, v->channel_index);
 }
 
 static const struct vb2_ops hwspcie_video_qops = {
