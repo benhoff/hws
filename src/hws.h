@@ -53,6 +53,7 @@ struct hwsvideo_buffer {
 	int slot;
 };
 
+#define HWS_VIDEO_DIRECT_SLOT (-1)
 #define HWS_VIDEO_BOUNCE_SLOTS 2
 
 struct hws_video {

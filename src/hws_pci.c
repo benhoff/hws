@@ -28,6 +28,11 @@
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
 
+static bool hws_enable_audio = true;
+module_param_named(enable_audio, hws_enable_audio, bool, 0644);
+MODULE_PARM_DESC(enable_audio,
+		 "Enable ALSA HDMI audio capture devices; set to 0 for video-only mode");
+
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
 	return div_u64(ktime_get_mono_fast_ns() - start_ns, 1000);
@@ -125,6 +130,8 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 
 	if (hdev->cur_max_audio_ch > hdev->cur_max_video_ch)
 		hdev->cur_max_audio_ch = hdev->cur_max_video_ch;
+	if (!hws_enable_audio)
+		hdev->cur_max_audio_ch = 0;
 
 	/* universal buffer capacity */
 	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
