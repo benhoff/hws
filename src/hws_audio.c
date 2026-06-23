@@ -13,6 +13,74 @@
 #include <linux/preempt.h>
 #include "hws_video.h"
 
+static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws,
+					 unsigned int ch);
+
+static void hws_audio_reset_runtime_state(struct hws_audio *a)
+{
+	unsigned long flags;
+
+	if (!a)
+		return;
+
+	spin_lock_irqsave(&a->ring_lock, flags);
+	a->ring_size_byframes = 0;
+	a->ring_wpos_byframes = 0;
+	a->period_size_byframes = 0;
+	a->period_used_byframes = 0;
+	a->frame_bytes = 0;
+	spin_unlock_irqrestore(&a->ring_lock, flags);
+
+	WRITE_ONCE(a->last_period_toggle, 0xFF);
+	WRITE_ONCE(a->irq_count, 0);
+	WRITE_ONCE(a->delivered_count, 0);
+}
+
+static bool hws_audio_publish_stopped(struct hws_audio *a)
+{
+	bool was_running;
+
+	if (!a)
+		return false;
+
+	was_running = READ_ONCE(a->stream_running) ||
+		      READ_ONCE(a->cap_active);
+	WRITE_ONCE(a->stream_running, false);
+	WRITE_ONCE(a->cap_active, false);
+	WRITE_ONCE(a->stop_requested, true);
+	/*
+	 * IRQ handlers test these flags before touching scratch buffers or
+	 * ALSA pointers. Publish the no-stream state before ACAP is disabled
+	 * and before any teardown clears pcm_substream.
+	 */
+	smp_wmb();
+	return was_running;
+}
+
+static bool hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
+				      unsigned int ch, bool sync_irq)
+{
+	struct hws_audio *a;
+	bool was_running;
+
+	if (!hws || ch >= hws->cur_max_audio_ch)
+		return false;
+
+	a = &hws->audio[ch];
+	was_running = hws_audio_publish_stopped(a);
+
+	hws_enable_audio_capture(hws, ch, false);
+	if (hws->bar0_base)
+		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+
+	if (sync_irq && hws->irq >= 0 && !in_interrupt())
+		synchronize_irq(hws->irq);
+
+	hws_audio_ack_pending(hws, ch);
+	hws_audio_reset_runtime_state(a);
+	return was_running;
+}
+
 static const struct snd_pcm_hardware audio_pcm_hardware = {
 	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
 		 SNDRV_PCM_INFO_BLOCK_TRANSFER | SNDRV_PCM_INFO_RESUME |
@@ -146,7 +214,7 @@ static size_t hws_audio_packet_offset(const struct hws_audio *a, u8 cur_toggle)
 	return cur_toggle ? 0 : packet;
 }
 
-static void hws_audio_deliver_packet(struct hws_audio *a, const void *src)
+static bool hws_audio_deliver_packet(struct hws_audio *a, const void *src)
 {
 	struct snd_pcm_substream *ss;
 	struct snd_pcm_runtime *rt;
@@ -154,30 +222,42 @@ static void hws_audio_deliver_packet(struct hws_audio *a, const void *src)
 	size_t frame_bytes, packet_bytes, ring_bytes, first;
 	unsigned long flags;
 	unsigned int elapsed = 0;
+	bool delivered = false;
 	char *dst;
 
-	ss = a->pcm_substream;
+	if (!READ_ONCE(a->stream_running) || !READ_ONCE(a->cap_active) ||
+	    READ_ONCE(a->stop_requested))
+		return false;
+
+	ss = READ_ONCE(a->pcm_substream);
 	if (!ss)
-		return;
+		return false;
 
 	rt = ss->runtime;
 	if (!rt || !rt->dma_area)
-		return;
+		return false;
+
+	spin_lock_irqsave(&a->ring_lock, flags);
+	if (!READ_ONCE(a->stream_running) || !READ_ONCE(a->cap_active) ||
+	    READ_ONCE(a->stop_requested) ||
+	    READ_ONCE(a->pcm_substream) != ss) {
+		spin_unlock_irqrestore(&a->ring_lock, flags);
+		return false;
+	}
 
 	frame_bytes = a->frame_bytes;
 	packet_bytes = a->hw_packet_bytes;
 	ring_frames = a->ring_size_byframes;
 	period_frames = a->period_size_byframes;
 	if (!frame_bytes || !packet_bytes || !ring_frames || !period_frames)
-		return;
+		goto out_unlock;
 	if (packet_bytes % frame_bytes)
-		return;
+		goto out_unlock;
 
 	frames = packet_bytes / frame_bytes;
 	if (!frames)
-		return;
+		goto out_unlock;
 
-	spin_lock_irqsave(&a->ring_lock, flags);
 	ring_pos = a->ring_wpos_byframes;
 	ring_bytes = ring_frames * frame_bytes;
 	dst = rt->dma_area + ring_pos * frame_bytes;
@@ -185,6 +265,7 @@ static void hws_audio_deliver_packet(struct hws_audio *a, const void *src)
 	memcpy(dst, src, first);
 	if (first < packet_bytes)
 		memcpy(rt->dma_area, (const char *)src + first, packet_bytes - first);
+	delivered = true;
 
 	ring_pos += frames;
 	if (ring_pos >= ring_frames)
@@ -196,10 +277,12 @@ static void hws_audio_deliver_packet(struct hws_audio *a, const void *src)
 		a->period_used_byframes -= period_frames;
 		elapsed++;
 	}
+out_unlock:
 	spin_unlock_irqrestore(&a->ring_lock, flags);
 
 	while (elapsed--)
 		snd_pcm_period_elapsed(ss);
+	return delivered;
 }
 
 void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cur_toggle)
@@ -213,42 +296,23 @@ void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cu
 		return;
 
 	a = &hws->audio[ch];
-	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &size) ||
-	    !a->stream_running)
+	if (!READ_ONCE(a->stream_running) || !READ_ONCE(a->cap_active) ||
+	    READ_ONCE(a->stop_requested))
 		return;
 
-	a->last_period_toggle = cur_toggle;
-	a->irq_count++;
+	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &size))
+		return;
+
+	WRITE_ONCE(a->last_period_toggle, cur_toggle);
+	WRITE_ONCE(a->irq_count, READ_ONCE(a->irq_count) + 1);
 	offset = hws_audio_packet_offset(a, cur_toggle);
 	if (offset + a->hw_packet_bytes > size)
 		return;
 
 	dma_rmb();
-	hws_audio_deliver_packet(a, (char *)cpu + offset);
-	a->delivered_count++;
-}
-
-static void hws_audio_hw_stop(struct hws_pcie_dev *hws, unsigned int ch)
-{
-	if (!hws || ch >= hws->cur_max_audio_ch)
-		return;
-
-	/* Disable the channel */
-	hws_enable_audio_capture(hws, ch, false);
-
-	/* Flush posted write */
-	readl(hws->bar0_base + HWS_REG_INT_STATUS);
-
-	/* Ack any latched ADONE so we don't get re-triggers */
-	{
-		u32 abit = HWS_INT_ADONE_BIT(ch);
-		u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-
-		if (st & abit) {
-			writel(abit, hws->bar0_base + HWS_REG_INT_ACK);
-			readl(hws->bar0_base + HWS_REG_INT_STATUS);
-		}
-	}
+	if (hws_audio_deliver_packet(a, (char *)cpu + offset))
+		WRITE_ONCE(a->delivered_count,
+			   READ_ONCE(a->delivered_count) + 1);
 }
 
 int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
@@ -273,17 +337,17 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 	aud->hw_packet_bytes    = pdev->audio_pkt_size;
 
 	/* ALSA linkage */
-	aud->pcm_substream = NULL;
+	WRITE_ONCE(aud->pcm_substream, NULL);
 
 	/* stream state */
-	aud->cap_active     = false;
-	aud->stream_running = false;
-	aud->stop_requested = false;
+	WRITE_ONCE(aud->cap_active, false);
+	WRITE_ONCE(aud->stream_running, false);
+	WRITE_ONCE(aud->stop_requested, false);
 
 	/* HW readback sentinel */
-	aud->last_period_toggle = 0xFF;
-	aud->irq_count = 0;
-	aud->delivered_count = 0;
+	WRITE_ONCE(aud->last_period_toggle, 0xFF);
+	WRITE_ONCE(aud->irq_count, 0);
+	WRITE_ONCE(aud->delivered_count, 0);
 
 	return 0;
 }
@@ -292,42 +356,26 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 {
 	struct hws_audio *aud;
 	bool was_running;
+	struct snd_pcm_substream *ss;
 
 	if (!pdev || ch < 0 || ch >= pdev->cur_max_audio_ch)
 		return;
 
 	aud = &pdev->audio[ch];
-	was_running = aud->stream_running;
+	was_running = hws_audio_quiesce_capture(pdev, ch, true);
 
-	/* 1) Make IRQ path a no-op first */
-	aud->stream_running = false;
-	aud->cap_active = false;
-	aud->stop_requested = true;
-	smp_wmb();  /* publish flags before touching HW */
-
-	/* 2) Quiesce hardware (disable ch, flush, ack pending ADONE) */
-	hws_audio_hw_stop(pdev, ch);  /* should disable capture and ack pending */
-
-	/* 3) If device is going away and stream was open, tell ALSA */
-	if (device_removal && aud->pcm_substream) {
+	/* If device is going away and stream was open, tell ALSA. */
+	ss = READ_ONCE(aud->pcm_substream);
+	if (device_removal && ss) {
 		unsigned long flags;
 
-		snd_pcm_stream_lock_irqsave(aud->pcm_substream, flags);
-		if (aud->pcm_substream->runtime)
-			snd_pcm_stop(aud->pcm_substream, SNDRV_PCM_STATE_DISCONNECTED);
-		snd_pcm_stream_unlock_irqrestore(aud->pcm_substream, flags);
-		aud->pcm_substream = NULL;
+		snd_pcm_stream_lock_irqsave(ss, flags);
+		if (ss->runtime)
+			snd_pcm_stop(ss, SNDRV_PCM_STATE_DISCONNECTED);
+		snd_pcm_stream_unlock_irqrestore(ss, flags);
+		WRITE_ONCE(aud->pcm_substream, NULL);
 	}
 
-	/* 4) Clear book-keeping (optional) */
-	aud->ring_size_byframes = 0;
-	aud->ring_wpos_byframes = 0;
-	aud->period_size_byframes = 0;
-	aud->period_used_byframes = 0;
-	aud->frame_bytes = 0;
-	aud->last_period_toggle = 0xFF;
-	aud->irq_count = 0;
-	aud->delivered_count = 0;
 	if (was_running)
 		hws_release_channel_scratch(pdev, ch);
 }
@@ -338,9 +386,6 @@ static inline bool hws_check_audio_capture(struct hws_pcie_dev *hws, unsigned in
 
 	return !!(reg & BIT(ch));
 }
-
-static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws,
-					 unsigned int ch);
 
 int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
@@ -357,7 +402,7 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	}
 
 	/* Already running? Re-assert HW if needed. */
-	if (hws->audio[ch].stream_running) {
+	if (READ_ONCE(hws->audio[ch].stream_running)) {
 		if (!hws_check_audio_capture(hws, ch)) {
 			ret = hws_check_card_status(hws);
 			if (ret)
@@ -397,12 +442,12 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	}
 
 	/* Flip state visible to IRQ */
-	hws->audio[ch].stop_requested = false;
-	hws->audio[ch].stream_running = true;
-	hws->audio[ch].cap_active = true;
-	hws->audio[ch].irq_count = 0;
-	hws->audio[ch].delivered_count = 0;
-	hws->audio[ch].last_period_toggle = 0xFF;
+	WRITE_ONCE(hws->audio[ch].stop_requested, false);
+	WRITE_ONCE(hws->audio[ch].stream_running, true);
+	WRITE_ONCE(hws->audio[ch].cap_active, true);
+	WRITE_ONCE(hws->audio[ch].irq_count, 0);
+	WRITE_ONCE(hws->audio[ch].delivered_count, 0);
+	WRITE_ONCE(hws->audio[ch].last_period_toggle, 0xFF);
 	/*
 	 * ADONE can fire as soon as capture is enabled. Publish the stream
 	 * state before ACAP_ENABLE so the IRQ path accepts the first packet.
@@ -417,8 +462,12 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	u32 abit = HWS_INT_ADONE_BIT(ch);
+	u32 st;
 
-	u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	if (!hws || !hws->bar0_base || ch >= hws->cur_max_audio_ch)
+		return;
+
+	st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
 
 	if (st & abit) {
 		writel(abit, hws->bar0_base + HWS_REG_INT_ACK);
@@ -431,6 +480,9 @@ static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 {
 	u32 mask = 0;
 
+	if (!hws || !hws->bar0_base)
+		return;
+
 	for (unsigned int ch = 0; ch < hws->cur_max_audio_ch; ch++)
 		mask |= HWS_INT_ADONE_BIT(ch);
 	if (mask) {
@@ -441,36 +493,19 @@ static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 
 void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
+	bool was_running;
+
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return;
 
-	if (!hws->audio[ch].stream_running)
+	if (!READ_ONCE(hws->audio[ch].stream_running) &&
+	    !READ_ONCE(hws->audio[ch].cap_active))
 		return;
 
-	/* 1) Publish software state so IRQ path becomes a no-op */
-	hws->audio[ch].stream_running = false;
-	hws->audio[ch].cap_active = false;
-	hws->audio[ch].stop_requested = true;
-	smp_wmb(); /* make sure flags are visible before HW disable */
-
-	/* 2) Disable channel in HW */
-	hws_enable_audio_capture(hws, ch, false);
-	/* flush posted write */
-	readl(hws->bar0_base + HWS_REG_INT_STATUS);
-
-	/* 3) Wait for non-IRQ-triggered stops to stop racing the handler. */
-	if (hws->irq >= 0 && !in_interrupt())
-		synchronize_irq(hws->irq);
-
-	/* 4) Ack any latched ADONE to prevent retrigger storms */
-	hws_audio_ack_pending(hws, ch);
-	spin_lock(&hws->audio[ch].ring_lock);
-	hws->audio[ch].ring_wpos_byframes = 0;
-	hws->audio[ch].period_used_byframes = 0;
-	spin_unlock(&hws->audio[ch].ring_lock);
-
+	was_running = hws_audio_quiesce_capture(hws, ch, true);
 	dev_dbg(&hws->pdev->dev, "audio capture stopped on ch %u\n", ch);
-	hws_release_channel_scratch(hws, ch);
+	if (was_running)
+		hws_release_channel_scratch(hws, ch);
 }
 
 void hws_enable_audio_capture(struct hws_pcie_dev *hws,
@@ -506,7 +541,7 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *rt = substream->runtime;
 
 	rt->hw = audio_pcm_hardware;
-	a->pcm_substream = substream;
+	WRITE_ONCE(a->pcm_substream, substream);
 
 	snd_pcm_hw_constraint_integer(rt, SNDRV_PCM_HW_PARAM_PERIODS);
 	snd_pcm_hw_constraint_step(rt, 0, SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 32);
@@ -518,7 +553,8 @@ int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
 
-	a->pcm_substream = NULL;
+	hws_stop_audio_capture(a->parent, a->channel_index);
+	WRITE_ONCE(a->pcm_substream, NULL);
 	return 0;
 }
 
@@ -554,9 +590,9 @@ int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	spin_unlock_irqrestore(&a->ring_lock, flags);
 
 	/* Optional: clear HW toggle readback */
-	a->last_period_toggle = 0xFF;
-	a->irq_count = 0;
-	a->delivered_count = 0;
+	WRITE_ONCE(a->last_period_toggle, 0xFF);
+	WRITE_ONCE(a->irq_count, 0);
+	WRITE_ONCE(a->delivered_count, 0);
 	return 0;
 }
 
@@ -643,11 +679,11 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 		/* Tie this PCM to channel i */
 		hws->audio[i].parent        = hws;
 		hws->audio[i].channel_index = i;
-		hws->audio[i].pcm_substream = NULL;
-		hws->audio[i].cap_active    = false;
-		hws->audio[i].stream_running = false;
-		hws->audio[i].stop_requested = false;
-		hws->audio[i].last_period_toggle = 0xFF;
+		WRITE_ONCE(hws->audio[i].pcm_substream, NULL);
+		WRITE_ONCE(hws->audio[i].cap_active, false);
+		WRITE_ONCE(hws->audio[i].stream_running, false);
+		WRITE_ONCE(hws->audio[i].stop_requested, false);
+		WRITE_ONCE(hws->audio[i].last_period_toggle, 0xFF);
 		hws->audio[i].output_sample_rate = 48000;
 		hws->audio[i].channel_count      = 2;
 		hws->audio[i].bits_per_sample    = 16;
@@ -695,6 +731,8 @@ error_card:
 
 void hws_audio_unregister(struct hws_pcie_dev *hws)
 {
+	bool was_running[MAX_VID_CHANNELS] = {};
+
 	if (!hws)
 		return;
 
@@ -705,23 +743,38 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 	for (unsigned int i = 0; i < hws->cur_max_audio_ch; i++) {
 		struct hws_audio *a = &hws->audio[i];
 
-		/* Flip flags first so IRQ path won't call ALSA anymore */
-		a->stream_running = false;
-		a->cap_active = false;
-		a->stop_requested = true;
-		/* Publish stop flags before disabling capture in HW.
-		 * Ensures that any CPU/core handling an ADONE IRQ or bottom half
-		 * observes stream_running/cap_active=false before it sees the
-		 * effect of the MMIO write below. Pairs with flag checks
-		 * in the IRQ/BH paths so ALSA callbacks are never invoked after
-		 * the stream has been marked stopped.
-		 */
-		smp_wmb();
+		was_running[i] = hws_audio_publish_stopped(a);
 		hws_enable_audio_capture(hws, i, false);
 	}
-	/* Flush and ack any pending audio interrupts across all channels */
-	readl(hws->bar0_base + HWS_REG_INT_STATUS);
+
+	/* Flush ACAP disables before waiting for any running IRQ handler. */
+	if (hws->bar0_base)
+		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	if (hws->irq >= 0 && !in_interrupt())
+		synchronize_irq(hws->irq);
+
+	/* No deferred audio work exists today; ADONE is handled in hard IRQ. */
 	hws_audio_ack_all(hws);
+
+	for (unsigned int i = 0; i < hws->cur_max_audio_ch; i++) {
+		struct hws_audio *a = &hws->audio[i];
+		struct snd_pcm_substream *ss = READ_ONCE(a->pcm_substream);
+
+		if (ss) {
+			unsigned long flags;
+
+			snd_pcm_stream_lock_irqsave(ss, flags);
+			if (ss->runtime)
+				snd_pcm_stop(ss, SNDRV_PCM_STATE_DISCONNECTED);
+			snd_pcm_stream_unlock_irqrestore(ss, flags);
+		}
+
+		WRITE_ONCE(a->pcm_substream, NULL);
+		hws_audio_reset_runtime_state(a);
+		if (was_running[i])
+			hws_release_channel_scratch(hws, i);
+	}
+
 	if (hws->snd_card) {
 		snd_card_free_when_closed(hws->snd_card);
 		hws->snd_card = NULL;
@@ -743,7 +796,7 @@ int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws)
 	/* Iterate audio channels and suspend each unique PCM device */
 	for (i = 0; i < hws->cur_max_audio_ch && i < ARRAY_SIZE(hws->audio); i++) {
 		struct hws_audio *a = &hws->audio[i];
-		struct snd_pcm_substream *ss = a->pcm_substream;
+		struct snd_pcm_substream *ss = READ_ONCE(a->pcm_substream);
 		struct snd_pcm *pcm;
 		bool already = false;
 
@@ -791,12 +844,12 @@ void hws_audio_pm_resume(struct hws_pcie_dev *hws)
 	for (ch = 0; ch < hws->cur_max_audio_ch && ch < MAX_VID_CHANNELS; ch++) {
 		struct hws_audio *a = &hws->audio[ch];
 
-		a->stream_running = false;
-		a->cap_active = false;
-		a->stop_requested = true;
-		a->last_period_toggle = 0xFF;
-		a->irq_count = 0;
-		a->delivered_count = 0;
+		WRITE_ONCE(a->stream_running, false);
+		WRITE_ONCE(a->cap_active, false);
+		WRITE_ONCE(a->stop_requested, true);
+		WRITE_ONCE(a->last_period_toggle, 0xFF);
+		WRITE_ONCE(a->irq_count, 0);
+		WRITE_ONCE(a->delivered_count, 0);
 	}
 	hws_audio_seed_channels(hws);
 	hws_audio_ack_all(hws);

@@ -275,8 +275,9 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 				continue;
 
 			/* Only service running streams */
-			if (!pdx->audio[ch].cap_active ||
-			    !pdx->audio[ch].stream_running) {
+			if (!READ_ONCE(pdx->audio[ch].cap_active) ||
+			    !READ_ONCE(pdx->audio[ch].stream_running) ||
+			    READ_ONCE(pdx->audio[ch].stop_requested)) {
 				writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
 				(void)readl_relaxed(pdx->bar0_base +
 						    HWS_REG_INT_STATUS);
@@ -290,7 +291,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			 */
 			cur_toggle = readl_relaxed(pdx->bar0_base +
 						   HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-			pdx->audio[ch].last_period_toggle = cur_toggle;
+			WRITE_ONCE(pdx->audio[ch].last_period_toggle, cur_toggle);
 
 			hws_audio_handle_interrupt(pdx, ch, cur_toggle);
 			writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);

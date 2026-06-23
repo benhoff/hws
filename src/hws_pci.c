@@ -716,9 +716,9 @@ static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 	for (i = 0; i < hws->cur_max_audio_ch; ++i) {
 		struct hws_audio *a = &hws->audio[i];
 
-		a->stream_running = false;
-		a->cap_active = false;
-		a->stop_requested = true;
+		WRITE_ONCE(a->stream_running, false);
+		WRITE_ONCE(a->cap_active, false);
+		WRITE_ONCE(a->stop_requested, true);
 	}
 
 	smp_wmb(); /* make flags visible before we touch MMIO/queues */
