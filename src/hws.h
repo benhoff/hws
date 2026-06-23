@@ -12,6 +12,7 @@
 #include <linux/spinlock.h>
 #include <linux/sizes.h>
 #include <linux/atomic.h>
+#include <linux/workqueue.h>
 
 #include <sound/pcm.h>
 #include <sound/core.h>
@@ -157,9 +158,15 @@ struct hws_audio {
 	bool stop_requested;
 
 	/* minimal HW packet tracking */
+	struct work_struct deliver_work;
+	spinlock_t pending_lock;
+	bool packet_pending;
+	u8 pending_toggle;
+	u64 pending_irq_ns;
 	u8 last_period_toggle;
 	u32 irq_count;
 	u32 delivered_count;
+	u32 dropped_packets;
 
 	/* PCM format */
 	u32 output_sample_rate;
@@ -182,6 +189,7 @@ struct hws_pcie_dev {
 
 	/* BAR and workqueues */
 	void __iomem *bar0_base;
+	struct workqueue_struct *audio_wq;
 
 	/* Device identity and capabilities */
 	u16 vendor_id;

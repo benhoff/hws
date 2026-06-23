@@ -10,11 +10,15 @@
 #include <sound/pcm.h>
 #include <sound/rawmidi.h>
 #include <sound/initval.h>
+#include <linux/ktime.h>
 #include <linux/preempt.h>
 #include "hws_video.h"
 
 static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws,
 					 unsigned int ch);
+static void hws_audio_clear_pending(struct hws_audio *a);
+static void hws_audio_deliver_work(struct work_struct *work);
+static void hws_audio_drain_channel_work(struct hws_audio *a);
 
 static void hws_audio_reset_runtime_state(struct hws_audio *a)
 {
@@ -23,6 +27,7 @@ static void hws_audio_reset_runtime_state(struct hws_audio *a)
 	if (!a)
 		return;
 
+	hws_audio_clear_pending(a);
 	spin_lock_irqsave(&a->ring_lock, flags);
 	a->ring_size_byframes = 0;
 	a->ring_wpos_byframes = 0;
@@ -34,6 +39,7 @@ static void hws_audio_reset_runtime_state(struct hws_audio *a)
 	WRITE_ONCE(a->last_period_toggle, 0xFF);
 	WRITE_ONCE(a->irq_count, 0);
 	WRITE_ONCE(a->delivered_count, 0);
+	WRITE_ONCE(a->dropped_packets, 0);
 }
 
 static bool hws_audio_publish_stopped(struct hws_audio *a)
@@ -75,6 +81,9 @@ static bool hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
 
 	if (sync_irq && hws->irq >= 0 && !in_interrupt())
 		synchronize_irq(hws->irq);
+
+	if (!in_interrupt())
+		hws_audio_drain_channel_work(a);
 
 	hws_audio_ack_pending(hws, ch);
 	hws_audio_reset_runtime_state(a);
@@ -214,6 +223,29 @@ static size_t hws_audio_packet_offset(const struct hws_audio *a, u8 cur_toggle)
 	return cur_toggle ? 0 : packet;
 }
 
+static void hws_audio_clear_pending(struct hws_audio *a)
+{
+	unsigned long flags;
+
+	if (!a)
+		return;
+
+	spin_lock_irqsave(&a->pending_lock, flags);
+	a->packet_pending = false;
+	a->pending_irq_ns = 0;
+	spin_unlock_irqrestore(&a->pending_lock, flags);
+}
+
+static void hws_audio_drain_channel_work(struct hws_audio *a)
+{
+	if (!a)
+		return;
+
+	if (!in_interrupt())
+		cancel_work_sync(&a->deliver_work);
+	hws_audio_clear_pending(a);
+}
+
 static bool hws_audio_deliver_packet(struct hws_audio *a, const void *src)
 {
 	struct snd_pcm_substream *ss;
@@ -285,12 +317,95 @@ out_unlock:
 	return delivered;
 }
 
-void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cur_toggle)
+static bool hws_audio_packet_stale(struct hws_audio *a, u64 irq_ns)
 {
-	struct hws_audio *a;
+	u64 packet_ns;
+	size_t frame_bytes;
+	u32 rate;
+	u64 frames;
+
+	if (!a || !irq_ns)
+		return false;
+
+	frame_bytes = READ_ONCE(a->frame_bytes);
+	rate = READ_ONCE(a->output_sample_rate);
+	if (!frame_bytes || !rate || a->hw_packet_bytes % frame_bytes)
+		return false;
+
+	frames = a->hw_packet_bytes / frame_bytes;
+	if (!frames)
+		return false;
+
+	packet_ns = div_u64(frames * NSEC_PER_SEC, rate);
+	return ktime_get_mono_fast_ns() - irq_ns >= packet_ns;
+}
+
+static void hws_audio_deliver_one_packet(struct hws_audio *a, u8 cur_toggle)
+{
+	struct hws_pcie_dev *hws;
+	unsigned int ch;
 	void *cpu;
 	size_t size;
 	size_t offset;
+
+	if (!a)
+		return;
+
+	hws = a->parent;
+	ch = a->channel_index;
+	if (!hws || ch >= hws->cur_max_audio_ch)
+		return;
+
+	if (!READ_ONCE(a->stream_running) || !READ_ONCE(a->cap_active) ||
+	    READ_ONCE(a->stop_requested))
+		return;
+
+	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &size))
+		return;
+
+	offset = hws_audio_packet_offset(a, cur_toggle);
+	if (offset + a->hw_packet_bytes > size)
+		return;
+
+	dma_rmb();
+	if (hws_audio_deliver_packet(a, (char *)cpu + offset))
+		WRITE_ONCE(a->delivered_count,
+			   READ_ONCE(a->delivered_count) + 1);
+}
+
+static void hws_audio_deliver_work(struct work_struct *work)
+{
+	struct hws_audio *a = container_of(work, struct hws_audio, deliver_work);
+	unsigned long flags;
+	u64 irq_ns;
+	u8 toggle;
+
+	for (;;) {
+		spin_lock_irqsave(&a->pending_lock, flags);
+		if (!a->packet_pending) {
+			spin_unlock_irqrestore(&a->pending_lock, flags);
+			break;
+		}
+		toggle = a->pending_toggle;
+		irq_ns = a->pending_irq_ns;
+		a->packet_pending = false;
+		a->pending_irq_ns = 0;
+		spin_unlock_irqrestore(&a->pending_lock, flags);
+
+		if (hws_audio_packet_stale(a, irq_ns)) {
+			WRITE_ONCE(a->dropped_packets,
+				   READ_ONCE(a->dropped_packets) + 1);
+			continue;
+		}
+
+		hws_audio_deliver_one_packet(a, toggle);
+	}
+}
+
+void hws_audio_queue_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cur_toggle)
+{
+	struct workqueue_struct *wq;
+	struct hws_audio *a;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return;
@@ -300,19 +415,25 @@ void hws_audio_handle_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cu
 	    READ_ONCE(a->stop_requested))
 		return;
 
-	if (!hws_audio_select_buffer(hws, ch, &cpu, NULL, &size))
+	wq = READ_ONCE(hws->audio_wq);
+	if (!wq) {
+		WRITE_ONCE(a->dropped_packets,
+			   READ_ONCE(a->dropped_packets) + 1);
 		return;
+	}
 
 	WRITE_ONCE(a->last_period_toggle, cur_toggle);
+	spin_lock(&a->pending_lock);
+	if (a->packet_pending)
+		WRITE_ONCE(a->dropped_packets,
+			   READ_ONCE(a->dropped_packets) + 1);
+	a->pending_toggle = cur_toggle;
+	a->pending_irq_ns = ktime_get_mono_fast_ns();
+	a->packet_pending = true;
 	WRITE_ONCE(a->irq_count, READ_ONCE(a->irq_count) + 1);
-	offset = hws_audio_packet_offset(a, cur_toggle);
-	if (offset + a->hw_packet_bytes > size)
-		return;
+	spin_unlock(&a->pending_lock);
 
-	dma_rmb();
-	if (hws_audio_deliver_packet(a, (char *)cpu + offset))
-		WRITE_ONCE(a->delivered_count,
-			   READ_ONCE(a->delivered_count) + 1);
+	queue_work(wq, &a->deliver_work);
 }
 
 int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
@@ -329,6 +450,8 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 	aud->parent        = pdev;
 	aud->channel_index = ch;
 	spin_lock_init(&aud->ring_lock);
+	spin_lock_init(&aud->pending_lock);
+	INIT_WORK(&aud->deliver_work, hws_audio_deliver_work);
 
 	/* defaults */
 	aud->output_sample_rate = 48000;
@@ -348,6 +471,7 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 	WRITE_ONCE(aud->last_period_toggle, 0xFF);
 	WRITE_ONCE(aud->irq_count, 0);
 	WRITE_ONCE(aud->delivered_count, 0);
+	WRITE_ONCE(aud->dropped_packets, 0);
 
 	return 0;
 }
@@ -447,7 +571,9 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	WRITE_ONCE(hws->audio[ch].cap_active, true);
 	WRITE_ONCE(hws->audio[ch].irq_count, 0);
 	WRITE_ONCE(hws->audio[ch].delivered_count, 0);
+	WRITE_ONCE(hws->audio[ch].dropped_packets, 0);
 	WRITE_ONCE(hws->audio[ch].last_period_toggle, 0xFF);
+	hws_audio_clear_pending(&hws->audio[ch]);
 	/*
 	 * ADONE can fire as soon as capture is enabled. Publish the stream
 	 * state before ACAP_ENABLE so the IRQ path accepts the first packet.
@@ -554,6 +680,7 @@ int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
 
 	hws_stop_audio_capture(a->parent, a->channel_index);
+	hws_audio_drain_channel_work(a);
 	WRITE_ONCE(a->pcm_substream, NULL);
 	return 0;
 }
@@ -566,6 +693,10 @@ int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream,
 
 int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
 {
+	struct hws_audio *a = snd_pcm_substream_chip(substream);
+
+	hws_stop_audio_capture(a->parent, a->channel_index);
+	hws_audio_drain_channel_work(a);
 	return snd_pcm_lib_free_pages(substream);
 }
 
@@ -593,6 +724,8 @@ int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	WRITE_ONCE(a->last_period_toggle, 0xFF);
 	WRITE_ONCE(a->irq_count, 0);
 	WRITE_ONCE(a->delivered_count, 0);
+	WRITE_ONCE(a->dropped_packets, 0);
+	hws_audio_clear_pending(a);
 	return 0;
 }
 
@@ -753,7 +886,7 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 	if (hws->irq >= 0 && !in_interrupt())
 		synchronize_irq(hws->irq);
 
-	/* No deferred audio work exists today; ADONE is handled in hard IRQ. */
+	hws_audio_drain_work(hws);
 	hws_audio_ack_all(hws);
 
 	for (unsigned int i = 0; i < hws->cur_max_audio_ch; i++) {
@@ -850,7 +983,20 @@ void hws_audio_pm_resume(struct hws_pcie_dev *hws)
 		WRITE_ONCE(a->last_period_toggle, 0xFF);
 		WRITE_ONCE(a->irq_count, 0);
 		WRITE_ONCE(a->delivered_count, 0);
+		WRITE_ONCE(a->dropped_packets, 0);
+		hws_audio_clear_pending(a);
 	}
 	hws_audio_seed_channels(hws);
 	hws_audio_ack_all(hws);
+}
+
+void hws_audio_drain_work(struct hws_pcie_dev *hws)
+{
+	unsigned int ch;
+
+	if (!hws)
+		return;
+
+	for (ch = 0; ch < hws->cur_max_audio_ch && ch < MAX_VID_CHANNELS; ch++)
+		hws_audio_drain_channel_work(&hws->audio[ch]);
 }

@@ -271,6 +271,21 @@ static void hws_stop_kthread_action(void *data)
 	}
 }
 
+static void hws_destroy_audio_workqueue(struct hws_pcie_dev *hws)
+{
+	struct workqueue_struct *wq;
+
+	if (!hws)
+		return;
+
+	wq = hws->audio_wq;
+	if (!wq)
+		return;
+
+	hws->audio_wq = NULL;
+	destroy_workqueue(wq);
+}
+
 static size_t hws_video_scratch_bytes(void)
 {
 	return HWS_VIDEO_BOUNCE_SLOTS * ALIGN((size_t)MAX_VIDEO_SCALER_SIZE, 64);
@@ -303,6 +318,10 @@ static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
 
 	if (ch < hws->cur_max_video_ch) {
 		hws->video[ch].window_valid = false;
+		hws->video[ch].last_dma_hi = 0;
+		hws->video[ch].last_dma_page = 0;
+		hws->video[ch].last_pci_addr = 0;
+		hws->video[ch].last_half16 = 0;
 		hws->video[ch].next_bounce_slot = 0;
 	}
 	hws->scratch_users[ch] = 0;
@@ -332,6 +351,12 @@ int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 	if (has_audio)
 		arena_need = ALIGN(aud_off + hws_audio_scratch_bytes(), 64);
 
+	/*
+	 * One coherent per-channel arena backs both fallback video DMA and audio
+	 * DMA. The video bounce slots live first; the audio capture window starts
+	 * at aud_off. The whole arena must fit inside a single 512 MiB remap page
+	 * because video and audio share the channel remap slot.
+	 */
 	mutex_lock(&hws->scratch_lock);
 	if (hws->scratch_vid[ch].cpu) {
 		hws->scratch_users[ch]++;
@@ -414,6 +439,7 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 	if (!hws)
 		return;
 
+	/* Teardown-only force-free path; normal streams use release refcounts. */
 	mutex_lock(&hws->scratch_lock);
 	for (ch = 0; ch < MAX_VID_CHANNELS; ch++) {
 		hws_free_channel_scratch_locked(hws, ch);
@@ -571,6 +597,15 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		}
 	}
 
+	hws->audio_wq = alloc_workqueue("hws-audio",
+					WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM,
+					0);
+	if (!hws->audio_wq) {
+		ret = -ENOMEM;
+		dev_err(&pdev->dev, "audio workqueue allocation failed\n");
+		goto err_unwind_channels;
+	}
+
 	/* 6) Start-run sequence. Scratch DMA is allocated on stream start. */
 	hws_init_video_sys(hws, false);
 
@@ -650,6 +685,7 @@ err_unregister_va:
 	if (v4l2_registered)
 		hws_video_unregister(hws);
 	hws_free_seed_buffers(hws);
+	hws_destroy_audio_workqueue(hws);
 	return ret;
 err_unwind_channels:
 	hws_free_seed_buffers(hws);
@@ -658,6 +694,7 @@ err_unwind_channels:
 			hws_video_cleanup_channel(hws, i);
 		hws_audio_cleanup_channel(hws, i, true);
 	}
+	hws_destroy_audio_workqueue(hws);
 	return ret;
 }
 
@@ -752,6 +789,7 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 	/* Ensure no hard IRQ is still running. */
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
+	hws_audio_drain_work(hws);
 
 	dev_dbg(&hws->pdev->dev, "lifecycle:drain-after-stop:done (%lluus)\n",
 		hws_elapsed_us(start_ns));
@@ -853,6 +891,7 @@ static void hws_remove(struct pci_dev *pdev)
 	/* Unregister ALSA resources before V4L2. */
 	hws_audio_unregister(hws);
 	hws_video_unregister(hws);
+	hws_destroy_audio_workqueue(hws);
 
 	/* Release seeded DMA buffers */
 	hws_free_seed_buffers(hws);

@@ -291,9 +291,8 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			 */
 			cur_toggle = readl_relaxed(pdx->bar0_base +
 						   HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-			WRITE_ONCE(pdx->audio[ch].last_period_toggle, cur_toggle);
 
-			hws_audio_handle_interrupt(pdx, ch, cur_toggle);
+			hws_audio_queue_interrupt(pdx, ch, cur_toggle);
 			writel(abit, pdx->bar0_base + HWS_REG_INT_STATUS);
 			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 		}
