@@ -72,6 +72,17 @@ static size_t hws_video_bounce_size(void)
 	return ALIGN((size_t)MAX_VIDEO_SCALER_SIZE, 64);
 }
 
+static void hws_ack_video_pending(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	u32 vbit = HWS_INT_VDONE_BIT(ch);
+
+	if (!hws || !hws->bar0_base)
+		return;
+
+	writel(vbit, hws->bar0_base + HWS_REG_INT_STATUS);
+	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+}
+
 static bool hws_video_dma_shares_channel_page(struct hws_video *vid,
 					      dma_addr_t dma)
 {
@@ -117,6 +128,9 @@ static int hws_select_video_dma(struct hws_video *vid,
 		*dma = direct_dma;
 		return 0;
 	}
+
+	if (buf->vb.vb2_buf.memory == VB2_MEMORY_DMABUF)
+		return -EOPNOTSUPP;
 
 	arena = &hws->scratch_vid[vid->channel_index];
 	if (!arena->cpu || !arena->size)
@@ -1229,6 +1243,7 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	struct hws_pcie_dev *hws = vid->parent;
 	unsigned long flags;
 	bool queue_error = false;
+	bool streaming;
 	int ret;
 
 	dev_dbg(&hws->pdev->dev,
@@ -1242,9 +1257,11 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	spin_lock_irqsave(&vid->irq_lock, flags);
 	list_add_tail(&buf->list, &vid->capture_queue);
 	vid->queued_count++;
+	streaming = vb2_is_streaming(&vid->buffer_queue) &&
+		    !READ_ONCE(vid->stop_requested);
 
 	/* If streaming and no in-flight buffer, prime HW immediately */
-	if (READ_ONCE(vid->cap_active) && !vid->active) {
+	if (streaming && !vid->active) {
 		dev_dbg(&hws->pdev->dev,
 			"buffer_queue(ch=%u): priming first vb=%p\n",
 			vid->channel_index, &buf->vb.vb2_buf);
@@ -1262,10 +1279,11 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 			goto out_unlock;
 		}
 
+		hws_ack_video_pending(hws, vid->channel_index);
 		wmb(); /* ensure descriptors visible before enabling capture */
 		hws_enable_video_capture(hws, vid->channel_index, true);
 		hws_prime_next_locked(vid);
-	} else if (READ_ONCE(vid->cap_active) && vid->active) {
+	} else if (streaming && READ_ONCE(vid->cap_active) && vid->active) {
 		hws_prime_next_locked(vid);
 	}
 out_unlock:
@@ -1349,7 +1367,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	lockdep_assert_held(&v->state_lock);
 	/* init per-stream state */
 	WRITE_ONCE(v->stop_requested, false);
-	WRITE_ONCE(v->cap_active, true);
+	WRITE_ONCE(v->cap_active, false);
 	WRITE_ONCE(v->half_seen, false);
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
 
@@ -1396,6 +1414,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 			dev_dbg(&hws->pdev->dev,
 				"start_streaming: ch=%u programmed buffer %p slot=%d\n",
 				v->channel_index, to_program, to_program->slot);
+			hws_ack_video_pending(hws, v->channel_index);
 			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 		}
 
@@ -1553,7 +1572,7 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q = &ch->buffer_queue;
 		memset(q, 0, sizeof(*q));
 		q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		q->io_modes = VB2_MMAP | VB2_DMABUF;
+		q->io_modes = VB2_MMAP;
 		q->drv_priv = ch;
 		q->buf_struct_size = sizeof(struct hwsvideo_buffer);
 		q->ops = &hwspcie_video_qops;

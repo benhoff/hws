@@ -245,8 +245,41 @@ static void hws_audio_clear_pending(struct hws_audio *a)
 
 	spin_lock_irqsave(&a->pending_lock, flags);
 	a->packet_pending = false;
+	a->xrun_pending = false;
 	a->pending_irq_ns = 0;
 	spin_unlock_irqrestore(&a->pending_lock, flags);
+}
+
+static void hws_audio_report_xrun(struct hws_audio *a)
+{
+	struct hws_pcie_dev *hws;
+	struct snd_pcm_substream *ss;
+	unsigned long flags;
+	unsigned int ch;
+
+	if (!a)
+		return;
+
+	hws = a->parent;
+	ch = a->channel_index;
+	ss = READ_ONCE(a->pcm_substream);
+
+	hws_audio_publish_stopped(a);
+	if (hws && ch < hws->cur_max_audio_ch) {
+		hws_enable_audio_capture(hws, ch, false);
+		if (hws->bar0_base)
+			readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_audio_ack_pending(hws, ch);
+	}
+	hws_audio_clear_pending(a);
+
+	if (!ss)
+		return;
+
+	snd_pcm_stream_lock_irqsave(ss, flags);
+	if (ss->runtime && READ_ONCE(a->pcm_substream) == ss)
+		snd_pcm_stop(ss, SNDRV_PCM_STATE_XRUN);
+	snd_pcm_stream_unlock_irqrestore(ss, flags);
 }
 
 static void hws_audio_drain_channel_work(struct hws_audio *a)
@@ -450,6 +483,14 @@ static void hws_audio_deliver_work(struct work_struct *work)
 
 	for (;;) {
 		spin_lock_irqsave(&a->pending_lock, flags);
+		if (a->xrun_pending) {
+			a->xrun_pending = false;
+			a->packet_pending = false;
+			a->pending_irq_ns = 0;
+			spin_unlock_irqrestore(&a->pending_lock, flags);
+			hws_audio_report_xrun(a);
+			break;
+		}
 		if (!a->packet_pending) {
 			spin_unlock_irqrestore(&a->pending_lock, flags);
 			break;
@@ -463,7 +504,8 @@ static void hws_audio_deliver_work(struct work_struct *work)
 		if (hws_audio_packet_stale(a, irq_ns)) {
 			WRITE_ONCE(a->dropped_packets,
 				   READ_ONCE(a->dropped_packets) + 1);
-			continue;
+			hws_audio_report_xrun(a);
+			break;
 		}
 
 		hws_audio_deliver_one_packet(a, toggle);
@@ -492,9 +534,11 @@ void hws_audio_queue_interrupt(struct hws_pcie_dev *hws, unsigned int ch, u8 cur
 
 	WRITE_ONCE(a->last_period_toggle, cur_toggle);
 	spin_lock(&a->pending_lock);
-	if (a->packet_pending)
+	if (a->packet_pending) {
 		WRITE_ONCE(a->dropped_packets,
 			   READ_ONCE(a->dropped_packets) + 1);
+		a->xrun_pending = true;
+	}
 	a->pending_toggle = cur_toggle;
 	a->pending_irq_ns = ktime_get_mono_fast_ns();
 	a->packet_pending = true;
@@ -740,8 +784,13 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 static snd_pcm_uframes_t hws_pcie_audio_pointer(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
+	snd_pcm_uframes_t pos;
+	unsigned long flags;
 
-	return a->ring_wpos_byframes;
+	spin_lock_irqsave(&a->ring_lock, flags);
+	pos = a->ring_wpos_byframes;
+	spin_unlock_irqrestore(&a->ring_lock, flags);
+	return pos;
 }
 
 int hws_pcie_audio_open(struct snd_pcm_substream *substream)

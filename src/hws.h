@@ -163,6 +163,7 @@ struct hws_audio {
 	struct work_struct deliver_work;
 	spinlock_t pending_lock; /* protects packet_pending/toggle/irq timestamp */
 	bool packet_pending;
+	bool xrun_pending;
 	u8 pending_toggle;
 	u64 pending_irq_ns;
 	u8 last_period_toggle;
