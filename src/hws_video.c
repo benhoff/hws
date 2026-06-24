@@ -72,6 +72,14 @@ static size_t hws_video_bounce_size(void)
 	return ALIGN((size_t)MAX_VIDEO_SCALER_SIZE, 64);
 }
 
+static bool hws_video_uses_audio_window(struct hws_video *vid)
+{
+	if (!vid || !vid->parent || vid->channel_index < 0)
+		return false;
+
+	return vid->channel_index < vid->parent->cur_max_audio_ch;
+}
+
 static void hws_ack_video_pending(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	u32 vbit = HWS_INT_VDONE_BIT(ch);
@@ -88,16 +96,14 @@ static bool hws_video_dma_shares_channel_page(struct hws_video *vid,
 {
 	struct hws_pcie_dev *hws;
 	struct hws_scratch_dma *aud;
-	unsigned int ch;
 
 	if (!vid || !vid->parent)
 		return false;
 
-	hws = vid->parent;
-	ch = vid->channel_index;
-	if (ch >= hws->cur_max_audio_ch)
+	if (!hws_video_uses_audio_window(vid))
 		return true;
 
+	hws = vid->parent;
 	aud = &hws->scratch_aud[vid->channel_index];
 	if (!aud->cpu || !aud->size)
 		return true;
@@ -1298,6 +1304,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	struct hws_pcie_dev *hws = v->parent;
 	struct hwsvideo_buffer *to_program = NULL;	/* local copy */
 	unsigned long flags;
+	bool scratch_acquired = false;
 	int ret;
 
 	dev_dbg(&hws->pdev->dev, "start_streaming: ch=%u count=%u\n",
@@ -1332,33 +1339,36 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		return ret;
 	}
 
-	ret = hws_alloc_channel_scratch(hws, v->channel_index);
-	if (ret) {
-		struct hwsvideo_buffer *b, *tmp;
-		unsigned long f;
-		LIST_HEAD(queued);
+	if (hws_video_uses_audio_window(v)) {
+		ret = hws_alloc_channel_scratch(hws, v->channel_index);
+		if (ret) {
+			struct hwsvideo_buffer *b, *tmp;
+			unsigned long f;
+			LIST_HEAD(queued);
 
-		spin_lock_irqsave(&v->irq_lock, f);
-		if (v->active) {
-			list_add_tail(&v->active->list, &queued);
-			v->active = NULL;
-		}
-		if (v->next_prepared) {
-			list_add_tail(&v->next_prepared->list, &queued);
-			v->next_prepared = NULL;
-		}
-		while (!list_empty(&v->capture_queue)) {
-			b = list_first_entry(&v->capture_queue,
-					     struct hwsvideo_buffer, list);
-			list_move_tail(&b->list, &queued);
-		}
-		spin_unlock_irqrestore(&v->irq_lock, f);
+			spin_lock_irqsave(&v->irq_lock, f);
+			if (v->active) {
+				list_add_tail(&v->active->list, &queued);
+				v->active = NULL;
+			}
+			if (v->next_prepared) {
+				list_add_tail(&v->next_prepared->list, &queued);
+				v->next_prepared = NULL;
+			}
+			while (!list_empty(&v->capture_queue)) {
+				b = list_first_entry(&v->capture_queue,
+						     struct hwsvideo_buffer, list);
+				list_move_tail(&b->list, &queued);
+			}
+			spin_unlock_irqrestore(&v->irq_lock, f);
 
-		list_for_each_entry_safe(b, tmp, &queued, list) {
-			list_del_init(&b->list);
-			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
+			list_for_each_entry_safe(b, tmp, &queued, list) {
+				list_del_init(&b->list);
+				vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
+			}
+			return ret;
 		}
-		return ret;
+		scratch_acquired = true;
 	}
 
 	(void)hws_read_active_state(hws, v->channel_index,
@@ -1407,8 +1417,9 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 					vb2_buffer_done(&b->vb.vb2_buf,
 							VB2_BUF_STATE_QUEUED);
 				}
-				hws_release_channel_scratch(hws,
-							    v->channel_index);
+				if (scratch_acquired)
+					hws_release_channel_scratch(hws,
+								    v->channel_index);
 				return ret;
 			}
 			dev_dbg(&hws->pdev->dev,
@@ -1503,7 +1514,8 @@ static void hws_stop_streaming(struct vb2_queue *q)
 		"video:streamoff:done ch=%u completed=%u (%lluus)\n",
 		v->channel_index, done_cnt, hws_elapsed_us(start_ns));
 	hws_log_video_state(v, "streamoff", "end");
-	hws_release_channel_scratch(hws, v->channel_index);
+	if (hws_video_uses_audio_window(v))
+		hws_release_channel_scratch(hws, v->channel_index);
 }
 
 static const struct vb2_ops hwspcie_video_qops = {
