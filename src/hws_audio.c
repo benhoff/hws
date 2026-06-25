@@ -808,7 +808,6 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	int ret;
 
 	rt->hw = audio_pcm_hardware;
-	WRITE_ONCE(a->pcm_substream, substream);
 
 	ret = snd_pcm_hw_constraint_integer(rt, SNDRV_PCM_HW_PARAM_PERIODS);
 	if (ret < 0)
@@ -821,6 +820,8 @@ int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 					 HWS_AUDIO_PACKET_BYTES);
 	if (ret < 0)
 		return ret;
+
+	WRITE_ONCE(a->pcm_substream, substream);
 	return 0;
 }
 
