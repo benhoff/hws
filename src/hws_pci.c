@@ -189,6 +189,17 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 		sys_status, dec_mode);
 }
 
+static void hws_init_probe_state(struct hws_pcie_dev *hdev)
+{
+	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
+	hdev->max_channels = 4;
+	hdev->buf_allocated = false;
+	hdev->main_task = NULL;
+	hdev->audio_pkt_size = MAX_DMA_AUDIO_PK_SIZE;
+	hdev->start_run = false;
+	hdev->pci_lost = 0;
+}
+
 static int read_chip_id(struct hws_pcie_dev *hdev)
 {
 	u32 reg;
@@ -202,14 +213,6 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->sub_ver = FIELD_GET(DEVINFO_SUBVER, reg);
 	hdev->support_yv12 = FIELD_GET(DEVINFO_YV12, reg);
 	hdev->port_id = FIELD_GET(DEVINFO_PORTID, reg);
-
-	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
-	hdev->max_channels = 4;
-	hdev->buf_allocated = false;
-	hdev->main_task = NULL;
-	hdev->audio_pkt_size = MAX_DMA_AUDIO_PK_SIZE;
-	hdev->start_run = false;
-	hdev->pci_lost = 0;
 
 	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);
 	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE);
@@ -579,6 +582,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 #endif
 
 	/* 4) Identify chip & capabilities */
+	hws_init_probe_state(hws);
 	read_chip_id(hws);
 	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n",
 		 pdev->vendor, pdev->device);
