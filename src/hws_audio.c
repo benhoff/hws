@@ -16,18 +16,19 @@
 
 static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws,
 					 unsigned int ch);
+static void hws_audio_disable_capture_and_ack(struct hws_pcie_dev *hws,
+					      unsigned int ch);
 static void hws_audio_clear_pending(struct hws_audio *a);
 static void hws_audio_deliver_work(struct work_struct *work);
 static void hws_audio_drain_channel_work(struct hws_audio *a);
 
-static void hws_audio_reset_runtime_state(struct hws_audio *a)
+static void hws_audio_reset_ring_state(struct hws_audio *a)
 {
 	unsigned long flags;
 
 	if (!a)
 		return;
 
-	hws_audio_clear_pending(a);
 	spin_lock_irqsave(&a->ring_lock, flags);
 	a->ring_size_byframes = 0;
 	a->ring_wpos_byframes = 0;
@@ -35,11 +36,27 @@ static void hws_audio_reset_runtime_state(struct hws_audio *a)
 	a->period_used_byframes = 0;
 	a->frame_bytes = 0;
 	spin_unlock_irqrestore(&a->ring_lock, flags);
+}
+
+static void hws_audio_reset_counters(struct hws_audio *a)
+{
+	if (!a)
+		return;
 
 	WRITE_ONCE(a->last_period_toggle, 0xFF);
 	WRITE_ONCE(a->irq_count, 0);
 	WRITE_ONCE(a->delivered_count, 0);
 	WRITE_ONCE(a->dropped_packets, 0);
+}
+
+static void hws_audio_reset_runtime_state(struct hws_audio *a)
+{
+	if (!a)
+		return;
+
+	hws_audio_clear_pending(a);
+	hws_audio_reset_ring_state(a);
+	hws_audio_reset_counters(a);
 }
 
 static bool hws_audio_publish_stopped(struct hws_audio *a)
@@ -66,21 +83,18 @@ static bool hws_audio_publish_stopped(struct hws_audio *a)
 	return was_running;
 }
 
-static bool hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
+static void hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
 				      unsigned int ch, bool sync_irq)
 {
 	struct hws_audio *a;
-	bool was_running;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
-		return false;
+		return;
 
 	a = &hws->audio[ch];
-	was_running = hws_audio_publish_stopped(a);
+	hws_audio_publish_stopped(a);
 
-	hws_enable_audio_capture(hws, ch, false);
-	if (hws->bar0_base)
-		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	hws_audio_disable_capture_and_ack(hws, ch);
 
 	if (sync_irq && hws->irq >= 0 && !in_interrupt())
 		synchronize_irq(hws->irq);
@@ -88,9 +102,7 @@ static bool hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
 	if (!in_interrupt())
 		hws_audio_drain_channel_work(a);
 
-	hws_audio_ack_pending(hws, ch);
 	hws_audio_reset_runtime_state(a);
-	return was_running;
 }
 
 #define HWS_AUDIO_PACKET_BYTES      MAX_DMA_AUDIO_PK_SIZE
@@ -265,12 +277,7 @@ static void hws_audio_report_xrun(struct hws_audio *a)
 	ss = READ_ONCE(a->pcm_substream);
 
 	hws_audio_publish_stopped(a);
-	if (hws && ch < hws->cur_max_audio_ch) {
-		hws_enable_audio_capture(hws, ch, false);
-		if (hws->bar0_base)
-			readl(hws->bar0_base + HWS_REG_INT_STATUS);
-		hws_audio_ack_pending(hws, ch);
-	}
+	hws_audio_disable_capture_and_ack(hws, ch);
 	hws_audio_clear_pending(a);
 
 	if (!ss)
@@ -581,11 +588,7 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 	WRITE_ONCE(aud->stop_requested, false);
 	WRITE_ONCE(aud->scratch_acquired, false);
 
-	/* HW readback sentinel */
-	WRITE_ONCE(aud->last_period_toggle, 0xFF);
-	WRITE_ONCE(aud->irq_count, 0);
-	WRITE_ONCE(aud->delivered_count, 0);
-	WRITE_ONCE(aud->dropped_packets, 0);
+	hws_audio_reset_counters(aud);
 
 	return 0;
 }
@@ -647,7 +650,7 @@ static int hws_audio_hw_ready(struct hws_pcie_dev *hws)
 	return 0;
 }
 
-int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
+static int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	struct hws_audio *a;
 	int ret;
@@ -693,10 +696,7 @@ int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	WRITE_ONCE(a->stop_requested, false);
 	WRITE_ONCE(a->stream_running, true);
 	WRITE_ONCE(a->cap_active, true);
-	WRITE_ONCE(a->irq_count, 0);
-	WRITE_ONCE(a->delivered_count, 0);
-	WRITE_ONCE(a->dropped_packets, 0);
-	WRITE_ONCE(a->last_period_toggle, 0xFF);
+	hws_audio_reset_counters(a);
 	hws_audio_clear_pending(a);
 	/*
 	 * ADONE can fire as soon as capture is enabled. Publish the stream
@@ -726,6 +726,17 @@ static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws, unsigned int 
 	}
 }
 
+static void hws_audio_disable_capture_and_ack(struct hws_pcie_dev *hws,
+					      unsigned int ch)
+{
+	if (!hws || !hws->bar0_base || ch >= hws->cur_max_audio_ch)
+		return;
+
+	hws_enable_audio_capture(hws, ch, false);
+	readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	hws_audio_ack_pending(hws, ch);
+}
+
 static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 {
 	u32 mask = 0;
@@ -741,7 +752,7 @@ static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 	}
 }
 
-void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
+static void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	struct hws_audio *a;
 
@@ -753,10 +764,7 @@ void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 		return;
 
 	hws_audio_publish_stopped(a);
-	hws_enable_audio_capture(hws, ch, false);
-	if (hws->bar0_base)
-		readl(hws->bar0_base + HWS_REG_INT_STATUS);
-	hws_audio_ack_pending(hws, ch);
+	hws_audio_disable_capture_and_ack(hws, ch);
 	hws_audio_clear_pending(a);
 	dev_dbg(&hws->pdev->dev, "audio capture stopped on ch %u\n", ch);
 }
@@ -897,11 +905,7 @@ int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	a->frame_bytes = frame_bytes;
 	spin_unlock_irqrestore(&a->ring_lock, flags);
 
-	/* Optional: clear HW toggle readback */
-	WRITE_ONCE(a->last_period_toggle, 0xFF);
-	WRITE_ONCE(a->irq_count, 0);
-	WRITE_ONCE(a->delivered_count, 0);
-	WRITE_ONCE(a->dropped_packets, 0);
+	hws_audio_reset_counters(a);
 	hws_audio_clear_pending(a);
 	return 0;
 }
@@ -985,19 +989,6 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 			dev_err(&hws->pdev->dev, "snd_pcm_new(%d) failed: %d\n", i, ret);
 			goto error_card;
 		}
-
-		/* Tie this PCM to channel i */
-		hws->audio[i].parent        = hws;
-		hws->audio[i].channel_index = i;
-		WRITE_ONCE(hws->audio[i].pcm_substream, NULL);
-		WRITE_ONCE(hws->audio[i].cap_active, false);
-		WRITE_ONCE(hws->audio[i].stream_running, false);
-		WRITE_ONCE(hws->audio[i].stop_requested, false);
-		WRITE_ONCE(hws->audio[i].scratch_acquired, false);
-		WRITE_ONCE(hws->audio[i].last_period_toggle, 0xFF);
-		hws->audio[i].output_sample_rate = 48000;
-		hws->audio[i].channel_count      = 2;
-		hws->audio[i].bits_per_sample    = 16;
 
 		pcm->private_data = &hws->audio[i];
 		strscpy(pcm->name, pcm_name, sizeof(pcm->name));
@@ -1155,10 +1146,7 @@ void hws_audio_pm_resume(struct hws_pcie_dev *hws)
 		WRITE_ONCE(a->stream_running, false);
 		WRITE_ONCE(a->cap_active, false);
 		WRITE_ONCE(a->stop_requested, true);
-		WRITE_ONCE(a->last_period_toggle, 0xFF);
-		WRITE_ONCE(a->irq_count, 0);
-		WRITE_ONCE(a->delivered_count, 0);
-		WRITE_ONCE(a->dropped_packets, 0);
+		hws_audio_reset_counters(a);
 		hws_audio_clear_pending(a);
 	}
 	hws_audio_seed_channels(hws);
