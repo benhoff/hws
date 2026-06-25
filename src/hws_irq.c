@@ -44,6 +44,24 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	}
 
 	spin_lock_irqsave(&v->irq_lock, flags);
+	if (v->active) {
+		buf = v->active;
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		dev_dbg(&hws->pdev->dev,
+			"arm_next(ch=%u): active buffer already armed %p\n",
+			ch, buf);
+		return 0;
+	}
+	if (v->next_prepared) {
+		buf = v->next_prepared;
+		v->active = buf;
+		v->next_prepared = NULL;
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		dev_dbg(&hws->pdev->dev,
+			"arm_next(ch=%u): promoted prepared buffer %p\n",
+			ch, buf);
+		return 0;
+	}
 	if (list_empty(&v->capture_queue)) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): queue empty\n", ch);
@@ -69,7 +87,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 		dev_dbg(&hws->pdev->dev,
 			"arm_next(ch=%u): suspended after pick\n", ch);
 		spin_lock_irqsave(&v->irq_lock, f);
-		if (v->active) {
+		if (v->active == buf) {
 			list_add(&buf->list, &v->capture_queue);
 			v->queued_count++;
 			v->active = NULL;
@@ -109,6 +127,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
 	struct hwsvideo_buffer *done;
+	struct hwsvideo_buffer *promoted_active = NULL;
 	unsigned long flags;
 	bool promoted = false;
 	int ret;
@@ -132,6 +151,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (done && v->next_prepared) {
 		v->active = v->next_prepared;
 		v->next_prepared = NULL;
+		promoted_active = v->active;
 		promoted = true;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -139,23 +159,38 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	/* 1) Complete the buffer the HW just finished (if any) */
 	if (done) {
 		struct vb2_v4l2_buffer *vb2v = &done->vb;
+		enum vb2_buffer_state state = VB2_BUF_STATE_DONE;
 
 		ret = hws_video_prepare_done_buffer(v, done);
 		if (ret) {
 			dev_warn_ratelimited(&hws->pdev->dev,
 					     "bh_video(ch=%u): failed to prepare completed buffer ret=%d\n",
 					     ch, ret);
-			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
-			goto arm_next;
+			state = VB2_BUF_STATE_ERROR;
+		} else {
+			dev_dbg(&hws->pdev->dev,
+				"bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
+				ch, done, vb2v->sequence, v->half_seen,
+				v->last_buf_half_toggle);
 		}
-		dev_dbg(&hws->pdev->dev,
-			"bh_video(ch=%u): DONE buf=%p seq=%u half_seen=%d toggle=%u\n",
-			ch, done, vb2v->sequence, v->half_seen,
-			v->last_buf_half_toggle);
 
-		if (!promoted)
-			v->active = NULL;	/* channel no longer owns this buffer */
-		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
+		spin_lock_irqsave(&v->irq_lock, flags);
+		if (v->active == done) {
+			if (v->next_prepared) {
+				v->active = v->next_prepared;
+				v->next_prepared = NULL;
+				promoted_active = v->active;
+				promoted = true;
+			} else {
+				v->active = NULL;
+			}
+		} else if (v->active) {
+			promoted_active = v->active;
+			promoted = true;
+		}
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+
+		vb2_buffer_done(&vb2v->vb2_buf, state);
 	}
 
 	if (READ_ONCE(hws->suspended))
@@ -164,7 +199,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (promoted) {
 		dev_dbg(&hws->pdev->dev,
 			"bh_video(ch=%u): promoted pre-armed buffer active=%p\n",
-			ch, v->active);
+			ch, promoted_active);
 		spin_lock_irqsave(&v->irq_lock, flags);
 		ret = hws_prime_next_locked(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
