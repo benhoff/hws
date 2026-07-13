@@ -518,16 +518,58 @@ static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 	}
 }
 
+static void hws_free_irq_vectors(void *data)
+{
+	struct pci_dev *pdev = data;
+
+	pci_free_irq_vectors(pdev);
+}
+
+static int hws_alloc_irq(struct hws_pcie_dev *hws, unsigned long *irq_flags)
+{
+	struct pci_dev *pdev = hws->pdev;
+	int irq;
+	int ret;
+
+	/*
+	 * One vector is sufficient because HWS_REG_INT_STATUS demultiplexes all
+	 * video and audio causes. Let PCI core prefer MSI-X, then MSI, and fall
+	 * back to INTx when neither message-signaled mode is available.
+	 */
+	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
+	if (ret < 0)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to allocate PCI IRQ vector\n");
+
+	irq = pci_irq_vector(pdev, 0);
+	if (irq < 0) {
+		pci_free_irq_vectors(pdev);
+		return dev_err_probe(&pdev->dev, irq,
+				     "failed to resolve PCI IRQ vector 0\n");
+	}
+
+	/* Registered before the IRQ action so devres releases the action first. */
+	ret = devm_add_action_or_reset(&pdev->dev, hws_free_irq_vectors, pdev);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to register PCI IRQ vector cleanup\n");
+
+	hws->irq = irq;
+	*irq_flags = pci_dev_msi_enabled(pdev) ? 0 : IRQF_SHARED;
+
+	return 0;
+}
+
 static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 {
 	WRITE_ONCE(hws->suspended, true);
-	if (hws->irq >= 0)
-		disable_irq(hws->irq);
 
 	if (!hws->bar0_base)
 		return;
 
 	hws_irq_mask_gate(hws);
+	if (hws->irq >= 0)
+		synchronize_irq(hws->irq);
 	hws_irq_clear_pending(hws);
 }
 
@@ -620,12 +662,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	/* 6) Start-run sequence. Scratch DMA is allocated on stream start. */
 	hws_init_video_sys(hws, false);
 
-	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
-	pci_intx(pdev, 1);
-	irqf = IRQF_SHARED;
-	irq = pdev->irq;
-	hws->irq = irq;
-	dev_info(&pdev->dev, "IRQ mode: legacy INTx (shared), irq=%d\n", irq);
+	/* A) Prefer the card's single MSI vector; retain shared INTx fallback. */
+	ret = hws_alloc_irq(hws, &irqf);
+	if (ret)
+		goto err_unwind_channels;
+	irq = hws->irq;
 
 	/* B) Mask the device's global/bridge gate (INT_EN_REG_BASE) */
 	hws_irq_mask_gate(hws);
@@ -633,7 +674,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	/* C) Clear any sticky pending interrupt status (W1C) before we arm the line */
 	hws_irq_clear_pending(hws);
 
-	/* D) Request the legacy shared interrupt line (no vectors/MSI/MSI-X) */
+	/* D) Install the same demultiplexing handler for MSI or INTx. */
 	ret = devm_request_threaded_irq(&pdev->dev, irq, hws_irq_handler,
 					hws_irq_thread, irqf, dev_name(&pdev->dev),
 					hws);
@@ -687,7 +728,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		goto err_unregister_va; /* reset already stopped the thread */
 	}
 
-	/* 13) Final: show the line is armed */
+	/* 13) Final: show the vector is armed. */
 	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
 	return 0;
 
@@ -982,11 +1023,8 @@ static int hws_pm_resume(struct device *dev)
 	dev_dbg(dev, "lifecycle:pm_resume:chip-reinit (%lluus)\n",
 		hws_elapsed_us(step_ns));
 
-	/* IRQs can be re-enabled now that MMIO is sane */
+	/* MMIO is sane and the device interrupt gate is open again. */
 	step_ns = ktime_get_mono_fast_ns();
-	if (hws->irq >= 0)
-		enable_irq(hws->irq);
-
 	WRITE_ONCE(hws->suspended, false);
 	dev_dbg(dev, "lifecycle:pm_resume:irq-unsuspend (%lluus)\n",
 		hws_elapsed_us(step_ns));

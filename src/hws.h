@@ -227,8 +227,10 @@ struct hws_pcie_dev {
 
 	bool suspended;
 	int irq;
-	spinlock_t irq_thread_lock; /* protects threaded video IRQ counters */
+	spinlock_t irq_thread_lock; /* protects threaded IRQ state below */
 	unsigned int irq_pending_vdone[MAX_VID_CHANNELS];
+	u32 irq_fault_status;
+	bool irq_faulted;
 
 	/* Error flags */
 	int pci_lost;

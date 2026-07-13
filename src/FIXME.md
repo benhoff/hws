@@ -114,28 +114,32 @@ out-of-tree module".
   2. Probe, initial stream-on, and live mode changes should program identical
      values for the same format.
 
-## [low] Interrupt mode is fixed to legacy INTx
+## [resolved] Prefer MSI with legacy INTx fallback
 
 - Where:
-  `src/hws_pci.c:454`, `src/hws_pci.c:459`, `src/hws_pci.c:467`
+  `hws_alloc_irq()` in `src/hws_pci.c` and `hws_irq_handler()` in
+  `src/hws_irq.c`
 - What:
-  Probe forces legacy shared INTx and never attempts MSI or MSI-X.
+  Probe previously forced legacy shared INTx and never attempted MSI.
 - Why it matters:
   This is not always a hard blocker, but upstream reviewers often ask why a
   PCIe device does not use MSI when the hardware supports it.
 - Current status:
-  Still present in current `master`.
+  The driver requests one vector through the PCI core, which prefers MSI-X,
+  then MSI, and falls back to shared INTx. See `doc/msi-interrupts.md`.
 - Baseline branch status:
   Introduced later. `baseline` attempted to enable MSI in
   `probe_scan_for_msi()` (`baseline:src/hws_video.c:5385`) and used the result
   in `irq_setup()` (`baseline:src/hws_video.c:5428`). The old code still needs
   review, but it was not hard-wired to INTx only.
-- Fix direction:
-  Validate what the hardware supports. If MSI/MSI-X works, prefer it and keep
-  INTx as fallback. If the hardware only supports INTx, document that clearly.
-- How to test the current gap:
-  1. Check the PCI capabilities for MSI/MSI-X support.
-  2. If supported, add an MSI path and test interrupt delivery under load.
+- Hardware validation:
+  The AVMatrix VC42 (`8888:8504`) advertises one 64-bit MSI vector and no MSI-X
+  capability. The host PCIe path permits MSI.
+- How to test:
+  1. Load normally and confirm `MSI: Enable+`, one `msi_irqs` entry, and stable
+     interrupt delivery under load.
+  2. Disable MSI using the applicable PCI/platform test mechanism and repeat
+     the same workload against the INTx fallback path.
 - How to verify the fix:
   1. The preferred interrupt mode should probe cleanly.
   2. Buffer completion and suspend/resume behavior should remain correct in

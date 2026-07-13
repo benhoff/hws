@@ -10,6 +10,7 @@ void hws_audio_unregister(struct hws_pcie_dev *hws);
 void hws_audio_seed_channels(struct hws_pcie_dev *hws);
 void hws_audio_queue_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
 			       u8 cur_toggle);
+void hws_audio_handle_irq_fault(struct hws_pcie_dev *hws);
 void hws_audio_drain_work(struct hws_pcie_dev *hws);
 void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 			      unsigned int ch,

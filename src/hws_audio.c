@@ -292,6 +292,25 @@ static void hws_audio_report_xrun(struct hws_audio *a)
 	snd_pcm_stream_unlock_irqrestore(ss, flags);
 }
 
+void hws_audio_handle_irq_fault(struct hws_pcie_dev *hws)
+{
+	unsigned int ch;
+
+	if (!hws)
+		return;
+
+	for (ch = 0; ch < hws->cur_max_audio_ch &&
+	     ch < MAX_VID_CHANNELS; ch++) {
+		struct hws_audio *a = &hws->audio[ch];
+
+		if (!READ_ONCE(a->stream_running) &&
+		    !READ_ONCE(a->cap_active))
+			continue;
+
+		hws_audio_report_xrun(a);
+	}
+}
+
 static void hws_audio_drain_channel_work(struct hws_audio *a)
 {
 	if (!a)
@@ -635,6 +654,11 @@ static int hws_audio_hw_ready(struct hws_pcie_dev *hws)
 
 	if (!hws || !hws->bar0_base)
 		return -ENODEV;
+	if (READ_ONCE(hws->irq_faulted)) {
+		dev_err_ratelimited(&hws->pdev->dev,
+				    "audio start refused after an IRQ-fabric fault; reload the driver\n");
+		return -EIO;
+	}
 
 	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 	if (status == 0xFFFFFFFF) {
@@ -660,6 +684,8 @@ static int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
+	if (READ_ONCE(hws->irq_faulted))
+		return -EIO;
 	a = &hws->audio[ch];
 
 	/* Already running? Re-assert HW if needed. */
@@ -792,6 +818,8 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 	u32 reg, mask = BIT(ch);
 
 	if (!hws || ch >= hws->cur_max_audio_ch || hws->pci_lost)
+		return;
+	if (enable && READ_ONCE(hws->irq_faulted))
 		return;
 
 	reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);

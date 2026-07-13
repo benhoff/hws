@@ -676,6 +676,8 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 
 	if (!hws || hws->pci_lost || chan >= hws->max_channels)
 		return;
+	if (on && READ_ONCE(hws->irq_faulted))
+		return;
 
 	status = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	status = on ? (status | BIT(chan)) : (status & ~BIT(chan));
@@ -767,8 +769,9 @@ static void hws_open_irq_fabric(struct hws_pcie_dev *hws)
 	writel(0x00000001, hws->bar0_base + PCIEBR_EN_REG_BASE);
 	(void)readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
 
-	/* Open the global/bridge gate (legacy 0x3FFFF) */
-	writel(HWS_INT_EN_MASK, hws->bar0_base + INT_EN_REG_BASE);
+	/* A persistent IRQ fault is recoverable only through driver reload. */
+	writel(READ_ONCE(hws->irq_faulted) ? 0 : HWS_INT_EN_MASK,
+	       hws->bar0_base + INT_EN_REG_BASE);
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
@@ -809,6 +812,11 @@ int hws_check_card_status(struct hws_pcie_dev *hws)
 
 	if (!hws || !hws->bar0_base)
 		return -ENODEV;
+	if (READ_ONCE(hws->irq_faulted)) {
+		dev_err_ratelimited(&hws->pdev->dev,
+				    "capture start refused after an IRQ-fabric fault; reload the driver\n");
+		return -EIO;
+	}
 
 	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 

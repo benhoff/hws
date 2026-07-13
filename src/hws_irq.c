@@ -31,9 +31,12 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
 		!list_empty(&v->capture_queue));
 
-	if (READ_ONCE(hws->suspended)) {
-		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): suspended\n", ch);
-		return -EBUSY;
+	if (READ_ONCE(hws->suspended) || READ_ONCE(hws->irq_faulted)) {
+		dev_dbg(&hws->pdev->dev,
+			"arm_next(ch=%u): unavailable (suspended=%d irq_faulted=%d)\n",
+			ch, READ_ONCE(hws->suspended),
+			READ_ONCE(hws->irq_faulted));
+		return READ_ONCE(hws->irq_faulted) ? -EIO : -EBUSY;
 	}
 
 	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)) {
@@ -81,11 +84,11 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 	wmb();
 
 	/* Avoid MMIO during suspend */
-	if (READ_ONCE(hws->suspended)) {
+	if (READ_ONCE(hws->suspended) || READ_ONCE(hws->irq_faulted)) {
 		unsigned long f;
 
 		dev_dbg(&hws->pdev->dev,
-			"arm_next(ch=%u): suspended after pick\n", ch);
+			"arm_next(ch=%u): unavailable after pick\n", ch);
 		spin_lock_irqsave(&v->irq_lock, f);
 		if (v->active == buf) {
 			list_add(&buf->list, &v->capture_queue);
@@ -93,7 +96,7 @@ static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
 			v->active = NULL;
 		}
 		spin_unlock_irqrestore(&v->irq_lock, f);
-		return -EBUSY;
+		return READ_ONCE(hws->irq_faulted) ? -EIO : -EBUSY;
 	}
 
 	/* Program the baseline DMA window; use arena bounce if needed. */
@@ -255,6 +258,71 @@ static void hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch)
 	spin_unlock_irqrestore(&pdx->irq_thread_lock, flags);
 }
 
+static void hws_irq_record_fault(struct hws_pcie_dev *pdx, u32 status)
+{
+	unsigned long flags;
+
+	WRITE_ONCE(pdx->irq_faulted, true);
+	spin_lock_irqsave(&pdx->irq_thread_lock, flags);
+	pdx->irq_fault_status |= status;
+	memset(pdx->irq_pending_vdone, 0,
+	       sizeof(pdx->irq_pending_vdone));
+	spin_unlock_irqrestore(&pdx->irq_thread_lock, flags);
+}
+
+static u32 hws_irq_take_fault(struct hws_pcie_dev *pdx)
+{
+	unsigned long flags;
+	u32 status;
+
+	spin_lock_irqsave(&pdx->irq_thread_lock, flags);
+	status = pdx->irq_fault_status;
+	pdx->irq_fault_status = 0;
+	spin_unlock_irqrestore(&pdx->irq_thread_lock, flags);
+
+	return status;
+}
+
+static void hws_irq_contain_fault(struct hws_pcie_dev *pdx)
+{
+	/* Mask at the device; disable_irq() is invalid for a shared INTx line. */
+	writel(0, pdx->bar0_base + INT_EN_REG_BASE);
+
+	/* Do not leave DMA running after completion delivery has been disabled. */
+	writel(0, pdx->bar0_base + HWS_REG_VCAP_ENABLE);
+	writel(0, pdx->bar0_base + HWS_REG_ACAP_ENABLE);
+	(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+}
+
+static void hws_irq_fail_video_streams(struct hws_pcie_dev *pdx)
+{
+	unsigned int ch;
+
+	for (ch = 0; ch < pdx->cur_max_video_ch &&
+	     ch < MAX_VID_CHANNELS; ch++) {
+		struct hws_video *v = &pdx->video[ch];
+
+		if (!READ_ONCE(v->cap_active) &&
+		    !vb2_is_streaming(&v->buffer_queue))
+			continue;
+
+		WRITE_ONCE(v->stop_requested, true);
+		smp_wmb(); /* publish stop before MMIO disable and queue error */
+		hws_enable_video_capture(pdx, ch, false);
+		vb2_queue_error(&v->buffer_queue);
+	}
+}
+
+static void hws_irq_handle_fault(struct hws_pcie_dev *pdx, u32 status)
+{
+	hws_irq_fail_video_streams(pdx);
+	hws_audio_handle_irq_fault(pdx);
+
+	dev_err(&pdx->pdev->dev,
+		"IRQ-fabric fault status=0x%08x: DMA stopped; V4L2 queues report EIO and ALSA streams report XRUN; reload the driver\n",
+		status);
+}
+
 static bool hws_irq_take_vdone(struct hws_pcie_dev *pdx, unsigned int *ch)
 {
 	unsigned long flags;
@@ -348,12 +416,16 @@ static void hws_irq_handle_audio(struct hws_pcie_dev *pdx, u32 int_state)
 irqreturn_t hws_irq_handler(int irq, void *info)
 {
 	struct hws_pcie_dev *pdx = info;
-	u32 int_state;
-	bool wake_thread;
+	bool handled = false;
+	bool wake_thread = false;
+	unsigned int loops;
+	u32 serviced = 0;
 
 	(void)irq;
 
 	if (!pdx || !pdx->bar0_base)
+		return IRQ_NONE;
+	if (READ_ONCE(pdx->irq_faulted))
 		return IRQ_NONE;
 
 	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
@@ -364,28 +436,77 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			readl(pdx->bar0_base + HWS_REG_INT_STATUS));
 	}
 
-	/* Fast path: if suspended, quietly ack and exit */
-	if (READ_ONCE(pdx->suspended)) {
+	/*
+	 * Drain all currently latched causes before returning. With legacy INTx,
+	 * an uncleared source keeps the level-triggered line asserted and naturally
+	 * invokes us again. MSI is message-based and has no asserted line to rely
+	 * on, so returning with a cause still latched risks waiting indefinitely
+	 * for a later event. The vendor baseline used the same bounded-drain model.
+	 *
+	 * Dispatch each cause at most once per hard-handler entry. A bit latch
+	 * cannot distinguish a genuinely new same-source event from a failed W1C,
+	 * so dispatching it twice could manufacture a completion. Different source
+	 * bits which arrive while draining are still handled normally.
+	 */
+	for (loops = 0; loops < MAX_INT_LOOPS; loops++) {
+		u32 int_state, fresh;
+
 		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
-		if (int_state)
+		if (!int_state || int_state == 0xFFFFFFFF) {
+			if (!handled)
+				dev_dbg(&pdx->pdev->dev,
+					"irq: spurious or device-gone int_state=0x%08x\n",
+					int_state);
+			break;
+		}
+
+		handled = true;
+		fresh = int_state & ~serviced;
+		if (!fresh) {
+			u32 retry;
+
+			/* Retry W1C once, but never dispatch these causes again. */
 			hws_irq_ack_status(pdx, int_state);
-		return int_state ? IRQ_HANDLED : IRQ_NONE;
+			retry = readl_relaxed(pdx->bar0_base +
+					      HWS_REG_INT_STATUS);
+			if (!retry || retry == 0xFFFFFFFF) {
+				dev_warn_ratelimited(&pdx->pdev->dev,
+					"IRQ status 0x%08x needed a second W1C; duplicate completion suppressed\n",
+					int_state);
+				break;
+			}
+
+			if (retry & serviced) {
+				u32 stuck = retry & serviced;
+
+				hws_irq_record_fault(pdx, stuck);
+				hws_irq_contain_fault(pdx);
+				wake_thread = true;
+				break;
+			}
+
+			/* Only previously unseen sources remain; process them. */
+			continue;
+		}
+
+		/* During suspend teardown, acknowledge without scheduling work. */
+		if (!READ_ONCE(pdx->suspended)) {
+			wake_thread |= hws_irq_queue_video(pdx, fresh);
+			hws_irq_handle_audio(pdx, fresh);
+		}
+		serviced |= fresh;
+		hws_irq_ack_status(pdx, int_state);
 	}
 
-	int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
-	if (!int_state || int_state == 0xFFFFFFFF) {
-		dev_dbg(&pdx->pdev->dev,
-			"irq: spurious or device-gone int_state=0x%08x\n",
-			int_state);
-		return IRQ_NONE;
-	}
-	dev_dbg(&pdx->pdev->dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
+	if (loops == MAX_INT_LOOPS)
+		dev_warn_ratelimited(&pdx->pdev->dev,
+				     "IRQ status did not drain after %u passes\n",
+				     MAX_INT_LOOPS);
 
-	wake_thread = hws_irq_queue_video(pdx, int_state);
-	hws_irq_handle_audio(pdx, int_state);
-	hws_irq_ack_status(pdx, int_state);
+	if (wake_thread)
+		return IRQ_WAKE_THREAD;
 
-	return wake_thread ? IRQ_WAKE_THREAD : IRQ_HANDLED;
+	return handled ? IRQ_HANDLED : IRQ_NONE;
 }
 
 irqreturn_t hws_irq_thread(int irq, void *info)
@@ -394,15 +515,27 @@ irqreturn_t hws_irq_thread(int irq, void *info)
 	unsigned int ch;
 	unsigned int count = 0;
 	bool handled = false;
+	u32 fault;
 
 	(void)irq;
 
 	if (!pdx || !pdx->bar0_base)
 		return IRQ_NONE;
 
-	while (hws_irq_take_vdone(pdx, &ch)) {
+	for (;;) {
+		fault = hws_irq_take_fault(pdx);
+		if (fault) {
+			handled = true;
+			hws_irq_handle_fault(pdx, fault);
+			continue;
+		}
+
+		if (!hws_irq_take_vdone(pdx, &ch))
+			break;
+
 		handled = true;
-		if (READ_ONCE(pdx->suspended))
+		if (READ_ONCE(pdx->suspended) ||
+		    READ_ONCE(pdx->irq_faulted))
 			continue;
 
 		hws_video_handle_vdone(&pdx->video[ch]);
