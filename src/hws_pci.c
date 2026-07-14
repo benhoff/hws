@@ -39,13 +39,6 @@ static unsigned long long hws_elapsed_us(u64 start_ns)
 	return div_u64(ktime_get_mono_fast_ns() - start_ns, 1000);
 }
 
-/* register layout inside HWS_REG_DEVICE_INFO */
-#define DEVINFO_VER GENMASK(7, 0)
-#define DEVINFO_SUBVER GENMASK(15, 8)
-#define DEVINFO_YV12 GENMASK(31, 28)
-#define DEVINFO_HWKEY GENMASK(27, 24)
-#define DEVINFO_PORTID GENMASK(25, 24) /* low 2 bits of HW-key */
-
 #define MAKE_ENTRY(__vend, __chip, __subven, __subdev, __configptr) \
 	{ .vendor = (__vend),                                       \
 	  .device = (__chip),                                       \
@@ -209,10 +202,10 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 
 	reg = readl(hdev->bar0_base + HWS_REG_DEVICE_INFO);
 
-	hdev->device_ver = FIELD_GET(DEVINFO_VER, reg);
-	hdev->sub_ver = FIELD_GET(DEVINFO_SUBVER, reg);
-	hdev->support_yv12 = FIELD_GET(DEVINFO_YV12, reg);
-	hdev->port_id = FIELD_GET(DEVINFO_PORTID, reg);
+	hdev->device_ver = FIELD_GET(HWS_DEVINFO_VER, reg);
+	hdev->sub_ver = FIELD_GET(HWS_DEVINFO_SUBVER, reg);
+	hdev->support_yv12 = FIELD_GET(HWS_DEVINFO_YV12, reg);
+	hdev->port_id = FIELD_GET(HWS_DEVINFO_PORTID, reg);
 
 	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);
 	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE);
