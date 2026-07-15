@@ -16,6 +16,7 @@
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws_v4l2_ioctl.h"
+#include "hws_mmio.h"
 
 struct hws_dv_mode {
 	struct v4l2_dv_timings timings;
@@ -244,8 +245,8 @@ static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,
 
 	if (!hws || !hws->bar0_base || ch >= hws->max_channels)
 		return;
-	writel_relaxed(packed, hws->bar0_base + HWS_REG_BCHS(ch));
-	(void)readl(hws->bar0_base + HWS_REG_BCHS(ch)); /* post write */
+	hws_writel_relaxed(hws, packed, HWS_REG_BCHS(ch));
+	(void)hws_readl(hws, HWS_REG_BCHS(ch)); /* post write */
 }
 
 /* Helper: find a supported DV mode by W/H + interlace flag */
@@ -333,7 +334,7 @@ static bool hws_get_live_dv_geometry(struct hws_video *vid,
 	if (!pdx || !pdx->bar0_base)
 		return false;
 
-	reg = readl(pdx->bar0_base + HWS_REG_IN_RES(vid->channel_index));
+	reg = hws_readl(pdx, HWS_REG_IN_RES(vid->channel_index));
 	if (!reg || reg == 0xFFFFFFFF)
 		return false;
 
@@ -342,7 +343,7 @@ static bool hws_get_live_dv_geometry(struct hws_video *vid,
 	if (h)
 		*h = (reg >> 16) & 0xFFFF;
 	if (interlaced) {
-		reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+		reg = hws_readl(pdx, HWS_REG_ACTIVE_STATUS);
 		*interlaced = !!(reg & BIT(8 + vid->channel_index));
 	}
 	return true;
@@ -360,7 +361,7 @@ static u32 hws_get_live_fps(struct hws_video *vid)
 	if (!pdx || !pdx->bar0_base)
 		return 0;
 
-	fps = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(vid->channel_index));
+	fps = hws_readl(pdx, HWS_REG_FRAME_RATE(vid->channel_index));
 	if (!fps || fps == 0xFFFFFFFF || fps > 240)
 		return 0;
 
@@ -404,7 +405,7 @@ static u32 hws_input_status(struct hws_video *vid)
 	if (!pdx || !pdx->bar0_base)
 		return V4L2_IN_ST_NO_SIGNAL;
 
-	reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+	reg = hws_readl(pdx, HWS_REG_ACTIVE_STATUS);
 	if (reg == 0xffffffff)
 		return V4L2_IN_ST_NO_SIGNAL;
 

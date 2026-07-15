@@ -20,9 +20,11 @@
 
 #include "hws.h"
 #include "hws_audio.h"
+#include "hws_debugfs.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws_irq.h"
+#include "hws_mmio.h"
 #include "hws_v4l2_ioctl.h"
 
 #define DRV_NAME "hws"
@@ -138,9 +140,9 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 			hdev->hw_ver = 1;
 			u32 dma_max = (u32)(MAX_VIDEO_SCALER_SIZE / 16);
 
-			writel(dma_max, hdev->bar0_base + HWS_REG_DMA_MAX_SIZE);
+			hws_writel(hdev, dma_max, HWS_REG_DMA_MAX_SIZE);
 			/* readback to flush posted MMIO write */
-			(void)readl(hdev->bar0_base + HWS_REG_DMA_MAX_SIZE);
+			(void)hws_readl(hdev, HWS_REG_DMA_MAX_SIZE);
 		}
 	} else {
 		hdev->hw_ver = 0;
@@ -169,11 +171,11 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 		return;
 	}
 
-	int_en = readl(hws->bar0_base + INT_EN_REG_BASE);
-	int_status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-	vcap = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	sys_status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
-	dec_mode = readl(hws->bar0_base + HWS_REG_DEC_MODE);
+	int_en = hws_readl(hws, INT_EN_REG_BASE);
+	int_status = hws_readl(hws, HWS_REG_INT_STATUS);
+	vcap = hws_readl(hws, HWS_REG_VCAP_ENABLE);
+	sys_status = hws_readl(hws, HWS_REG_SYS_STATUS);
+	dec_mode = hws_readl(hws, HWS_REG_DEC_MODE);
 
 	dev_dbg(dev,
 		"lifecycle:%s:%s suspended=%d start_run=%d pci_lost=%d irq=%d INT_EN=0x%08x INT_STATUS=0x%08x VCAP=0x%08x SYS=0x%08x DEC=0x%08x\n",
@@ -200,15 +202,15 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->device_id = hdev->pdev->device;
 	hdev->vendor_id = hdev->pdev->vendor;
 
-	reg = readl(hdev->bar0_base + HWS_REG_DEVICE_INFO);
+	reg = hws_readl(hdev, HWS_REG_DEVICE_INFO);
 
 	hdev->device_ver = FIELD_GET(HWS_DEVINFO_VER, reg);
 	hdev->sub_ver = FIELD_GET(HWS_DEVINFO_SUBVER, reg);
 	hdev->support_yv12 = FIELD_GET(HWS_DEVINFO_YV12, reg);
 	hdev->port_id = FIELD_GET(HWS_DEVINFO_PORTID, reg);
 
-	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);
-	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE);
+	hws_writel(hdev, 0x00, HWS_REG_DEC_MODE);
+	hws_writel(hdev, 0x10, HWS_REG_DEC_MODE);
 
 	hws_configure_hardware_capabilities(hdev);
 
@@ -455,15 +457,13 @@ static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
 	lo &= PCI_E_BAR_ADD_MASK;
 
 	/* Program 64-bit BAR remap entry for this channel. */
-	writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE +
-		       HWS_VIDEO_REMAP_SLOT_OFF(ch));
-	writel_relaxed(lo, hws->bar0_base + PCI_ADDR_TABLE_BASE +
-		       HWS_VIDEO_REMAP_SLOT_OFF(ch) + PCIE_BARADDROFSIZE);
+	hws_writel_relaxed(hws, hi, PCI_ADDR_TABLE_BASE +
+			   HWS_VIDEO_REMAP_SLOT_OFF(ch));
+	hws_writel_relaxed(hws, lo, HWS_VIDEO_REMAP_LOW_SLOT_OFF(ch));
 
 	/* Program capture engine per-channel base/half */
-	writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-		       hws->bar0_base + CVBS_IN_BUF_BASE +
-		       ch * PCIE_BARADDROFSIZE);
+	hws_writel_relaxed(hws, (ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
+			   HWS_REG_VID_DMA_ADDR(ch));
 
 	/* Half size: use either the current format or the video arena. */
 	{
@@ -471,12 +471,11 @@ static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
 			hws->video[ch].pix.half_size :
 			(u32)(MAX_VIDEO_SCALER_SIZE / 2);
 
-		writel_relaxed(half / 16,
-			       hws->bar0_base + CVBS_IN_BUF_BASE2 +
-			       ch * PCIE_BARADDROFSIZE);
+		hws_writel_relaxed(hws, half / 16,
+				   HWS_REG_VIDEO_HALF_SIZE(ch));
 	}
 
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush posted writes */
+	(void)hws_readl(hws, HWS_REG_INT_STATUS); /* flush posted writes */
 }
 
 static void hws_seed_all_channels(struct hws_pcie_dev *hws)
@@ -491,23 +490,23 @@ static void hws_seed_all_channels(struct hws_pcie_dev *hws)
 
 static void hws_irq_mask_gate(struct hws_pcie_dev *hws)
 {
-	writel(0x00000000, hws->bar0_base + INT_EN_REG_BASE);
-	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
+	hws_writel(hws, 0x00000000, INT_EN_REG_BASE);
+	(void)hws_readl(hws, INT_EN_REG_BASE);
 }
 
 static void hws_irq_unmask_gate(struct hws_pcie_dev *hws)
 {
-	writel(HWS_INT_EN_MASK, hws->bar0_base + INT_EN_REG_BASE);
-	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
+	hws_writel(hws, HWS_INT_EN_MASK, INT_EN_REG_BASE);
+	(void)hws_readl(hws, INT_EN_REG_BASE);
 }
 
 static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 {
-	u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	u32 st = hws_readl(hws, HWS_REG_INT_STATUS);
 
 	if (st) {
-		writel(st, hws->bar0_base + HWS_REG_INT_STATUS); /* W1C */
-		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_writel(hws, st, HWS_REG_INT_STATUS); /* W1C */
+		(void)hws_readl(hws, HWS_REG_INT_STATUS);
 	}
 }
 
@@ -555,7 +554,9 @@ static int hws_alloc_irq(struct hws_pcie_dev *hws, unsigned long *irq_flags)
 
 static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 {
+	mutex_lock(&hws->mmio_snapshot_lock);
 	WRITE_ONCE(hws->suspended, true);
+	mutex_unlock(&hws->mmio_snapshot_lock);
 
 	if (!hws->bar0_base)
 		return;
@@ -583,6 +584,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws->irq = -1;
 	hws->suspended = false;
 	mutex_init(&hws->scratch_lock);
+	mutex_init(&hws->mmio_snapshot_lock);
 	spin_lock_init(&hws->irq_thread_lock);
 	pci_set_drvdata(pdev, hws);
 
@@ -679,18 +681,18 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	/* E) Set the global interrupt enable bit in main control register */
 	{
-		u32 ctl_reg = readl(hws->bar0_base + HWS_REG_CTL);
+		u32 ctl_reg = hws_readl(hws, HWS_REG_CTL);
 
 		ctl_reg |= HWS_CTL_IRQ_ENABLE_BIT;
-		writel(ctl_reg, hws->bar0_base + HWS_REG_CTL);
-		(void)readl(hws->bar0_base + HWS_REG_CTL); /* flush write */
+		hws_writel(hws, ctl_reg, HWS_REG_CTL);
+		(void)hws_readl(hws, HWS_REG_CTL); /* flush write */
 		dev_info(&pdev->dev, "Global IRQ enable bit set in control register\n");
 	}
 
 	/* F) Open the global gate just like legacy did */
 	hws_irq_unmask_gate(hws);
 	dev_info(&pdev->dev, "INT_EN_GATE readback=0x%08x\n",
-		 readl(hws->bar0_base + INT_EN_REG_BASE));
+		 hws_readl(hws, INT_EN_REG_BASE));
 
 	/* 11) Register V4L2/ALSA */
 	ret = hws_video_register(hws);
@@ -722,6 +724,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	}
 
 	/* 13) Final: show the vector is armed. */
+	hws_debugfs_add_device(hws);
 	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
 	return 0;
 
@@ -747,14 +750,15 @@ err_unwind_channels:
 
 static int hws_check_busy(struct hws_pcie_dev *pdx)
 {
-	void __iomem *reg = pdx->bar0_base + HWS_REG_SYS_STATUS;
 	u32 val;
 	int ret;
 
 	/* poll until !(val & BUSY_BIT), sleeping HWS_BUSY_POLL_DELAY_US between reads */
-	ret = readl_poll_timeout(reg, val, !(val & HWS_SYS_DMA_BUSY_BIT),
-				 HWS_BUSY_POLL_DELAY_US,
-				 HWS_BUSY_POLL_TIMEOUT_US);
+	ret = read_poll_timeout(hws_readl, val,
+				!(val & HWS_SYS_DMA_BUSY_BIT),
+				HWS_BUSY_POLL_DELAY_US,
+				HWS_BUSY_POLL_TIMEOUT_US, false, pdx,
+				HWS_REG_SYS_STATUS);
 	if (ret) {
 		dev_err(&pdx->pdev->dev,
 			"SYS_STATUS busy bit never cleared (0x%08x)\n", val);
@@ -769,7 +773,7 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 	u32 status;
 
 	/* Read the decoder mode/status register */
-	status = readl(hws->bar0_base + HWS_REG_DEC_MODE);
+	status = hws_readl(hws, HWS_REG_DEC_MODE);
 	dev_dbg(&hws->pdev->dev, "%s: status=0x%08x\n", __func__, status);
 
 	/* If the device looks unplugged/stuck, bail out */
@@ -777,12 +781,12 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 		return;
 
 	/* Tell the DSP to stop */
-	writel(0x10, hws->bar0_base + HWS_REG_DEC_MODE);
+	hws_writel(hws, 0x10, HWS_REG_DEC_MODE);
 
 	if (hws_check_busy(hws))
 		dev_warn(&hws->pdev->dev, "DSP busy timeout on stop\n");
 	/* Disable video capture engine in the DSP */
-	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	hws_writel(hws, 0x0, HWS_REG_VCAP_ENABLE);
 }
 
 /* Publish stop so ISR/BH will not touch ALSA/VB2 anymore. */
@@ -816,9 +820,9 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 	u64 start_ns = ktime_get_mono_fast_ns();
 
 	/* Mask device enables: no new DMA starts. */
-	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	writel(0x0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush */
+	hws_writel(hws, 0x0, HWS_REG_VCAP_ENABLE);
+	hws_writel(hws, 0x0, HWS_REG_ACAP_ENABLE);
+	(void)hws_readl(hws, HWS_REG_INT_STATUS); /* flush */
 
 	/* Let any in-flight DMAs finish (best-effort). */
 	(void)hws_check_busy(hws);
@@ -829,8 +833,8 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 	for (i = 0; i < hws->cur_max_audio_ch; ++i)
 		ackmask |= HWS_INT_ADONE_BIT(i);
 	if (ackmask) {
-		writel(ackmask, hws->bar0_base + HWS_REG_INT_STATUS);
-		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_writel(hws, ackmask, HWS_REG_INT_STATUS);
+		(void)hws_readl(hws, HWS_REG_INT_STATUS);
 	}
 
 	/* Ensure no hard IRQ is still running. */
@@ -844,7 +848,7 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 
 static void hws_stop_device(struct hws_pcie_dev *hws)
 {
-	u32 status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
+	u32 status = hws_readl(hws, HWS_REG_SYS_STATUS);
 	u64 start_ns = ktime_get_mono_fast_ns();
 	bool live = status != 0xFFFFFFFF;
 
@@ -924,6 +928,7 @@ static void hws_remove(struct pci_dev *pdev)
 	if (!hws)
 		return;
 
+	hws_debugfs_remove_device(hws);
 	start_ns = ktime_get_mono_fast_ns();
 	dev_info(&pdev->dev, "lifecycle:remove begin\n");
 	hws_log_lifecycle_snapshot(hws, "remove", "begin");
@@ -1018,7 +1023,9 @@ static int hws_pm_resume(struct device *dev)
 
 	/* MMIO is sane and the device interrupt gate is open again. */
 	step_ns = ktime_get_mono_fast_ns();
+	mutex_lock(&hws->mmio_snapshot_lock);
 	WRITE_ONCE(hws->suspended, false);
+	mutex_unlock(&hws->mmio_snapshot_lock);
 	dev_dbg(dev, "lifecycle:pm_resume:irq-unsuspend (%lluus)\n",
 		hws_elapsed_us(step_ns));
 
@@ -1076,12 +1083,21 @@ MODULE_DEVICE_TABLE(pci, hws_pci_table);
 
 static int __init pcie_hws_init(void)
 {
-	return pci_register_driver(&hws_pci_driver);
+	int ret;
+
+	ret = hws_debugfs_init();
+	if (ret)
+		return ret;
+	ret = pci_register_driver(&hws_pci_driver);
+	if (ret)
+		hws_debugfs_exit();
+	return ret;
 }
 
 static void __exit pcie_hws_exit(void)
 {
 	pci_unregister_driver(&hws_pci_driver);
+	hws_debugfs_exit();
 }
 
 module_init(pcie_hws_init);

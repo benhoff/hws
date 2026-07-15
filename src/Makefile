@@ -5,7 +5,11 @@ HwsCapture-objs := \
 	 hws_irq.o \
 	 hws_video.o \
 	 hws_v4l2_ioctl.o \
-	 hws_audio.o
+	 hws_audio.o \
+	 hws_reg_atlas.o \
+	 hws_debugfs.o \
+	 hws_mmio.o \
+	 hws_trace.o
 
 src := $(CURDIR)
 
@@ -48,7 +52,13 @@ TIDY_DEFINES  := -D__KERNEL__ -D__KERNEL_STRICT_NAMES
 
 C_SOURCES     := $(wildcard *.c)
 
-.PHONY: tidy
+.PHONY: tidy atlas atlas-check
+atlas:
+	python3 ../python/gen_hws_register_atlas.py
+
+atlas-check:
+	python3 ../python/gen_hws_register_atlas.py --check
+
 tidy:
 ifdef HAVE_CLANG_TIDY
 	@echo ">> Running clang-tidy on: $(C_SOURCES)"

@@ -26,10 +26,11 @@
 #include "hws_video.h"
 #include "hws_audio.h"
 #include "hws_irq.h"
+#include "hws_mmio.h"
 #include "hws_v4l2_ioctl.h"
 
-#define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
-#define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
+#define HWS_BUF_BASE_OFF(ch)     HWS_REG_VID_DMA_ADDR(ch)
+#define HWS_HALF_SZ_OFF(ch)      HWS_REG_VIDEO_HALF_SIZE(ch)
 
 static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch,
 				   bool interlace);
@@ -87,8 +88,8 @@ static void hws_ack_video_pending(struct hws_pcie_dev *hws, unsigned int ch)
 	if (!hws || !hws->bar0_base)
 		return;
 
-	writel(vbit, hws->bar0_base + HWS_REG_INT_STATUS);
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	hws_writel(hws, vbit, HWS_REG_INT_STATUS);
+	(void)hws_readl(hws, HWS_REG_INT_STATUS);
 }
 
 static bool hws_video_dma_shares_channel_page(struct hws_video *vid,
@@ -178,10 +179,8 @@ static int hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 	/* Remap entry only when DMA crosses into a new 512 MB page */
 	if (!vid->window_valid || vid->last_dma_hi != hi ||
 	    vid->last_dma_page != page_lo) {
-		writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-		writel(page_lo,
-		       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-		       PCIE_BARADDROFSIZE);
+		hws_writel(hws, hi, PCI_ADDR_TABLE_BASE + table_off);
+		hws_writel(hws, page_lo, HWS_VIDEO_REMAP_LOW_SLOT_OFF(ch));
 		vid->last_dma_hi = hi;
 		vid->last_dma_page = page_lo;
 		wrote = true;
@@ -189,16 +188,15 @@ static int hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 
 	/* Base pointer only needs low 29 bits */
 	if (!vid->window_valid || vid->last_pci_addr != pci_addr) {
-		writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-		       hws->bar0_base + HWS_BUF_BASE_OFF(ch));
+		hws_writel(hws, (ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
+			   HWS_BUF_BASE_OFF(ch));
 		vid->last_pci_addr = pci_addr;
 		wrote = true;
 	}
 
 	/* Half-size only changes when resolution changes */
 	if (!vid->window_valid || vid->last_half16 != vid->pix.half_size / 16) {
-		writel(vid->pix.half_size / 16,
-		       hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+		hws_writel(hws, vid->pix.half_size / 16, HWS_HALF_SZ_OFF(ch));
 		vid->last_half16 = vid->pix.half_size / 16;
 		wrote = true;
 	}
@@ -206,13 +204,10 @@ static int hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 	vid->window_valid = true;
 
 	if (dma_window_verify && wrote) {
-		u32 r_hi =
-		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-		u32 r_lo =
-		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-			  PCIE_BARADDROFSIZE);
-		u32 r_base = readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
-		u32 r_half = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+		u32 r_hi = hws_readl(hws, PCI_ADDR_TABLE_BASE + table_off);
+		u32 r_lo = hws_readl(hws, HWS_VIDEO_REMAP_LOW_SLOT_OFF(ch));
+		u32 r_base = hws_readl(hws, HWS_BUF_BASE_OFF(ch));
+		u32 r_half = hws_readl(hws, HWS_HALF_SZ_OFF(ch));
 
 		dev_dbg(&hws->pdev->dev,
 			"ch%u remap verify: hi=0x%08x page_lo=0x%08x exp_page=0x%08x base=0x%08x exp_base=0x%08x half16B=0x%08x exp_half=0x%08x\n",
@@ -221,7 +216,7 @@ static int hws_program_dma_window(struct hws_video *vid, dma_addr_t dma)
 			vid->pix.half_size / 16);
 	} else if (wrote) {
 		/* Flush posted writes before arming DMA */
-		readl_relaxed(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
+		hws_readl_relaxed(hws, HWS_HALF_SZ_OFF(ch));
 	}
 
 	return 0;
@@ -679,10 +674,10 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	if (on && READ_ONCE(hws->irq_faulted))
 		return;
 
-	status = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	status = hws_readl(hws, HWS_REG_VCAP_ENABLE);
 	status = on ? (status | BIT(chan)) : (status & ~BIT(chan));
-	writel(status, hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	hws_writel(hws, status, HWS_REG_VCAP_ENABLE);
+	(void)hws_readl(hws, HWS_REG_VCAP_ENABLE);
 
 	WRITE_ONCE(hws->video[chan].cap_active, on);
 
@@ -715,18 +710,16 @@ static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
 			u32 pci_addr_low = lower_32_bits(p) & addr_low_mask;
 			u32 table = HWS_VIDEO_REMAP_SLOT_OFF(ch);
 
-			writel_relaxed(hi,
-				       hws->bar0_base + PCI_ADDR_TABLE_BASE +
-				       table);
-			writel_relaxed(lo,
-				       hws->bar0_base + PCI_ADDR_TABLE_BASE +
-				       table + PCIE_BARADDROFSIZE);
+			hws_writel_relaxed(hws, hi,
+					   PCI_ADDR_TABLE_BASE + table);
+			hws_writel_relaxed(hws, lo,
+					   HWS_VIDEO_REMAP_LOW_SLOT_OFF(ch));
 
 			/* Per-channel AXI base + PCI low */
-			writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE +
-				       pci_addr_low,
-				       hws->bar0_base + CVBS_IN_BUF_BASE +
-				       ch * PCIE_BARADDROFSIZE);
+			hws_writel_relaxed(hws,
+					   (ch + 1) * PCIEBAR_AXI_BASE +
+					   pci_addr_low,
+					   HWS_REG_VID_DMA_ADDR(ch));
 
 			/*
 			 * Half-frame length in /16 units. Prefer the current
@@ -738,41 +731,40 @@ static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
 					hws->video[ch].pix.half_size :
 					(u32)(MAX_VIDEO_SCALER_SIZE / 2);
 
-				writel_relaxed(half_bytes / 16,
-					       hws->bar0_base + CVBS_IN_BUF_BASE2 +
-					       ch * PCIE_BARADDROFSIZE);
+				hws_writel_relaxed(hws, half_bytes / 16,
+						   HWS_REG_VIDEO_HALF_SIZE(ch));
 			}
 		}
 	}
 
 	/* Post writes so device sees them before we move on */
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	(void)hws_readl(hws, HWS_REG_INT_STATUS);
 }
 
 static void hws_ack_all_irqs(struct hws_pcie_dev *hws)
 {
-	u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	u32 st = hws_readl(hws, HWS_REG_INT_STATUS);
 
 	if (st) {
-		writel(st, hws->bar0_base + HWS_REG_INT_STATUS);	/* W1C */
-		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_writel(hws, st, HWS_REG_INT_STATUS); /* W1C */
+		(void)hws_readl(hws, HWS_REG_INT_STATUS);
 	}
 }
 
 static void hws_open_irq_fabric(struct hws_pcie_dev *hws)
 {
 	/* Route all sources to vector 0. */
-	writel(0x00000000, hws->bar0_base + PCIE_INT_DEC_REG_BASE);
-	(void)readl(hws->bar0_base + PCIE_INT_DEC_REG_BASE);
+	hws_writel(hws, 0x00000000, PCIE_INT_DEC_REG_BASE);
+	(void)hws_readl(hws, PCIE_INT_DEC_REG_BASE);
 
 	/* Enable the PCIe bridge. */
-	writel(0x00000001, hws->bar0_base + PCIEBR_EN_REG_BASE);
-	(void)readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
+	hws_writel(hws, 0x00000001, PCIEBR_EN_REG_BASE);
+	(void)hws_readl(hws, PCIEBR_EN_REG_BASE);
 
 	/* A persistent IRQ fault is recoverable only through driver reload. */
-	writel(READ_ONCE(hws->irq_faulted) ? 0 : HWS_INT_EN_MASK,
-	       hws->bar0_base + INT_EN_REG_BASE);
-	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
+	hws_writel(hws, READ_ONCE(hws->irq_faulted) ? 0 : HWS_INT_EN_MASK,
+		   INT_EN_REG_BASE);
+	(void)hws_readl(hws, INT_EN_REG_BASE);
 }
 
 void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
@@ -783,7 +775,7 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 		return;
 
 	/* 1) reset the decoder mode register to 0 */
-	writel(0x00000000, hws->bar0_base + HWS_REG_DEC_MODE);
+	hws_writel(hws, 0x00000000, HWS_REG_DEC_MODE);
 	hws_seed_dma_windows(hws);
 	hws_audio_seed_channels(hws);
 
@@ -797,9 +789,9 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 	}
 
 	/* 4) Start run: set bit31, wait a bit, then program low 24 bits. */
-	writel(0x80000000, hws->bar0_base + HWS_REG_DEC_MODE);
-	writel(0x80FFFFFF, hws->bar0_base + HWS_REG_DEC_MODE);
-	writel(0x13, hws->bar0_base + HWS_REG_DEC_MODE);
+	hws_writel(hws, 0x80000000, HWS_REG_DEC_MODE);
+	hws_writel(hws, 0x80FFFFFF, HWS_REG_DEC_MODE);
+	hws_writel(hws, 0x13, HWS_REG_DEC_MODE);
 	hws_ack_all_irqs(hws);
 	hws_open_irq_fabric(hws);
 	/* 6) record that we're now running */
@@ -818,7 +810,7 @@ int hws_check_card_status(struct hws_pcie_dev *hws)
 		return -EIO;
 	}
 
-	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
+	status = hws_readl(hws, HWS_REG_SYS_STATUS);
 
 	/* Common device-missing pattern. */
 	if (status == 0xFFFFFFFF) {
@@ -868,15 +860,12 @@ void check_video_format(struct hws_pcie_dev *pdx)
 static inline void hws_write_if_diff(struct hws_pcie_dev *hws, u32 reg_off,
 				     u32 new_val)
 {
-	void __iomem *addr;
 	u32 old;
 
 	if (!hws || !hws->bar0_base)
 		return;
 
-	addr = hws->bar0_base + reg_off;
-
-	old = readl(addr);
+	old = hws_readl(hws, reg_off);
 	/* Treat all-ones as device gone; avoid writing garbage. */
 	if (old == 0xFFFFFFFF) {
 		hws->pci_lost = true;
@@ -884,9 +873,9 @@ static inline void hws_write_if_diff(struct hws_pcie_dev *hws, u32 reg_off,
 	}
 
 	if (old != new_val) {
-		writel(new_val, addr);
+		hws_writel(hws, new_val, reg_off);
 		/* Post the write on some bridges / enforce ordering. */
-		(void)readl(addr);
+		(void)hws_readl(hws, reg_off);
 	}
 }
 
@@ -899,7 +888,7 @@ static bool hws_read_active_state(struct hws_pcie_dev *pdx, unsigned int ch,
 	if (ch >= pdx->cur_max_video_ch)
 		return false;
 
-	reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+	reg = hws_readl(pdx, HWS_REG_ACTIVE_STATUS);
 	active = !!(reg & BIT(ch));
 	if (interlace)
 		*interlace = !!(reg & BIT(8 + ch));
@@ -920,7 +909,7 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 	vid = &hws->video[ch];
 
 	/* 1) Input frame rate (read-only; log or export via debugfs if wanted) */
-	in_fps = readl(hws->bar0_base + HWS_REG_FRAME_RATE(ch));
+	in_fps = hws_readl(hws, HWS_REG_FRAME_RATE(ch));
 	/* dev_dbg(&hws->pdev->dev, "ch%u input fps=%u\n", ch, in_fps); */
 	(void)in_fps;
 
@@ -928,7 +917,7 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 	 * For now, mirror the current format to OUT_RES.
 	 */
 	want_out_res = (vid->pix.height << 16) | vid->pix.width;
-	cur_out_res = readl(hws->bar0_base + HWS_REG_OUT_RES(ch));
+	cur_out_res = hws_readl(hws, HWS_REG_OUT_RES(ch));
 	if (cur_out_res != want_out_res)
 		hws_write_if_diff(hws, HWS_REG_OUT_RES(ch), want_out_res);
 
@@ -940,7 +929,7 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 	 */
 
 	/* 4) BCHS controls: pack from per-channel current_* fields */
-	reg = readl(hws->bar0_base + HWS_REG_BCHS(ch));
+	reg = hws_readl(hws, HWS_REG_BCHS(ch));
 	{
 		u8 br = reg & 0xFF;
 		u8 co = (reg >> 8) & 0xFF;
@@ -959,7 +948,7 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 	}
 
 	/* 5) HDCP detect: read only (no cache field in your structs today) */
-	reg = readl(hws->bar0_base + HWS_REG_HDCP_STATUS);
+	reg = hws_readl(hws, HWS_REG_HDCP_STATUS);
 	/* bool hdcp = !!(reg & BIT(ch)); // use if you later add a field/control */
 }
 
@@ -1051,7 +1040,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	smp_wmb();
 
 	hws_enable_video_capture(pdx, ch, false);
-	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+	hws_readl(pdx, HWS_REG_INT_STATUS);
 
 	if (v->parent && v->parent->irq >= 0)
 		synchronize_irq(v->parent->irq);
@@ -1091,10 +1080,9 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 	hws_write_if_diff(pdx, HWS_REG_OUT_RES(ch), (h << 16) | w);
 
 	/* Legacy half-buffer programming */
-	writel(v->pix.half_size / 16,
-	       pdx->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-	(void)readl(pdx->bar0_base + CVBS_IN_BUF_BASE2 +
-		    ch * PCIE_BARADDROFSIZE);
+	hws_writel(pdx, v->pix.half_size / 16,
+		   HWS_REG_VIDEO_HALF_SIZE(ch));
+	(void)hws_readl(pdx, HWS_REG_VIDEO_HALF_SIZE(ch));
 
 	/* Reset per-channel toggles/counters */
 	WRITE_ONCE(v->last_buf_half_toggle, 0);
@@ -1111,8 +1099,8 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch,
 				   bool interlace)
 {
-	u32 reg = readl(pdx->bar0_base + HWS_REG_IN_RES(ch));
-	u32 fps = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(ch));
+	u32 reg = hws_readl(pdx, HWS_REG_IN_RES(ch));
+	u32 fps = hws_readl(pdx, HWS_REG_FRAME_RATE(ch));
 	u16 res_w = reg & 0xFFFF;
 	u16 res_h = (reg >> 16) & 0xFFFF;
 	struct hws_video *vid = &pdx->video[ch];
@@ -1459,7 +1447,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 				"start_streaming: ch=%u programmed buffer %p slot=%d\n",
 				v->channel_index, to_program, to_program->slot);
 			hws_ack_video_pending(hws, v->channel_index);
-			(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
+			(void)hws_readl(hws, HWS_REG_INT_STATUS);
 		}
 
 		wmb(); /* ensure descriptors visible before enabling capture */

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "hws_audio.h"
+#include "hws_mmio.h"
 
 #include "hws.h"
 #include "hws_reg.h"
@@ -189,18 +190,16 @@ static int hws_guard_audio_video_remap_page(struct hws_pcie_dev *hws,
 }
 
 static void hws_audio_program_remap_slot(struct hws_pcie_dev *hws,
-					 u32 table_off, u32 hi, u32 page_lo)
+					 unsigned int ch, u32 hi, u32 page_lo)
 {
-	writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-	writel_relaxed(page_lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-		       PCIE_BARADDROFSIZE);
+	hws_writel_relaxed(hws, hi, HWS_AUDIO_REMAP_SLOT_OFF(ch));
+	hws_writel_relaxed(hws, page_lo, HWS_AUDIO_REMAP_LOW_SLOT_OFF(ch));
 }
 
 static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	dma_addr_t dma;
 	u32 lo, hi, pci_addr;
-	u32 audio_table_off;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
@@ -212,11 +211,10 @@ static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws, unsigned int 
 	hi = upper_32_bits(dma);
 	pci_addr = lo & PCI_E_BAR_ADD_LOWMASK;
 	lo &= PCI_E_BAR_ADD_MASK;
-	audio_table_off = HWS_AUDIO_REMAP_SLOT_OFF(ch);
-	hws_audio_program_remap_slot(hws, audio_table_off, hi, lo);
-	writel_relaxed((ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
-		       hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
-	(void)readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
+	hws_audio_program_remap_slot(hws, ch, hi, lo);
+	hws_writel_relaxed(hws, (ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
+			   HWS_REG_AUD_DMA_ADDR(ch));
+	(void)hws_readl(hws, HWS_REG_AUD_DMA_ADDR(ch));
 	return 0;
 }
 
@@ -643,7 +641,7 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 
 static inline bool hws_check_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	u32 reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	u32 reg = hws_readl(hws, HWS_REG_ACAP_ENABLE);
 
 	return !!(reg & BIT(ch));
 }
@@ -660,7 +658,7 @@ static int hws_audio_hw_ready(struct hws_pcie_dev *hws)
 		return -EIO;
 	}
 
-	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
+	status = hws_readl(hws, HWS_REG_SYS_STATUS);
 	if (status == 0xFFFFFFFF) {
 		hws->pci_lost = true;
 		dev_err(&hws->pdev->dev, "PCIe device not responding\n");
@@ -752,12 +750,12 @@ static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws, unsigned int 
 	if (!hws || !hws->bar0_base || ch >= hws->cur_max_audio_ch)
 		return;
 
-	st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	st = hws_readl(hws, HWS_REG_INT_STATUS);
 
 	if (st & abit) {
-		writel(abit, hws->bar0_base + HWS_REG_INT_ACK);
+		hws_writel(hws, abit, HWS_REG_INT_ACK);
 		/* flush posted write */
-		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_readl(hws, HWS_REG_INT_STATUS);
 	}
 }
 
@@ -776,7 +774,7 @@ static void hws_audio_disable_capture_and_ack(struct hws_pcie_dev *hws,
 		return;
 
 	hws_enable_audio_capture(hws, ch, false);
-	readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	hws_readl(hws, HWS_REG_INT_STATUS);
 	hws_audio_ack_pending(hws, ch);
 }
 
@@ -790,8 +788,8 @@ static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
 	for (unsigned int ch = 0; ch < hws->cur_max_audio_ch; ch++)
 		mask |= HWS_INT_ADONE_BIT(ch);
 	if (mask) {
-		writel(mask, hws->bar0_base + HWS_REG_INT_ACK);
-		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_writel(hws, mask, HWS_REG_INT_ACK);
+		hws_readl(hws, HWS_REG_INT_STATUS);
 	}
 }
 
@@ -822,13 +820,13 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 	if (enable && READ_ONCE(hws->irq_faulted))
 		return;
 
-	reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	reg = hws_readl(hws, HWS_REG_ACAP_ENABLE);
 	if (enable)
 		reg |= mask;
 	else
 		reg &= ~mask;
 
-	writel(reg, hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	hws_writel(hws, reg, HWS_REG_ACAP_ENABLE);
 
 	dev_dbg(&hws->pdev->dev, "audio capture %s ch%u, reg=0x%08x\n",
 		enable ? "enabled" : "disabled", ch, reg);
@@ -1095,7 +1093,7 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 
 	/* Flush ACAP disables before waiting for any running IRQ handler. */
 	if (hws->bar0_base)
-		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		hws_readl(hws, HWS_REG_INT_STATUS);
 	if (hws->irq >= 0 && !in_interrupt())
 		synchronize_irq(hws->irq);
 

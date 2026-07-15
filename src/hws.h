@@ -52,6 +52,7 @@ struct hws_pix_state {
 struct hws_pcie_dev;
 struct hws_adapter;
 struct hws_video;
+struct dentry;
 
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
@@ -192,6 +193,7 @@ struct hws_pcie_dev {
 
 	/* BAR and workqueues */
 	void __iomem *bar0_base;
+	struct dentry *debugfs_dir;
 	struct workqueue_struct *audio_wq;
 
 	/* Device identity and capabilities */
@@ -221,6 +223,7 @@ struct hws_pcie_dev {
 	/* Kernel thread */
 	struct task_struct *main_task;
 	struct mutex scratch_lock; /* protects scratch DMA arenas and user refs */
+	struct mutex mmio_snapshot_lock; /* serializes debugfs reads with suspend */
 	unsigned int scratch_users[MAX_VID_CHANNELS];
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
 	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];

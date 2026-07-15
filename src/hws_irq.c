@@ -8,6 +8,7 @@
 #include <linux/string.h>
 
 #include "hws_irq.h"
+#include "hws_mmio.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws.h"
@@ -242,8 +243,8 @@ static void hws_irq_ack_status(struct hws_pcie_dev *pdx, u32 int_state)
 	if (!int_state || !pdx || !pdx->bar0_base)
 		return;
 
-	writel(int_state, pdx->bar0_base + HWS_REG_INT_STATUS);
-	(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+	hws_writel(pdx, int_state, HWS_REG_INT_STATUS);
+	(void)hws_readl(pdx, HWS_REG_INT_STATUS);
 }
 
 static void hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch)
@@ -286,12 +287,12 @@ static u32 hws_irq_take_fault(struct hws_pcie_dev *pdx)
 static void hws_irq_contain_fault(struct hws_pcie_dev *pdx)
 {
 	/* Mask at the device; disable_irq() is invalid for a shared INTx line. */
-	writel(0, pdx->bar0_base + INT_EN_REG_BASE);
+	hws_writel(pdx, 0, INT_EN_REG_BASE);
 
 	/* Do not leave DMA running after completion delivery has been disabled. */
-	writel(0, pdx->bar0_base + HWS_REG_VCAP_ENABLE);
-	writel(0, pdx->bar0_base + HWS_REG_ACAP_ENABLE);
-	(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+	hws_writel(pdx, 0, HWS_REG_VCAP_ENABLE);
+	hws_writel(pdx, 0, HWS_REG_ACAP_ENABLE);
+	(void)hws_readl(pdx, HWS_REG_INT_STATUS);
 }
 
 static void hws_irq_fail_video_streams(struct hws_pcie_dev *pdx)
@@ -359,8 +360,8 @@ static bool hws_irq_queue_video(struct hws_pcie_dev *pdx, u32 int_state)
 		    !READ_ONCE(pdx->video[ch].stop_requested)) {
 			if (hws_toggle_debug) {
 				u32 toggle =
-				    readl_relaxed(pdx->bar0_base +
-						  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+				    hws_readl_relaxed(pdx,
+						      HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
 
 				WRITE_ONCE(pdx->video[ch].last_buf_half_toggle,
 					   toggle);
@@ -407,8 +408,8 @@ static void hws_irq_handle_audio(struct hws_pcie_dev *pdx, u32 int_state)
 		 * hard handler so the deferred audio work receives the edge's
 		 * toggle value, not a later one.
 		 */
-		cur_toggle = readl_relaxed(pdx->bar0_base +
-					   HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+		cur_toggle = hws_readl_relaxed(pdx,
+					       HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 		hws_audio_queue_interrupt(pdx, ch, cur_toggle);
 	}
 }
@@ -432,8 +433,8 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	if (pdx->bar0_base) {
 		dev_dbg(&pdx->pdev->dev,
 			"irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
-			readl(pdx->bar0_base + INT_EN_REG_BASE),
-			readl(pdx->bar0_base + HWS_REG_INT_STATUS));
+			hws_readl(pdx, INT_EN_REG_BASE),
+			hws_readl(pdx, HWS_REG_INT_STATUS));
 	}
 
 	/*
@@ -451,7 +452,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	for (loops = 0; loops < MAX_INT_LOOPS; loops++) {
 		u32 int_state, fresh;
 
-		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
+		int_state = hws_readl_relaxed(pdx, HWS_REG_INT_STATUS);
 		if (!int_state || int_state == 0xFFFFFFFF) {
 			if (!handled)
 				dev_dbg(&pdx->pdev->dev,
@@ -467,8 +468,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 			/* Retry W1C once, but never dispatch these causes again. */
 			hws_irq_ack_status(pdx, int_state);
-			retry = readl_relaxed(pdx->bar0_base +
-					      HWS_REG_INT_STATUS);
+			retry = hws_readl_relaxed(pdx, HWS_REG_INT_STATUS);
 			if (!retry || retry == 0xFFFFFFFF) {
 				dev_warn_ratelimited(&pdx->pdev->dev,
 					"IRQ status 0x%08x needed a second W1C; duplicate completion suppressed\n",

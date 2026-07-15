@@ -1,0 +1,391 @@
+{
+  "schema_version": 1,
+  "device": "HWS/AVMatrix PCIe capture family",
+  "bar": 0,
+  "address_space_bytes": 65536,
+  "safety": {
+    "default_read": "deny",
+    "default_write": "deny",
+    "notes": "Only registers with snapshot_safe=true may be read by automated snapshot tooling. Unknown writes are never permitted."
+  },
+  "access_semantics": {
+    "ro": "read-only",
+    "rw": "read/write",
+    "w1c": "read status; write one to clear",
+    "wo": "write-only",
+    "r-status-w-control": "read and write have different documented meanings"
+  },
+  "confidence_levels": [
+    "measured",
+    "vendor-code",
+    "inferred",
+    "unknown"
+  ],
+  "registers": [
+    {
+      "id": "DMA_REMAP_HIGH",
+      "name": "DMA remap high word",
+      "offset": "0x0208",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 8 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_video.c and origin/baseline SetDMAAddress", "confidence": "vendor-code" },
+      "fields": []
+    },
+    {
+      "id": "DMA_REMAP_LOW",
+      "name": "DMA remap page-select word",
+      "offset": "0x020c",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 8 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_video.c and origin/baseline SetDMAAddress", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "page", "lsb": 29, "msb": 31 }
+      ]
+    },
+    {
+      "id": "INT_ENABLE",
+      "name": "PCI interrupt enable gate",
+      "offset": "0x0134",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000000", "0x0003ffff"],
+      "evidence": { "source": "src/hws_reg.h INT_EN_REG_BASE and baseline initialization", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "enabled_sources", "lsb": 0, "msb": 17 }
+      ]
+    },
+    {
+      "id": "INT_DECODE",
+      "name": "PCI interrupt decode control",
+      "offset": "0x0138",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000000"],
+      "evidence": { "source": "src/hws_reg.h PCIE_INT_DEC_REG_BASE and baseline initialization", "confidence": "vendor-code" },
+      "fields": []
+    },
+    {
+      "id": "PCIE_BRIDGE_ENABLE",
+      "name": "PCIe bridge enable",
+      "offset": "0x0148",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000001"],
+      "evidence": { "source": "src/hws_reg.h PCIEBR_EN_REG_BASE and baseline initialization", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "enable", "lsb": 0, "msb": 0 }
+      ]
+    },
+    {
+      "id": "SYSTEM_STATUS_DECODER_CONTROL",
+      "name": "System status / decoder control",
+      "offset": "0x4000",
+      "width_bits": 32,
+      "access": "r-status-w-control",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h HWS_REG_SYS_STATUS/HWS_REG_DEC_MODE and baseline driver", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "irq_pending", "lsb": 2, "msb": 2, "context": "read" },
+        { "name": "dma_busy", "lsb": 3, "msb": 3, "context": "read" },
+        { "name": "start_run", "lsb": 31, "msb": 31, "context": "write" }
+      ]
+    },
+    {
+      "id": "INT_STATUS",
+      "name": "Capture interrupt status/acknowledge",
+      "offset": "0x4004",
+      "width_bits": 32,
+      "access": "w1c",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000000"],
+      "evidence": { "source": "src/hws_reg.h and origin/baseline interrupt acknowledgement", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "video_done", "lsb": 0, "msb": 3 },
+        { "name": "audio_done", "lsb": 8, "msb": 11 }
+      ]
+    },
+    {
+      "id": "VIDEO_CAPTURE_ENABLE",
+      "name": "Video capture enable",
+      "offset": "0x4008",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000000"],
+      "evidence": { "source": "src/hws_reg.h and baseline capture control", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "channel_enable", "lsb": 0, "msb": 3 }
+      ]
+    },
+    {
+      "id": "AUDIO_CAPTURE_ENABLE",
+      "name": "Audio capture enable",
+      "offset": "0x400c",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000000"],
+      "evidence": { "source": "src/hws_reg.h and baseline capture control", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "channel_enable", "lsb": 0, "msb": 3 }
+      ]
+    },
+    {
+      "id": "CONTROL",
+      "name": "Main interrupt control",
+      "offset": "0x4010",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h HWS_REG_CTL", "confidence": "inferred" },
+      "fields": [
+        { "name": "global_irq_enable", "lsb": 0, "msb": 0 }
+      ]
+    },
+    {
+      "id": "ACTIVE_STATUS",
+      "name": "Input signal and interlace status",
+      "offset": "0x4014",
+      "width_bits": 32,
+      "access": "ro",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h and baseline signal detection", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "signal_present", "lsb": 0, "msb": 3 },
+        { "name": "interlaced", "lsb": 8, "msb": 11 }
+      ]
+    },
+    {
+      "id": "HDCP_STATUS",
+      "name": "HDCP detection status",
+      "offset": "0x4020",
+      "width_bits": 32,
+      "access": "ro",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h and baseline signal handling", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "channel_detected", "lsb": 0, "msb": 3 }
+      ]
+    },
+    {
+      "id": "DMA_MAX_SIZE",
+      "name": "Maximum video DMA size in 16-byte units",
+      "offset": "0x4024",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_pci.c hardware capability setup", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "size_div_16", "lsb": 0, "msb": 31 }
+      ]
+    },
+    {
+      "id": "VIDEO_DMA_BASE",
+      "name": "Video device-side DMA base",
+      "offset": "0x4040",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h and origin/baseline SetDMAAddress", "confidence": "vendor-code" },
+      "fields": []
+    },
+    {
+      "id": "AUDIO_DMA_BASE",
+      "name": "Audio device-side DMA base",
+      "offset": "0x4060",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h and origin/baseline audio DMA setup", "confidence": "vendor-code" },
+      "fields": []
+    },
+    {
+      "id": "VIDEO_BUFFER_TOGGLE",
+      "name": "Video DMA half-buffer toggle",
+      "offset": "0x4080",
+      "width_bits": 32,
+      "access": "ro",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000000", "0x00000001"],
+      "evidence": { "source": "origin/baseline interrupt path", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "active_half", "lsb": 0, "msb": 0 }
+      ]
+    },
+    {
+      "id": "AUDIO_BUFFER_TOGGLE",
+      "name": "Audio DMA half-buffer toggle",
+      "offset": "0x40a0",
+      "width_bits": 32,
+      "access": "ro",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x00000000", "0x00000001"],
+      "evidence": { "source": "origin/baseline audio interrupt path", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "active_half", "lsb": 0, "msb": 0 }
+      ]
+    },
+    {
+      "id": "VIDEO_HALF_SIZE",
+      "name": "Video DMA half size in 16-byte units",
+      "offset": "0x40c8",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_video.c and origin/baseline SetDMAAddress", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "size_div_16", "lsb": 0, "msb": 31 }
+      ]
+    },
+    {
+      "id": "DEVICE_INFO",
+      "name": "Device version and capabilities",
+      "offset": "0x4160",
+      "width_bits": 32,
+      "access": "ro",
+      "channel": null,
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h and baseline ReadChipId", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "device_version", "lsb": 8, "msb": 15 },
+        { "name": "sub_version", "lsb": 16, "msb": 23 },
+        { "name": "hardware_key", "lsb": 24, "msb": 27 },
+        { "name": "port_id", "lsb": 24, "msb": 25 },
+        { "name": "yv12_support", "lsb": 28, "msb": 31 }
+      ]
+    },
+    {
+      "id": "INPUT_RESOLUTION",
+      "name": "Detected input resolution",
+      "offset": "0x4168",
+      "width_bits": 32,
+      "access": "ro",
+      "channel": { "count": 4, "stride_bytes": 8 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_video.c and baseline format detection", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "width", "lsb": 0, "msb": 15 },
+        { "name": "height", "lsb": 16, "msb": 31 }
+      ]
+    },
+    {
+      "id": "BCHS",
+      "name": "Brightness, contrast, hue, saturation",
+      "offset": "0x416c",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 8 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": ["0x80008080"],
+      "evidence": { "source": "src/hws_video.c control packing and baseline controls", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "brightness", "lsb": 0, "msb": 7 },
+        { "name": "contrast", "lsb": 8, "msb": 15 },
+        { "name": "hue", "lsb": 16, "msb": 23 },
+        { "name": "saturation", "lsb": 24, "msb": 31 }
+      ]
+    },
+    {
+      "id": "INPUT_FRAME_RATE",
+      "name": "Detected input frame rate",
+      "offset": "0x41b8",
+      "width_bits": 32,
+      "access": "ro",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_reg.h and baseline format detection", "confidence": "vendor-code" },
+      "fields": [
+        { "name": "frames_per_second", "lsb": 0, "msb": 31 }
+      ]
+    },
+    {
+      "id": "OUTPUT_RESOLUTION",
+      "name": "Programmed output resolution",
+      "offset": "0x41e0",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_video.c output format programming", "confidence": "inferred" },
+      "fields": [
+        { "name": "width", "lsb": 0, "msb": 15 },
+        { "name": "height", "lsb": 16, "msb": 31 }
+      ]
+    },
+    {
+      "id": "OUTPUT_FRAME_RATE",
+      "name": "Programmed output frame rate",
+      "offset": "0x4208",
+      "width_bits": 32,
+      "access": "rw",
+      "channel": { "count": 4, "stride_bytes": 4 },
+      "snapshot_safe": true,
+      "reset_value": null,
+      "typical_values": [],
+      "evidence": { "source": "src/hws_video.c output format programming", "confidence": "inferred" },
+      "fields": [
+        { "name": "frames_per_second", "lsb": 0, "msb": 31 }
+      ]
+    }
+  ]
+}
