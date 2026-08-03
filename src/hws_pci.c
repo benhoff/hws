@@ -376,14 +376,21 @@ static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 {
 	WRITE_ONCE(hws->suspended, true);
+	/* Publish the stop state before a racing handler can enter MMIO. */
+	smp_mb();
+
+	if (hws->bar0_base)
+		hws_irq_mask_gate(hws);
+
+	/*
+	 * Do not disable the shared descriptor. Wait for any invocation of this
+	 * handler that raced with the device-local gate instead.
+	 */
 	if (hws->irq >= 0)
-		disable_irq(hws->irq);
+		synchronize_irq(hws->irq);
 
-	if (!hws->bar0_base)
-		return;
-
-	hws_irq_mask_gate(hws);
-	hws_irq_clear_pending(hws);
+	if (hws->bar0_base)
+		hws_irq_clear_pending(hws);
 }
 
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
@@ -784,12 +791,12 @@ static int hws_pm_resume(struct device *dev)
 	dev_dbg(dev, "lifecycle:pm_resume:chip-reinit (%lluus)\n",
 		hws_elapsed_us(step_ns));
 
-	/* IRQs can be re-enabled now that MMIO is sane */
+	/* Make our handler live before reopening only this device's IRQ gate. */
 	step_ns = ktime_get_mono_fast_ns();
-	if (hws->irq >= 0)
-		enable_irq(hws->irq);
-
 	WRITE_ONCE(hws->suspended, false);
+	/* Publish the live state before the device can raise another interrupt. */
+	smp_mb();
+	hws_irq_unmask_gate(hws);
 	dev_dbg(dev, "lifecycle:pm_resume:irq-unsuspend (%lluus)\n",
 		hws_elapsed_us(step_ns));
 

@@ -191,23 +191,15 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	struct hws_pcie_dev *pdx = info;
 	u32 int_state;
 
-	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
-	if (pdx->bar0_base) {
-		dev_dbg(&pdx->pdev->dev,
-			"irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
-			readl(pdx->bar0_base + INT_EN_REG_BASE),
-			readl(pdx->bar0_base + HWS_REG_INT_STATUS));
-	}
+	if (!pdx || READ_ONCE(pdx->suspended) || !pdx->bar0_base)
+		return IRQ_NONE;
 
-	/* Fast path: if suspended, quietly ack and exit */
-	if (READ_ONCE(pdx->suspended)) {
-		int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
-		if (int_state) {
-			writel(int_state, pdx->bar0_base + HWS_REG_INT_STATUS);
-			(void)readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
-		}
-		return int_state ? IRQ_HANDLED : IRQ_NONE;
-	}
+	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
+	dev_dbg(&pdx->pdev->dev,
+		"irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
+		readl(pdx->bar0_base + INT_EN_REG_BASE),
+		readl(pdx->bar0_base + HWS_REG_INT_STATUS));
+
 	int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
 	if (!int_state || int_state == 0xFFFFFFFF) {
 		dev_dbg(&pdx->pdev->dev,
