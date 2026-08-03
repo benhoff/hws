@@ -1456,6 +1456,7 @@ int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
 			continue;
 		}
 
+		mutex_lock(&vid->state_lock);
 		streaming = vb2_is_streaming(q);
 		hws_log_video_state(vid, reason, "channel");
 		if (streaming) {
@@ -1472,6 +1473,7 @@ int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
 				"video:%s:ch=%d idle (%lluus)\n",
 				reason, i, hws_elapsed_us(ch_start_ns));
 		}
+		mutex_unlock(&vid->state_lock);
 	}
 	dev_dbg(&hws->pdev->dev, "video:%s:done ret=%d (%lluus)\n", reason,
 		ret, hws_elapsed_us(start_ns));
