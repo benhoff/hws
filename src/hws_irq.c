@@ -419,6 +419,9 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	bool handled = false;
 	bool wake_thread = false;
 	unsigned int loops;
+	unsigned int ack_passes = 0;
+	u32 first_status = 0;
+	u32 repeated = 0;
 	u32 serviced = 0;
 
 	(void)irq;
@@ -461,47 +464,64 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 		}
 
 		handled = true;
+		if (!first_status)
+			first_status = int_state;
+		repeated |= int_state & serviced;
 		fresh = int_state & ~serviced;
-		if (!fresh) {
-			u32 retry;
-
-			/* Retry W1C once, but never dispatch these causes again. */
-			hws_irq_ack_status(pdx, int_state);
-			retry = readl_relaxed(pdx->bar0_base +
-					      HWS_REG_INT_STATUS);
-			if (!retry || retry == 0xFFFFFFFF) {
-				dev_warn_ratelimited(&pdx->pdev->dev,
-					"IRQ status 0x%08x needed a second W1C; duplicate completion suppressed\n",
-					int_state);
-				break;
-			}
-
-			if (retry & serviced) {
-				u32 stuck = retry & serviced;
-
-				hws_irq_record_fault(pdx, stuck);
-				hws_irq_contain_fault(pdx);
-				wake_thread = true;
-				break;
-			}
-
-			/* Only previously unseen sources remain; process them. */
-			continue;
-		}
 
 		/* During suspend teardown, acknowledge without scheduling work. */
-		if (!READ_ONCE(pdx->suspended)) {
+		if (fresh && !READ_ONCE(pdx->suspended)) {
 			wake_thread |= hws_irq_queue_video(pdx, fresh);
 			hws_irq_handle_audio(pdx, fresh);
 		}
 		serviced |= fresh;
+
+		/*
+		 * A repeated bit may be a slow W1C or a same-source reassertion.
+		 * Acknowledge it without dispatching a duplicate completion and use
+		 * the full bounded-drain budget before declaring the device stuck.
+		 */
 		hws_irq_ack_status(pdx, int_state);
+		ack_passes++;
 	}
 
-	if (loops == MAX_INT_LOOPS)
+	if (loops == MAX_INT_LOOPS) {
+		u32 residual;
+
+		residual = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
+		if (residual && residual != 0xFFFFFFFF) {
+			dev_err(&pdx->pdev->dev,
+				"IRQ status did not drain after %u passes: first=0x%08x serviced=0x%08x repeated=0x%08x residual=0x%08x INT_EN=0x%08x SYS=0x%08x VCAP=0x%08x ACAP=0x%08x VTGL=%u/%u/%u/%u ATGL=%u/%u/%u/%u\n",
+				ack_passes, first_status, serviced, repeated, residual,
+				readl(pdx->bar0_base + INT_EN_REG_BASE),
+				readl(pdx->bar0_base + HWS_REG_SYS_STATUS),
+				readl(pdx->bar0_base + HWS_REG_VCAP_ENABLE),
+				readl(pdx->bar0_base + HWS_REG_ACAP_ENABLE),
+				readl(pdx->bar0_base + HWS_REG_VBUF_TOGGLE(0)) & 0x01,
+				readl(pdx->bar0_base + HWS_REG_VBUF_TOGGLE(1)) & 0x01,
+				readl(pdx->bar0_base + HWS_REG_VBUF_TOGGLE(2)) & 0x01,
+				readl(pdx->bar0_base + HWS_REG_VBUF_TOGGLE(3)) & 0x01,
+				readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(0)) & 0x01,
+				readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(1)) & 0x01,
+				readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(2)) & 0x01,
+				readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(3)) & 0x01);
+			hws_irq_record_fault(pdx, residual);
+			hws_irq_contain_fault(pdx);
+			wake_thread = true;
+		} else if (!residual) {
+			dev_warn_ratelimited(&pdx->pdev->dev,
+					     "IRQ status drained at the %u-pass limit: first=0x%08x serviced=0x%08x repeated=0x%08x\n",
+					     ack_passes, first_status, serviced,
+					     repeated);
+		} else {
+			dev_err_ratelimited(&pdx->pdev->dev,
+					    "PCIe device stopped responding while draining IRQ status\n");
+		}
+	} else if (repeated) {
 		dev_warn_ratelimited(&pdx->pdev->dev,
-				     "IRQ status did not drain after %u passes\n",
-				     MAX_INT_LOOPS);
+			"IRQ status needed %u W1C passes: first=0x%08x serviced=0x%08x repeated=0x%08x\n",
+			ack_passes, first_status, serviced, repeated);
+	}
 
 	if (wake_thread)
 		return IRQ_WAKE_THREAD;

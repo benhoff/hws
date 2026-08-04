@@ -41,6 +41,7 @@
 *.su
 *.idb
 *.pdb
+*.codex
 
 # Kernel Module Compile Results
 *.mod*
@@ -53,3 +54,5 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+*__pycache__

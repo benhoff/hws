@@ -59,17 +59,18 @@ irq handler installed on irq=N
 
 ## Fallback validation and recovery
 
-Use the applicable PCI or platform test mechanism to disable MSI when the INTx
-fallback needs explicit validation. For example, the `pci=nomsi` kernel command
-line option disables MSI system-wide and therefore requires a reboot:
+Load the driver with `force_intx=1` when the INTx fallback needs explicit
+validation. The parameter is read-only because changing interrupt transport
+requires unloading and reloading the module:
 
 ```sh
-pci=nomsi
+sudo modprobe -r HwsCapture
+sudo insmod ./src/HwsCapture.ko force_intx=1
 ```
 
-Do not use a system-wide MSI override as the normal configuration after MSI has
-passed the streaming and power-management tests below. INTx fallback testing is
-useful for:
+The `pci=nomsi` kernel command-line option remains available as a system-wide
+fallback test, but it should not be necessary for this device-specific A/B
+test. INTx fallback testing is useful for:
 
 - Comparing MSI behavior against the previous driver configuration.
 - Isolating a platform-specific MSI routing problem.
@@ -82,11 +83,14 @@ MSI is message-based: software cannot depend on an asserted line to invoke the
 handler again. The hard handler consequently reads, handles, acknowledges, and
 re-reads `HWS_REG_INT_STATUS` until no causes remain.
 
-The loop is bounded by `MAX_INT_LOOPS`. Reaching the bound produces a ratelimited
-warning and indicates a stuck status bit, unexpected acknowledgment semantics,
-or an interrupt source arriving faster than it can be drained. Video completion
-is still deferred to the threaded handler, and audio completion is still queued
-to the existing audio work path.
+The loop is bounded by `MAX_INT_LOOPS`. A status bit already dispatched during
+the current handler entry is acknowledged again but is not dispatched twice.
+This lets a slow W1C consume the full drain budget without manufacturing a
+duplicate completion. If status remains asserted after the bound, the driver
+logs the initial, serviced, repeated, and residual masks plus relevant capture
+and toggle registers, stops DMA, errors active streams, and requires a reload.
+Video completion is still deferred to the threaded handler, and audio
+completion is still queued to the existing audio work path.
 
 For shared INTx, a zero status returns `IRQ_NONE`, allowing the kernel to treat
 the interrupt as belonging to another device. For MSI, zero status is unexpected
@@ -125,7 +129,7 @@ Expected MSI evidence:
 - `/proc/interrupts` identifies a PCI MSI interrupt rather than IO-APIC INTx.
 
 Run the same functional workload in default MSI mode and, in a controlled test
-environment, with MSI disabled so PCI core selects INTx:
+environment, with `force_intx=1` so PCI core selects INTx:
 
 1. Capture one video channel, then all available video channels.
 2. Capture all audio channels alone and concurrently with video.

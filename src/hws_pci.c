@@ -34,6 +34,11 @@ module_param_named(enable_audio, hws_enable_audio, bool, 0644);
 MODULE_PARM_DESC(enable_audio,
 		 "Enable ALSA HDMI audio capture devices; set to 0 for video-only mode");
 
+static bool hws_force_intx;
+module_param_named(force_intx, hws_force_intx, bool, 0444);
+MODULE_PARM_DESC(force_intx,
+		 "Force legacy INTx instead of preferring MSI/MSI-X (load-time diagnostic)");
+
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
 	return div_u64(ktime_get_mono_fast_ns() - start_ns, 1000);
@@ -521,6 +526,7 @@ static void hws_free_irq_vectors(void *data)
 static int hws_alloc_irq(struct hws_pcie_dev *hws, unsigned long *irq_flags)
 {
 	struct pci_dev *pdev = hws->pdev;
+	unsigned int irq_types;
 	int irq;
 	int ret;
 
@@ -529,7 +535,8 @@ static int hws_alloc_irq(struct hws_pcie_dev *hws, unsigned long *irq_flags)
 	 * video and audio causes. Let PCI core prefer MSI-X, then MSI, and fall
 	 * back to INTx when neither message-signaled mode is available.
 	 */
-	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
+	irq_types = hws_force_intx ? PCI_IRQ_INTX : PCI_IRQ_ALL_TYPES;
+	ret = pci_alloc_irq_vectors(pdev, 1, 1, irq_types);
 	if (ret < 0)
 		return dev_err_probe(&pdev->dev, ret,
 				     "failed to allocate PCI IRQ vector\n");
@@ -549,6 +556,9 @@ static int hws_alloc_irq(struct hws_pcie_dev *hws, unsigned long *irq_flags)
 
 	hws->irq = irq;
 	*irq_flags = pci_dev_msi_enabled(pdev) ? 0 : IRQF_SHARED;
+	dev_info(&pdev->dev, "IRQ mode: %s%s, irq=%d\n",
+		 pci_dev_msi_enabled(pdev) ? "MSI/MSI-X" : "legacy INTx",
+		 hws_force_intx ? " (forced)" : "", irq);
 
 	return 0;
 }
