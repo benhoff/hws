@@ -163,13 +163,20 @@ struct hws_pcie_dev {
 	/* Kernel thread */
 	struct task_struct *main_task;
 	struct mutex monitor_lock; /* serializes monitor and lifecycle changes */
+	struct mutex dma_lock; /* serializes DMA-idle checks and fatal shutdown */
+	bool dma_quiesced; /* no device DMA can still target host memory */
+	bool dma_failed; /* fatal shutdown invalidated all stream ownership */
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int irq;
+	spinlock_t capture_lock; /* serializes capture-enable register updates */
 
 	/* Error flags */
 	int pci_lost;
 };
+
+int hws_try_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
+int hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 
 #endif

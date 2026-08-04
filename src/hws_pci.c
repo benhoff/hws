@@ -26,6 +26,7 @@
 #define DRV_NAME "hws"
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
+#define HWS_DMA_IDLE_GRACE_US 100000
 
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
@@ -138,6 +139,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 }
 
 static void hws_stop_device(struct hws_pcie_dev *hws);
+static void hws_publish_stop_flags(struct hws_pcie_dev *hws);
 
 static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 				       const char *action,
@@ -152,9 +154,9 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 	dev = &hws->pdev->dev;
 	if (!hws->bar0_base) {
 		dev_dbg(dev,
-			"lifecycle:%s:%s bar0-unmapped suspended=%d start_run=%d pci_lost=%d irq=%d\n",
+			"lifecycle:%s:%s bar0-unmapped suspended=%d start_run=%d pci_lost=%d dma_failed=%d irq=%d\n",
 			action, phase, READ_ONCE(hws->suspended), hws->start_run,
-			hws->pci_lost, hws->irq);
+			hws->pci_lost, READ_ONCE(hws->dma_failed), hws->irq);
 		return;
 	}
 
@@ -165,9 +167,10 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 	dec_mode = readl(hws->bar0_base + HWS_REG_DEC_MODE);
 
 	dev_dbg(dev,
-		"lifecycle:%s:%s suspended=%d start_run=%d pci_lost=%d irq=%d INT_EN=0x%08x INT_STATUS=0x%08x VCAP=0x%08x SYS=0x%08x DEC=0x%08x\n",
+		"lifecycle:%s:%s suspended=%d start_run=%d pci_lost=%d dma_failed=%d irq=%d INT_EN=0x%08x INT_STATUS=0x%08x VCAP=0x%08x SYS=0x%08x DEC=0x%08x\n",
 		action, phase, READ_ONCE(hws->suspended), hws->start_run,
-		hws->pci_lost, hws->irq, int_en, int_status, vcap,
+		hws->pci_lost, READ_ONCE(hws->dma_failed), hws->irq,
+		int_en, int_status, vcap,
 		sys_status, dec_mode);
 }
 
@@ -294,7 +297,31 @@ static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
 
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 {
+	unsigned long flags;
+	bool allocated = false;
 	int ch;
+	int ret;
+
+	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+		if (hws->scratch_vid[ch].cpu) {
+			allocated = true;
+			break;
+		}
+	}
+	if (!allocated)
+		return;
+
+	/* Some probe-unwind paths arrive here without hws_stop_device(). */
+	spin_lock_irqsave(&hws->capture_lock, flags);
+	writel(0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	spin_unlock_irqrestore(&hws->capture_lock, flags);
+	ret = hws_wait_dma_idle(hws, "seed-buffer teardown", -1);
+	if (ret) {
+		dev_crit(&hws->pdev->dev,
+			 "retaining seed buffers: DMA did not quiesce (%d)\n", ret);
+		return;
+	}
 
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 		if (hws->scratch_vid[ch].cpu) {
@@ -415,6 +442,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws->irq = -1;
 	hws->suspended = false;
 	mutex_init(&hws->monitor_lock);
+	mutex_init(&hws->dma_lock);
+	spin_lock_init(&hws->capture_lock);
 	pci_set_drvdata(pdev, hws);
 
 	/* 1) Enable device + bus mastering (managed) */
@@ -547,23 +576,196 @@ err_unwind_channels:
 	return ret;
 }
 
-static int hws_check_busy(struct hws_pcie_dev *pdx)
+static int hws_poll_dma_idle(struct hws_pcie_dev *hws,
+			     unsigned int timeout_us, u32 *last_status)
 {
-	void __iomem *reg = pdx->bar0_base + HWS_REG_SYS_STATUS;
+	void __iomem *reg = hws->bar0_base + HWS_REG_SYS_STATUS;
 	u32 val;
 	int ret;
 
-	/* poll until !(val & BUSY_BIT), sleeping HWS_BUSY_POLL_DELAY_US between reads */
-	ret = readl_poll_timeout(reg, val, !(val & HWS_SYS_DMA_BUSY_BIT),
+	ret = readl_poll_timeout(reg, val,
+				 val == U32_MAX || !(val & HWS_SYS_DMA_BUSY_BIT),
 				 HWS_BUSY_POLL_DELAY_US,
-				 HWS_BUSY_POLL_TIMEOUT_US);
+				 timeout_us);
+	if (last_status)
+		*last_status = val;
+	if (ret)
+		return -ETIMEDOUT;
+	if (val == U32_MAX)
+		return -ENODEV;
+	return 0;
+}
+
+static int hws_check_busy(struct hws_pcie_dev *pdx)
+{
+	u32 val = 0;
+	int ret;
+
+	ret = hws_poll_dma_idle(pdx, HWS_BUSY_POLL_TIMEOUT_US, &val);
 	if (ret) {
+		if (ret == -ENODEV)
+			return ret;
 		dev_err(&pdx->pdev->dev,
 			"SYS_STATUS busy bit never cleared (0x%08x)\n", val);
-		return -ETIMEDOUT;
+		return ret;
 	}
 
 	return 0;
+}
+
+static void hws_fail_active_video_queues(struct hws_pcie_dev *hws)
+{
+	unsigned int ch;
+
+	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+		struct hws_video *vid = &hws->video[ch];
+
+		if (vid->video_device && video_is_registered(vid->video_device) &&
+		    vb2_is_streaming(&vid->buffer_queue))
+			vb2_queue_error(&vid->buffer_queue);
+	}
+}
+
+static int hws_isolate_pci_dma(struct hws_pcie_dev *hws,
+			       const char *owner, int ch)
+{
+	u16 command = U16_MAX;
+	int ret;
+
+	/*
+	 * PCI_COMMAND_MASTER is the generic containment boundary when the
+	 * device-specific busy indication cannot establish an idle point.
+	 * Read the command register back before allowing DMA-owned memory to be
+	 * returned. A missing function is safe too: it can no longer reach host
+	 * memory through this PCIe link.
+	 */
+	pci_clear_master(hws->pdev);
+	ret = pci_read_config_word(hws->pdev, PCI_COMMAND, &command);
+	if (ret || command == U16_MAX) {
+		if (!pci_device_is_present(hws->pdev)) {
+			dev_warn(&hws->pdev->dev,
+				 "%s ch=%d: PCI function disappeared while stopping DMA\n",
+				 owner, ch);
+			return 0;
+		}
+		dev_crit(&hws->pdev->dev,
+			 "%s ch=%d: cannot verify PCI bus-master disable: %d command=0x%04x\n",
+			 owner, ch, ret, command);
+		return ret ? pcibios_err_to_errno(ret) : -EIO;
+	}
+	if (command & PCI_COMMAND_MASTER) {
+		dev_crit(&hws->pdev->dev,
+			 "%s ch=%d: PCI bus-master bit remained set (command=0x%04x)\n",
+			 owner, ch, command);
+		return -EIO;
+	}
+
+	if (!pci_wait_for_pending_transaction(hws->pdev))
+		dev_warn(&hws->pdev->dev,
+			 "%s ch=%d: PCI transaction-pending bit remained set after bus-master disable\n",
+			 owner, ch);
+
+	dev_err(&hws->pdev->dev,
+		"%s ch=%d: disabled PCI bus mastering after stuck DMA busy indication\n",
+		owner, ch);
+	return 0;
+}
+
+static int hws_force_dma_quiesce_locked(struct hws_pcie_dev *hws,
+					const char *owner, int ch)
+{
+	unsigned long flags;
+	u32 status = 0;
+	int ret;
+
+	lockdep_assert_held(&hws->dma_lock);
+
+	dev_err(&hws->pdev->dev,
+		"%s ch=%d: channel DMA did not become idle; stopping all streams\n",
+		owner, ch);
+
+	/* Refuse every subsequent start before globally disabling capture. */
+	WRITE_ONCE(hws->dma_failed, true);
+	WRITE_ONCE(hws->pci_lost, true);
+	WRITE_ONCE(hws->start_run, false);
+	hws_publish_stop_flags(hws);
+	smp_mb(); /* block racing starts before global capture disable */
+	hws_irq_mask_gate(hws);
+
+	spin_lock_irqsave(&hws->capture_lock, flags);
+	writel(0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	spin_unlock_irqrestore(&hws->capture_lock, flags);
+
+	if (hws->irq >= 0)
+		synchronize_irq(hws->irq);
+	hws_fail_active_video_queues(hws);
+
+	ret = hws_poll_dma_idle(hws, HWS_BUSY_POLL_TIMEOUT_US, &status);
+	if (!ret)
+		goto quiesced;
+
+	/*
+	 * A stuck or inaccessible device-specific busy indication cannot
+	 * justify returning DMA-owned memory. Disable and verify PCI bus
+	 * mastering so the function can no longer target host addresses.
+	 */
+	ret = hws_isolate_pci_dma(hws, owner, ch);
+	if (ret)
+		return ret;
+
+quiesced:
+	WRITE_ONCE(hws->dma_quiesced, true);
+	return 0;
+}
+
+static int __hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner,
+			       int ch, bool force)
+{
+	u32 status = 0;
+	int ret;
+
+	if (!hws || !hws->bar0_base)
+		return -ENODEV;
+	might_sleep();
+	if (!owner)
+		owner = "DMA stop";
+
+	mutex_lock(&hws->dma_lock);
+	if (READ_ONCE(hws->dma_quiesced)) {
+		ret = 0;
+		goto out_unlock;
+	}
+
+	/*
+	 * There is no per-channel idle bit. Once the caller has posted the
+	 * target channel's disable, observing the global busy bit clear proves
+	 * that every older DMA from that channel has drained. Other channels
+	 * remain running unless they prevent that observation for the grace
+	 * period. Speculative recovery callers then fail without touching other
+	 * streams; callers that must release memory request the fatal global-stop
+	 * path below.
+	 */
+	ret = hws_poll_dma_idle(hws, HWS_DMA_IDLE_GRACE_US, &status);
+	if (!ret)
+		goto out_unlock;
+
+	if (force)
+		ret = hws_force_dma_quiesce_locked(hws, owner, ch);
+
+out_unlock:
+	mutex_unlock(&hws->dma_lock);
+	return ret;
+}
+
+int hws_try_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch)
+{
+	return __hws_wait_dma_idle(hws, owner, ch, false);
+}
+
+int hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch)
+{
+	return __hws_wait_dma_idle(hws, owner, ch, true);
 }
 
 static void hws_stop_dsp(struct hws_pcie_dev *hws)
@@ -603,18 +805,24 @@ static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 }
 
 /* Drain engines + ISR/BH after flags are published. */
-static void hws_drain_after_stop(struct hws_pcie_dev *hws)
+static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 {
+	unsigned long flags;
 	u32 ackmask = 0;
 	unsigned int i;
 	u64 start_ns = ktime_get_mono_fast_ns();
+	int ret;
 
 	/* Mask device enables: no new DMA starts. */
+	spin_lock_irqsave(&hws->capture_lock, flags);
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush */
+	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	spin_unlock_irqrestore(&hws->capture_lock, flags);
 
-	/* Let any in-flight DMAs finish (best-effort). */
-	(void)hws_check_busy(hws);
+	/* Do not release any DMA-owned memory until the engine is idle. */
+	ret = hws_wait_dma_idle(hws, "device stop", -1);
+	if (!ret)
+		WRITE_ONCE(hws->dma_quiesced, true);
 
 	/* Ack any latched VDONE. */
 	for (i = 0; i < hws->cur_max_video_ch; ++i)
@@ -630,6 +838,7 @@ static void hws_drain_after_stop(struct hws_pcie_dev *hws)
 
 	dev_dbg(&hws->pdev->dev, "lifecycle:drain-after-stop:done (%lluus)\n",
 		hws_elapsed_us(start_ns));
+	return ret;
 }
 
 static void hws_stop_device(struct hws_pcie_dev *hws)
@@ -637,6 +846,7 @@ static void hws_stop_device(struct hws_pcie_dev *hws)
 	u32 status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 	u64 start_ns = ktime_get_mono_fast_ns();
 	bool live = status != 0xFFFFFFFF;
+	int ret;
 
 	dev_dbg(&hws->pdev->dev, "%s: status=0x%08x\n", __func__, status);
 	if (!live) {
@@ -647,10 +857,14 @@ static void hws_stop_device(struct hws_pcie_dev *hws)
 
 	/* Make ISR/BH a no-op, then drain engines/IRQ. */
 	hws_publish_stop_flags(hws);
-	hws_drain_after_stop(hws);
+	ret = hws_drain_after_stop(hws);
+	if (ret)
+		dev_crit(&hws->pdev->dev,
+			 "device stop could not establish DMA idle: %d\n", ret);
 
 	/* 1) Stop the on-board DSP */
-	hws_stop_dsp(hws);
+	if (!READ_ONCE(hws->pci_lost))
+		hws_stop_dsp(hws);
 
 out:
 	hws->start_run = false;
@@ -688,17 +902,18 @@ static int hws_quiesce_for_transition(struct hws_pcie_dev *hws,
 	}
 
 	step_ns = ktime_get_mono_fast_ns();
+	hws_stop_device(hws);
+	dev_dbg(dev, "lifecycle:%s:stop-device (%lluus)\n", action,
+		hws_elapsed_us(step_ns));
+
+	/* DMA is globally idle before vb2 is allowed to return its buffers. */
+	step_ns = ktime_get_mono_fast_ns();
 	vret = hws_video_quiesce(hws, action);
 	dev_dbg(dev, "lifecycle:%s:video-quiesce ret=%d (%lluus)\n", action,
 		vret, hws_elapsed_us(step_ns));
 	if (vret)
 		dev_warn(dev, "lifecycle:%s video quiesce returned %d\n",
 			 action, vret);
-
-	step_ns = ktime_get_mono_fast_ns();
-	hws_stop_device(hws);
-	dev_dbg(dev, "lifecycle:%s:stop-device (%lluus)\n", action,
-		hws_elapsed_us(step_ns));
 	hws_log_lifecycle_snapshot(hws, action, "end");
 	dev_dbg(dev, "lifecycle:%s:quiesce-done ret=%d (%lluus)\n", action,
 		vret, hws_elapsed_us(start_ns));
@@ -770,6 +985,8 @@ static int hws_pm_resume(struct device *dev)
 	u64 step_ns;
 
 	dev_info(dev, "lifecycle:pm_resume begin\n");
+	if (READ_ONCE(hws->dma_failed))
+		return -EIO;
 
 	/* Back to D0 and re-enable the function */
 	step_ns = ktime_get_mono_fast_ns();
@@ -795,6 +1012,10 @@ static int hws_pm_resume(struct device *dev)
 	hws_seed_all_channels(hws);
 	hws_init_video_sys(hws, true);
 	hws_irq_clear_pending(hws);
+	/* The engines are initialized and idle; allow future stream starts. */
+	mutex_lock(&hws->dma_lock);
+	WRITE_ONCE(hws->dma_quiesced, false);
+	mutex_unlock(&hws->dma_lock);
 	dev_dbg(dev, "lifecycle:pm_resume:chip-reinit (%lluus)\n",
 		hws_elapsed_us(step_ns));
 
