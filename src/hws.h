@@ -50,10 +50,19 @@ struct hws_video;
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
+	u64 dma_cookie;
 	int slot;
 };
 
+#define HWS_VIDEO_DIRECT_SLOT (-1)
 #define HWS_VIDEO_BOUNCE_SLOTS 2
+
+enum hws_video_completion_state {
+	HWS_VIDEO_COMPLETION_IDLE,
+	HWS_VIDEO_COMPLETION_PENDING,
+	HWS_VIDEO_COMPLETION_COPYING,
+	HWS_VIDEO_COMPLETION_OVERRUN,
+};
 
 struct hws_video {
 	/* Linkage */
@@ -64,6 +73,13 @@ struct hws_video {
 	struct list_head capture_queue;
 	struct hwsvideo_buffer *active;
 	struct hwsvideo_buffer *next_prepared;
+	struct hwsvideo_buffer *completion_buf;
+	u64 completion_cookie;
+	u64 completion_timestamp_ns;
+	u64 next_dma_cookie;
+	int completion_slot;
+	enum hws_video_completion_state completion_state;
+	u8 completion_toggle;
 
 	/* Locking */
 	struct mutex state_lock;
@@ -101,6 +117,7 @@ struct hws_video {
 	/* Timeout and error handling */
 	u32 timeout_count;
 	u32 error_count;
+	u32 completion_overruns;
 
 	bool window_valid;
 	u32 last_dma_hi;
@@ -179,6 +196,8 @@ struct hws_pcie_dev {
 	bool suspended;
 	int irq;
 	spinlock_t capture_lock; /* serializes capture-enable register updates */
+	spinlock_t irq_thread_lock; /* protects threaded video IRQ work flags */
+	bool irq_pending_vdone[MAX_VID_CHANNELS];
 
 	/* Error flags */
 	int pci_lost;

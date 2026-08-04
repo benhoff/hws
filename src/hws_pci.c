@@ -29,6 +29,11 @@
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
 #define HWS_DMA_IDLE_GRACE_US 100000
 
+static bool hws_enable_audio = true;
+module_param_named(enable_audio, hws_enable_audio, bool, 0444);
+MODULE_PARM_DESC(enable_audio,
+		 "Enable ALSA embedded audio capture devices; set to 0 for video-only mode");
+
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
 	return div_u64(ktime_get_mono_fast_ns() - start_ns, 1000);
@@ -126,6 +131,8 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 
 	if (hdev->cur_max_audio_ch > hdev->cur_max_video_ch)
 		hdev->cur_max_audio_ch = hdev->cur_max_video_ch;
+	if (!hws_enable_audio)
+		hdev->cur_max_audio_ch = 0;
 
 	/* universal buffer capacity */
 	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
@@ -303,6 +310,7 @@ static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
 {
 	struct hws_scratch_dma *vid;
 	struct hws_scratch_dma *aud;
+	unsigned long flags;
 
 	if (!hws || ch >= MAX_VID_CHANNELS)
 		return;
@@ -310,13 +318,16 @@ static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
 	vid = &hws->scratch_vid[ch];
 	aud = &hws->scratch_aud[ch];
 
-	if (ch < hws->cur_max_video_ch) {
+	/* Scratch cannot exist before the per-channel IRQ lock is initialized. */
+	if (ch < hws->cur_max_video_ch && (vid->cpu || aud->cpu)) {
+		spin_lock_irqsave(&hws->video[ch].irq_lock, flags);
 		hws->video[ch].window_valid = false;
 		hws->video[ch].last_dma_hi = 0;
 		hws->video[ch].last_dma_page = 0;
 		hws->video[ch].last_pci_addr = 0;
 		hws->video[ch].last_half16 = 0;
 		hws->video[ch].next_bounce_slot = 0;
+		spin_unlock_irqrestore(&hws->video[ch].irq_lock, flags);
 	}
 	hws->scratch_users[ch] = 0;
 
@@ -555,6 +566,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	mutex_init(&hws->dma_lock);
 	mutex_init(&hws->scratch_lock);
 	spin_lock_init(&hws->capture_lock);
+	spin_lock_init(&hws->irq_thread_lock);
 	pci_set_drvdata(pdev, hws);
 
 	/* 1) Enable device + bus mastering (managed) */
@@ -624,10 +636,12 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws_irq_clear_pending(hws);
 
 	/* D) Request the legacy shared interrupt line (no vectors/MSI/MSI-X) */
-	ret = devm_request_irq(&pdev->dev, irq, hws_irq_handler, irqf,
-			       dev_name(&pdev->dev), hws);
+	ret = devm_request_threaded_irq(&pdev->dev, irq, hws_irq_handler,
+					hws_irq_thread, irqf, dev_name(&pdev->dev),
+					hws);
 	if (ret) {
-		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n", irq, ret);
+		dev_err(&pdev->dev, "request_threaded_irq(%d) failed: %d\n",
+			irq, ret);
 		goto err_unwind_channels;
 	}
 
