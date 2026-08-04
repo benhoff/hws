@@ -174,6 +174,18 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 		sys_status, dec_mode);
 }
 
+static void hws_init_probe_state(struct hws_pcie_dev *hdev)
+{
+	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
+	hdev->max_channels = 4;
+	hdev->buf_allocated = false;
+	hdev->main_task = NULL;
+	hdev->start_run = false;
+	hdev->pci_lost = 0;
+	hdev->dma_quiesced = false;
+	hdev->dma_failed = false;
+}
+
 static int read_chip_id(struct hws_pcie_dev *hdev)
 {
 	u32 reg;
@@ -182,18 +194,17 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->vendor_id = hdev->pdev->vendor;
 
 	reg = readl(hdev->bar0_base + HWS_REG_DEVICE_INFO);
+	if (reg == U32_MAX) {
+		WRITE_ONCE(hdev->pci_lost, true);
+		dev_err(&hdev->pdev->dev,
+			"PCIe device did not respond while reading chip identity\n");
+		return -ENODEV;
+	}
 
 	hdev->device_ver = FIELD_GET(DEVINFO_VER, reg);
 	hdev->sub_ver = FIELD_GET(DEVINFO_SUBVER, reg);
 	hdev->support_yv12 = FIELD_GET(DEVINFO_YV12, reg);
 	hdev->port_id = FIELD_GET(DEVINFO_PORTID, reg);
-
-	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
-	hdev->max_channels = 4;
-	hdev->buf_allocated = false;
-	hdev->main_task = NULL;
-	hdev->start_run = false;
-	hdev->pci_lost = 0;
 
 	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);
 	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE);
@@ -478,7 +489,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 #endif
 
 	/* 4) Identify chip & capabilities */
-	read_chip_id(hws);
+	hws_init_probe_state(hws);
+	ret = read_chip_id(hws);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to read chip identity\n");
 	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n",
 		 pdev->vendor, pdev->device);
 	hws_init_video_sys(hws, false);
@@ -1007,13 +1022,18 @@ static int hws_pm_resume(struct device *dev)
 
 	/* Reinitialize chip-side capabilities / registers */
 	step_ns = ktime_get_mono_fast_ns();
-	read_chip_id(hws);
+	ret = read_chip_id(hws);
+	if (ret) {
+		dev_err(dev, "failed to restore chip identity: %d\n", ret);
+		goto err_disable_device;
+	}
 	/* Re-seed BAR remaps/DMA windows and restart the capture core */
 	hws_seed_all_channels(hws);
 	hws_init_video_sys(hws, true);
 	hws_irq_clear_pending(hws);
 	/* The engines are initialized and idle; allow future stream starts. */
 	mutex_lock(&hws->dma_lock);
+	WRITE_ONCE(hws->pci_lost, false);
 	WRITE_ONCE(hws->dma_quiesced, false);
 	mutex_unlock(&hws->dma_lock);
 	dev_dbg(dev, "lifecycle:pm_resume:chip-reinit (%lluus)\n",
@@ -1038,6 +1058,11 @@ static int hws_pm_resume(struct device *dev)
 		 hws_elapsed_us(start_ns));
 
 	return 0;
+
+err_disable_device:
+	pci_clear_master(pdev);
+	pci_disable_device(pdev);
+	return ret;
 }
 
 static SIMPLE_DEV_PM_OPS(hws_pm_ops, hws_pm_suspend, hws_pm_resume);
