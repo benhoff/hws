@@ -40,12 +40,29 @@ struct hws_pix_state {
 	u32 sizeimage;		/* full frame */
 	enum v4l2_field field;	/* V4L2_FIELD_NONE or INTERLACED */
 	enum v4l2_colorspace colorspace;	/* e.g., REC709 */
-	enum v4l2_ycbcr_encoding ycbcr_enc;	/* V4L2_YCBCR_ENC_DEFAULT */
-	enum v4l2_quantization quantization;	/* V4L2_QUANTIZATION_LIM_RANGE */
+	enum v4l2_ycbcr_encoding ycbcr_enc;	/* V4L2_YCBCR_ENC_601 */
+	enum v4l2_quantization quantization;	/* V4L2_QUANTIZATION_FULL_RANGE */
 	enum v4l2_xfer_func xfer_func;	/* V4L2_XFER_FUNC_DEFAULT */
 	bool interlaced;	/* cached hardware state */
 	u32 half_size;		/* hardware half-frame size */
 };
+
+static inline void hws_set_pix_colorimetry(struct hws_pix_state *pix)
+{
+	bool sd = pix->height <= 576;
+
+	/*
+	 * Hardware evidence shows BT.601 Y'CbCr coefficients and full-range
+	 * quantization at both SD and HD resolutions. Keep the resolution-based
+	 * colorspace for source primaries/transfer, but explicitly override its
+	 * default matrix so metadata describes the measured YUYV samples.
+	 */
+	pix->colorspace = sd ? V4L2_COLORSPACE_SMPTE170M :
+				 V4L2_COLORSPACE_REC709;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+}
 
 #define	UNSET	(-1U)
 

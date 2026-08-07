@@ -507,16 +507,6 @@ int hws_vidioc_g_dv_timings(struct file *file, void *fh,
 	return 0;
 }
 
-static inline void hws_set_colorimetry_state(struct hws_pix_state *p)
-{
-	bool sd = p->height <= 576;
-
-	p->colorspace   = sd ? V4L2_COLORSPACE_SMPTE170M : V4L2_COLORSPACE_REC709;
-	p->ycbcr_enc    = V4L2_YCBCR_ENC_DEFAULT;
-	p->quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	p->xfer_func    = V4L2_XFER_FUNC_DEFAULT;
-}
-
 /* Set DV timings: must match one of our supported modes.
  * If buffers are queued and this implies a size change, we reject with -EBUSY.
  * Otherwise we update pix state and (optionally) reprogram the HW.
@@ -588,7 +578,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	vid->pix.interlaced = interlaced;
 	vid->pix.fourcc     = V4L2_PIX_FMT_YUYV;
 
-	hws_set_colorimetry_state(&vid->pix);
+	hws_set_pix_colorimetry(&vid->pix);
 
 	/* Recompute stride, sizeimage, and half_size. */
 	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
@@ -735,8 +725,9 @@ static inline void hws_set_colorimetry_fmt(struct v4l2_pix_format *p)
 {
 	bool sd = p->height <= 576;
 
+	/* Mirror hws_set_pix_colorimetry() for the public format structure. */
 	p->colorspace   = sd ? V4L2_COLORSPACE_SMPTE170M : V4L2_COLORSPACE_REC709;
-	p->ycbcr_enc    = V4L2_YCBCR_ENC_DEFAULT;
+	p->ycbcr_enc    = V4L2_YCBCR_ENC_601;
 	p->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	p->xfer_func    = V4L2_XFER_FUNC_DEFAULT;
 }
