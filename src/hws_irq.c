@@ -45,6 +45,7 @@ enum hws_vdone_record_result {
 	HWS_VDONE_IGNORED,
 	HWS_VDONE_QUEUED,
 	HWS_VDONE_RESYNCED,
+	HWS_VDONE_RECOVERED,
 	HWS_VDONE_OVERRUN,
 };
 
@@ -218,11 +219,15 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		}
 		v->phase_generation = event->generation;
 		v->sync_events++;
+		/* Account verified full-frame boundaries skipped during recovery. */
+		if (v->sync_account_frames && completed_half)
+			completes_frame = true;
 		if (v->sync_events >= HWS_VIDEO_SYNC_EVENTS) {
 			v->half_phase = completed_half ?
 				HWS_VIDEO_PHASE_EXPECT_HALF0 :
 				HWS_VIDEO_PHASE_EXPECT_HALF1;
 			v->sync_restart_streak = 0;
+			v->sync_account_frames = false;
 		}
 		skip_copy = true;
 		buf = NULL;
@@ -485,9 +490,57 @@ static void hws_video_vdone_work(struct work_struct *work)
 	hws_video_handle_vdone(v);
 }
 
+static void hws_video_recovery_work(struct work_struct *work)
+{
+	struct hws_video *v = container_of(work, struct hws_video,
+					   recovery_work);
+	struct hws_pcie_dev *hws = v->parent;
+	unsigned long flags;
+	u64 generation;
+	u64 interval_us;
+	u32 reports;
+	u8 toggle;
+	u8 attempt;
+	enum hws_vdone_ambiguity reason;
+	bool dropped_partial;
+	bool steady;
+
+	spin_lock_irqsave(&v->irq_lock, flags);
+	reports = v->recovery_reports_pending;
+	v->recovery_reports_pending = 0;
+	generation = v->recovery_report_generation;
+	interval_us = v->recovery_report_interval_us;
+	toggle = v->recovery_report_toggle;
+	attempt = v->recovery_report_attempt;
+	reason = v->recovery_report_reason;
+	dropped_partial = v->recovery_report_dropped_partial;
+	steady = v->recovery_report_steady;
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+	if (!reports)
+		return;
+
+	if (steady)
+		dev_warn_ratelimited(&hws->pdev->dev,
+				     "VDONE duplicate recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u attempt=%u/%u reports=%u\n",
+				     v->channel_index,
+				     (unsigned long long)generation, toggle,
+				     (unsigned long long)interval_us,
+				     dropped_partial, attempt,
+				     HWS_VIDEO_SYNC_RESTARTS_MAX, reports);
+	else
+		dev_info_ratelimited(&hws->pdev->dev,
+				     "VDONE phase resync ch=%u generation=%llu toggle=%u interval=%lluus reason=%s attempt=%u/%u reports=%u\n",
+				     v->channel_index,
+				     (unsigned long long)generation, toggle,
+				     (unsigned long long)interval_us,
+				     hws_vdone_ambiguity_name(reason), attempt,
+				     HWS_VIDEO_SYNC_RESTARTS_MAX, reports);
+}
+
 void hws_irq_init_video_work(struct hws_video *vid)
 {
 	INIT_WORK(&vid->vdone_work, hws_video_vdone_work);
+	INIT_WORK(&vid->recovery_work, hws_video_recovery_work);
 }
 
 static u32 hws_irq_ack_status(struct hws_pcie_dev *pdx, u32 int_state)
@@ -521,12 +574,39 @@ static void hws_irq_queue_vdone_work(struct hws_pcie_dev *pdx,
 	queue_work(wq, &v->vdone_work);
 }
 
+static void hws_irq_queue_recovery_work(struct hws_pcie_dev *pdx,
+					unsigned int ch)
+{
+	if (!pdx || ch >= MAX_VID_CHANNELS)
+		return;
+	schedule_work(&pdx->video[ch].recovery_work);
+}
+
+static void
+hws_vdone_note_recovery_locked(struct hws_video *v, u64 generation,
+			       u64 interval_us, u8 toggle, u8 attempt,
+			       enum hws_vdone_ambiguity reason,
+			       bool dropped_partial, bool steady)
+{
+	lockdep_assert_held(&v->irq_lock);
+
+	v->recovery_reports_pending++;
+	v->recovery_report_generation = generation;
+	v->recovery_report_interval_us = interval_us;
+	v->recovery_report_toggle = toggle;
+	v->recovery_report_attempt = attempt;
+	v->recovery_report_reason = reason;
+	v->recovery_report_dropped_partial = dropped_partial;
+	v->recovery_report_steady = steady;
+}
+
 static enum hws_vdone_record_result
 hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     const struct hws_vdone_toggle_sample *sample,
 		     u64 timestamp_ns)
 {
 	struct hws_video *v;
+	struct hwsvideo_buffer *recovery_done = NULL;
 	unsigned long flags;
 	enum hws_vdone_ambiguity ambiguity = HWS_VDONE_AMBIG_NONE;
 	enum hws_vdone_record_result result;
@@ -534,6 +614,8 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	u64 previous_ns = 0;
 	u64 interval_us = 0;
 	u8 sync_attempt = 0;
+	bool cadence_ambiguous = false;
+	bool report_recovery = false;
 	u8 toggle;
 
 	if (!pdx || ch >= MAX_VID_CHANNELS || !sample)
@@ -550,6 +632,12 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 			v->next_completion_generation++;
 		generation = v->next_completion_generation;
 		previous_ns = v->last_vdone_timestamp_ns;
+		if (timestamp_ns > previous_ns)
+			interval_us = div_u64(timestamp_ns - previous_ns,
+					      NSEC_PER_USEC);
+		cadence_ambiguous = v->half_seen &&
+			hws_video_cadence_ambiguous(v, previous_ns,
+						    timestamp_ns);
 
 		if (v->completion_state != HWS_VIDEO_COMPLETION_IDLE)
 			ambiguity = HWS_VDONE_AMBIG_INFLIGHT;
@@ -562,9 +650,7 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		else if (v->half_seen &&
 			 toggle == v->last_buf_half_toggle)
 			ambiguity = HWS_VDONE_AMBIG_DUPLICATE;
-		else if (v->half_seen &&
-			 hws_video_cadence_ambiguous(v, previous_ns,
-						     timestamp_ns))
+		else if (cadence_ambiguous)
 			ambiguity = HWS_VDONE_AMBIG_CADENCE;
 
 		v->completion_timestamp_ns = timestamp_ns;
@@ -592,7 +678,55 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 			WRITE_ONCE(v->last_buf_half_toggle, toggle);
 			WRITE_ONCE(v->half_seen, true);
 			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
+			hws_vdone_note_recovery_locked(v, generation, interval_us,
+						       toggle, sync_attempt,
+						       ambiguity, false, false);
+			report_recovery = true;
 			result = HWS_VDONE_RESYNCED;
+		} else if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE &&
+			   !cadence_ambiguous &&
+			   v->half_phase != HWS_VIDEO_PHASE_SYNC &&
+			   v->sync_restart_streak <
+					HWS_VIDEO_SYNC_RESTARTS_MAX) {
+			/*
+			 * The characterized endpoint can assert a clean VDONE at a normal
+			 * half-period without changing ring ownership.  Baseline ignored
+			 * that edge and reset its partial-frame state.  Preserve that safe
+			 * behavior without silently delivering a mixed frame: invalidate
+			 * any partial VB2 buffer and reacquire eight
+			 * alternating boundaries.  A repeated disturbance before that run
+			 * completes remains bounded by HWS_VIDEO_SYNC_RESTARTS_MAX.
+			 */
+			v->sync_restart_streak++;
+			sync_attempt = v->sync_restart_streak;
+			v->sync_restarts++;
+			v->duplicate_recoveries++;
+			recovery_done = v->active;
+			v->active = NULL;
+			v->frame_generation = 0;
+			v->frame_half0_valid = false;
+			v->half_phase = HWS_VIDEO_PHASE_SYNC;
+			v->sync_events = 0;
+			v->sync_account_frames = true;
+			v->phase_generation = generation;
+			hws_irq_reset_completion_locked(v);
+			WRITE_ONCE(v->last_buf_half_toggle, toggle);
+			WRITE_ONCE(v->half_seen, true);
+			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
+			if (recovery_done) {
+				recovery_done->vb.vb2_buf.timestamp = timestamp_ns;
+				vb2_set_plane_payload(&recovery_done->vb.vb2_buf,
+						      0, 0);
+				recovery_done->vb.field = v->pix.field;
+				recovery_done->vb.sequence =
+					(u32)atomic_read(&v->sequence_number);
+			}
+			hws_vdone_note_recovery_locked(v, generation, interval_us,
+						       toggle, sync_attempt,
+						       ambiguity,
+						       !!recovery_done, true);
+			report_recovery = true;
+			result = HWS_VDONE_RECOVERED;
 		} else if (ambiguity != HWS_VDONE_AMBIG_NONE) {
 			hws_irq_mark_failure_locked(v, -EOVERFLOW);
 			v->w1c_ambiguities++;
@@ -613,19 +747,13 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		}
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
-	if (timestamp_ns > previous_ns)
-		interval_us = div_u64(timestamp_ns - previous_ns,
-				      NSEC_PER_USEC);
+	if (recovery_done)
+		vb2_buffer_done(&recovery_done->vb.vb2_buf,
+				VB2_BUF_STATE_ERROR);
+	if (report_recovery)
+		hws_irq_queue_recovery_work(pdx, ch);
 
-	if (result == HWS_VDONE_RESYNCED) {
-		dev_info_ratelimited(&pdx->pdev->dev,
-				     "VDONE startup resync ch=%u generation=%llu toggle=%u interval=%lluus reason=%s attempt=%u/%u\n",
-				     ch, (unsigned long long)generation, toggle,
-				     (unsigned long long)interval_us,
-				     hws_vdone_ambiguity_name(ambiguity),
-				     sync_attempt,
-				     HWS_VIDEO_SYNC_RESTARTS_MAX);
-	} else if (result == HWS_VDONE_OVERRUN) {
+	if (result == HWS_VDONE_OVERRUN) {
 		hws_enable_video_capture(pdx, ch, false);
 		dev_err_ratelimited(&pdx->pdev->dev,
 				    "VDONE ambiguity ch=%u generation=%llu toggle=%u pre_ack=%u post_stable=%u reasserted=%u interval=%lluus: %s\n",

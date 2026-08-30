@@ -651,6 +651,22 @@ collect_klog() {
 	fi
 }
 
+report_vdone_recoveries() {
+	local evidence="$OUTPUT_DIR/vdone-recoveries.log"
+	local recovered
+	local resynced
+
+	grep -E 'VDONE (duplicate recovered|phase resync)' \
+		"$KLOG_FILE" >"$evidence" || true
+	recovered=$(grep -c 'VDONE duplicate recovered' "$evidence" || true)
+	resynced=$(grep -c 'VDONE phase resync' "$evidence" || true)
+	if ((resynced || recovered)); then
+		log "VDONE phase recovery: $recovered steady duplicate(s), $resynced sync restart(s) (see $evidence)"
+	else
+		rm -f -- "$evidence"
+	fi
+}
+
 phase_begin() {
 	collect_klog
 	PHASE_KLOG_LINES=$(wc -l <"$KLOG_FILE")
@@ -1786,6 +1802,7 @@ main() {
 	finish_clean_phase module-recovery "module teardown/recovery"
 
 	collect_klog
+	report_vdone_recoveries
 	delta="$OUTPUT_DIR/kernel.log"
 	log ""
 	log "Evidence: $OUTPUT_DIR"

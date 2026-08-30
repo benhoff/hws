@@ -274,9 +274,10 @@ The implemented invariants are:
   before nominal source reuse. Faster modes automatically receive a tighter
   deadline based on their half period.
 - An orphan half 1 is dropped. A missing destination at half 0 drops the whole
-  frame. A pending copy, duplicate toggle, half-order mismatch, destination
-  mapping/size error, or guard failure stops capture and fails the queue
-  instead of delivering an ambiguous buffer.
+  frame. A pending copy, half-order mismatch, destination mapping/size error,
+  or guard failure stops capture and fails the queue instead of delivering an
+  ambiguous buffer. A stable duplicate toggle at a normal half-period with a
+  clean W1C acknowledgement follows the bounded recovery described below.
 - STREAMOFF disables VCAP, synchronizes the hard IRQ, drains the channel worker,
   retains the permanent arena until teardown, and checks the active extent
   guard after the existing DMA-idle barrier. Remove and device-wide shutdown
@@ -316,6 +317,56 @@ and srcversion `89120688711938057BDF4E0`; evidence is in
 eight-event quiet acquisition window was exercised but the bounded recovery
 branch was not forced in this run.
 
+On 2026-08-30, a planned five-minute channel-3 soak reproduced the steady-state
+failure early, at generation 1028. VDONE arrived after 8,588 us with only the
+channel-3 bit in `INT_STATUS`; W1C cleared the bit, the toggle remained `1` before
+and after acknowledgement, and eleven ordered samples kept reading `1`
+through 512 us. `INT_STATUS` remained clear, while `VCAP_ENABLE` and
+`ACTIVE_STATUS` remained `0x8` and `SYS_STATUS` remained `0x3`. This rules out
+a short MMIO-visibility delay and observed W1C reassertion. The endpoint emits
+an occasional stable duplicate VDONE without transferring ring ownership.
+
+The vendor baseline explicitly handled the same condition: it did not schedule
+the copy tasklet when the toggle matched the cached value, cleared its
+first-half state, discarded the following orphan half when necessary, and
+continued streaming. `audio-upstream-v19` lost that behavior and accepted
+every VDONE as a completion; the initial v20 safety implementation instead
+failed the complete VB2 queue.
+
+**First recovery iteration and follow-up evidence:** the exact module with
+srcversion `16F9EFAC3F09772596AFF25` recovered a generation-2556 duplicate at
+an 8,671-us interval and returned its partial buffer without stopping VCAP.
+The next two events arrived with 12,325-us duplicate and 4,332-us changed-toggle
+intervals and were resynchronized. A later generation-3734 duplicate at
+8,654 us exposed a recovery implementation race: its per-channel recovery work
+had not cleared `RECOVERING` before generation 3735 arrived, so the otherwise
+recoverable path escalated as an in-flight completion and userspace again
+observed `EIO`. Synchronous recovery logging in the hard handler also consumed
+part of the next half-period and perturbed the diagnostic cadence.
+
+**Revised working-tree resolution, hardware validation pending:** only a stable
+same-toggle event at a valid half-frame cadence with cleared post-W1C status is
+recoverable. The hard handler now detaches and returns any partially assembled
+VB2 buffer with `ERROR`, resets phase, and makes the completion slot idle before
+returning from that interrupt. It leaves the permanent ring and VCAP running
+and requires eight alternating completions before copying again. Recovery
+logging is deferred to a separate work item and cannot hold the completion
+state across the next VDONE. Verified full
+frames discarded during this mid-stream synchronization still advance the
+V4L2 sequence counter. Four disruptions are allowed before a clean sync run;
+further disruption escalates to the existing queue failure. Unstable or
+reasserted status, an in-flight completion, out-of-cadence/coalesced events,
+copy deadline failures, and guard corruption remain fail-closed. The temporary
+512-us hard-IRQ sampler was removed after collecting this evidence.
+
+Required hardware proof is a rebuilt-module soak that survives at least one
+`VDONE duplicate recovered` event without `VIDIOC_DQBUF` returning `EIO`,
+followed by the full E2E/fault-injection harness and the EOF/sequence metadata
+test. `hws_vdone_recovery_test.sh --run` performs the focused reload, timed
+capture, kernel-log classification, and exact-module check without relying on
+`v4l2-ctl`'s exit status (version 1.32.0 returned zero after printing a DQBUF
+`EIO`).
+
 The module builds against Arch kernel `7.1.9-arch1-2`, `git diff --check` is
 clean, and Linux `checkpatch.pl` reports zero errors and zero warnings for the
 change. The deadline, W1C ambiguity, phase, generation, and fail-closed step is
@@ -348,7 +399,7 @@ be resolved before broader testing alone could make v20 submission-ready.
 | v20 packed YUYV layout | Hardware compliance pass for native channel-3 mode | Commit `fe6aabc` normalizes every request to configured native progressive geometry with exact packed stride and size. `v4l2-compliance` passed 49/49 and streamed native 1920x1080 YUYV; the unrelated power-present control warning was fixed afterward and needs a rerun |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
 | v20 latest full E2E regression | Failed, 29 passed / 3 failed | The current source passed load/order verification, normal and stressed capture, format/DV checks, rapid STREAMON/OFF, both independent stop directions, arena reclamation, and recovery. Concurrent capture then encountered an unforced VDONE duplicate-toggle at an 8,682 us interval; forced INTx encountered another at 8,613 us before deliberate gating, so fault injection could not start |
-| v20 submission readiness | Blocked | Of the six original blockers, device scope remains unresolved in code. EOF timestamp/sequence semantics, audio bounds, progressive-only interlaced policy, DV-timings semantics, native packed format, and independent stop behavior have targeted proof for the characterized 8888:8504/channel-3 scope. The spontaneous VDONE duplicate-toggle failure is now an immediate blocker. Production telemetry, focused lifecycle testing, and cross-device validation also remain |
+| v20 submission readiness | Blocked pending recovery proof and scope cleanup | Of the six original blockers, device scope remains unresolved in code. EOF timestamp/sequence semantics, audio bounds, progressive-only interlaced policy, DV-timings semantics, native packed format, and independent stop behavior have targeted proof for the characterized 8888:8504/channel-3 scope. The working tree now recovers the characterized stable, normal-cadence duplicate VDONE per channel, but that path still needs the focused soak and full regression proof above. Production telemetry, focused lifecycle testing, and cross-device validation also remain |
 
 ## 2026-08-29 v20 code-value submission assessment
 
