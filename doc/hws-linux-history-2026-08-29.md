@@ -21,8 +21,10 @@ architecture:
   the page-rounded extent.
 - The native half-ring was viable for channel 3 at 1920x1080p60, with a fixed
   DMA base and CPU copies of proved-complete halves. That architecture is now
-  integrated on the `audio-upstream-v20-dma-safety` successor branch, but it
-  has not yet been hardware-validated across the supported channels and modes.
+  integrated on the `audio-upstream-v20-dma-safety` successor branch. Its
+  targeted channel-3/1080p60 E2E matrix passed, but a subsequent code-value
+  review found multi-stream lifecycle, audio DMA-boundary, hardware-scope,
+  interlaced-format, and V4L2 API blockers outside that tested path.
 
 The August findings therefore require a production successor to v19. They are
 not merely optional follow-on architecture work. The lifecycle, quiescing,
@@ -312,8 +314,9 @@ branch was not forced in this run.
 The module builds against Arch kernel `7.1.9-arch1-2`, `git diff --check` is
 clean, and Linux `checkpatch.pl` reports zero errors and zero warnings for the
 change. The deadline, W1C ambiguity, phase, generation, and fail-closed step is
-now implemented and software-checked. The complete hardware validation matrix
-is still outstanding. Until it passes, v20 is not submission-ready.
+implemented and targeted hardware-checked. Broader hardware validation remains
+outstanding, but the code-value assessment below identifies blockers that must
+be resolved before broader testing alone could make v20 submission-ready.
 
 ## Validation matrix
 
@@ -333,7 +336,353 @@ is still outstanding. Until it passes, v20 is not submission-ready.
 | v20 audio staging gate | Hardware passed for channel 3 | Concurrent run reported 237 IRQs, one primed packet, 236 delivered packets, zero drops/errors, and 157 us maximum work latency |
 | v20 packed YUYV layout | Negotiation test passed | A deliberately padded 720x576 request normalized to `bytesperline=1440`, `sizeimage=829440`; queue, buffer, ring, and STREAMON paths reject inconsistent internal state |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
-| v20 submission readiness | Blocked | Full hardware validation remains |
+| v20 submission readiness | Blocked | The targeted E2E matrix passed, but the code still has multi-stream global-idle, audio DMA-boundary, device-scope, interlaced-layout, and V4L2 API blockers |
+
+## 2026-08-29 v20 code-value submission assessment
+
+The assessment at standalone commit `ac3c784` considered the implementation
+itself rather than sign-off, patch formatting, checkpatch, or Git submission
+mechanics. The result is **not ready for Linux submission yet**, although the
+architecture has clear upstream value. The fixed private video ring, CPU-only
+VB2 path, independent per-channel completion workers, audio staging,
+generation/toggle/deadline validation, MSI preference, and fail-closed W1C
+handling are substantial improvements over v19. The 20/20 hardware result is
+strong evidence for the exact 8888:8504 channel-3/1080p60 path, but it does not
+cover the following code-level problems.
+
+### Submission blockers
+
+1. **Per-stream stop still depends on a device-global DMA-idle observation.**
+   The scratch arenas are deliberately allocated at probe and retained until
+   PCI teardown, and neither video nor audio DMA targets userspace buffers.
+   Nevertheless, video STREAMOFF, no-signal recovery, mode changes, and audio
+   scratch release wait for a global busy bit. The code itself notes that
+   another active channel can prevent the bit from clearing. A timeout in a
+   forced caller sets `dma_failed` and `pci_lost`, disables every video and
+   audio engine, fails all queues, and can clear PCI bus mastering. Stopping
+   one stream while another remains active can therefore disable the entire
+   card. Ordinary per-stream stop should disable that engine, synchronize its
+   IRQ, drain its worker, return its VB2 or ALSA buffers, and leave permanent
+   scratch quarantined. Global idle or PCI isolation should be reserved for
+   remapping, freeing scratch, suspend/remove, or a real device-wide fault.
+
+   The exceptional path in `hws_stop_streaming()` also returns without
+   returning all driver-owned VB2 buffers when idle/isolation cannot be proved.
+   That violates the VB2 stop contract even though the endpoint never targets
+   those VB2 buffers.
+
+2. **The audio DMA write extent is assumed rather than guarded and
+   characterized.** Video has page-rounded capacity and guard pages, but audio
+   receives only the inherited 10 KiB window and sits at the end of the
+   coherent allocation without a trailing guard. CPU-side packet bounds do not
+   detect or contain an endpoint write beyond that allocation. Because the
+   video diagnostics already found an undocumented 2,048-byte write tail, the
+   audio region needs a characterized page-rounded extent, a trailing guard or
+   canary, verification after proved idle, and a failure policy equivalent to
+   the video ring.
+
+3. **The PCI match table is broader than the established implementation
+   scope.** It binds unknown SKUs plus HDMI and SDI families, while the complete
+   validation covers only the 8888:8504 HDMI card. Older device revisions enter
+   a legacy path that explicitly leaves live geometry and FPS at defaults.
+   Until per-model register behavior, channel counts, formats, and DMA extents
+   are established, the table should be restricted to characterized devices or
+   split into explicit per-model capabilities and operations.
+
+4. **Interlaced geometry is internally inconsistent.** Detection bounds an
+   interlaced register height using `height * 2`, implying the register reports
+   a field height, but the driver then exposes that unmultiplied value as a
+   `V4L2_FIELD_INTERLACED` frame and sizes the ring from it. This can reject a
+   valid 1080i representation or expose and allocate only half a frame. The
+   driver should reject detected interlaced input until support is defined, or
+   establish the register semantics and consistently use full-frame geometry.
+
+5. **DV-timings behavior does not consistently represent the supported and
+   configured state.** With a recognized live signal,
+   `VIDIOC_ENUM_DV_TIMINGS` returns only the current timing rather than the
+   supported list. `VIDIOC_G_DV_TIMINGS` substitutes detected live timing for
+   configured timing. Several table entries contain only width and height with
+   no usable clock or porch data, while a 1080x1920 portrait entry raises the
+   advertised maximum height to 1920 even though capture formats are capped at
+   1080. The timing table and query/get/set/enumerate/capability semantics must
+   be made internally consistent.
+
+6. **Format negotiation accepts layouts that cannot reach STREAMON.** Packed
+   YUYV negotiation permits odd widths and dimensions as small as 1x1. The
+   native half split rounds down to a 2,048-byte boundary, so sufficiently
+   small accepted formats produce a zero split and fail later during capture
+   start. `TRY_FMT` must normalize every request to an actually streamable,
+   even-width hardware geometry and maintain that invariant across live mode
+   changes.
+
+### Additional code issues
+
+- PCIe Relaxed Ordering is enabled unconditionally even though the correctness
+  design depends on DMA data being visible before completion toggle/IRQ
+  observation. It should remain disabled unless the endpoint's ordering
+  contract is documented and proved for these transactions.
+- A live SD/HD geometry change recalculates dimensions and buffer size without
+  updating the cached colorimetry state.
+- The synthetic no-signal YUYV frame fills every byte with `0x10`, including U
+  and V. Neutral packed YUYV needs chroma values of 128 and a luma value chosen
+  consistently with the advertised quantization.
+- The permanent-ring design no longer needs coherent DMA allocators for VB2
+  and ALSA userspace rings because the endpoint never targets them. CPU-oriented
+  backing would better match ownership and avoid large unnecessary coherent
+  allocations, although this is an architectural refinement rather than the
+  primary safety blocker.
+
+### 2026-08-30 comprehensive follow-up findings
+
+The follow-up review covered the full current driver at standalone commit
+`ac3c784`, including IRQ ordering, video and audio completion publication,
+V4L2 API behavior, format and signal transitions, probe/remove, power
+management, and warning-enabled builds. It confirmed the six blockers above
+and found the following additional issues. These are code-value findings; Git
+mechanics, sign-off, patch presentation, and checkpatch policy were deliberately
+outside the assessment.
+
+#### Completion and interrupt correctness
+
+1. **The proof that endpoint data is visible at completion is incomplete.**
+   `src/hws_pci.c` enables PCIe Relaxed Ordering unconditionally, while video
+   and audio use relaxed MMIO reads to observe completion/toggle state. A
+   `dma_rmb()` orders CPU observations but cannot turn a late endpoint DMA write
+   into an ordered one. Likewise, copying a half and immediately comparing it
+   with the source only detects a write that lands between those two CPU reads;
+   two reads can agree on the same stale contents. Relaxed Ordering should be
+   disabled unless the device's transaction ordering is documented and proved,
+   and completion registers used as ordering points should use ordered MMIO
+   access.
+
+2. **Post-W1C ambiguity is handled for video but not for audio.** The IRQ
+   handler reads `INT_STATUS` again after acknowledging the W1C bits, but only
+   the video path receives that post-ack state. `hws_irq_record_audio()` sees
+   only the pre-ack snapshot. An ADONE that reasserts or coalesces across the
+   acknowledge can therefore be lost. Cadence and toggle checks may catch a
+   later inconsistency, but cannot guarantee detection when an even number of
+   toggles is lost or no later audio interrupt arrives. Post-ack audio bits must
+   fail the affected PCM stream closed immediately, with a focused forced-INTx
+   regression test analogous to the video ambiguity test.
+
+3. **The enabled interrupt mask is broader than the sources the handler
+   decodes.** `HWS_INT_EN_MASK` enables bits 0 through 17, while the current
+   handler explicitly accounts for video channels 0 through 3 and audio
+   channels 0 through 3. The value appears inherited from the vendor driver,
+   so it is not proof of a live bug, but every remaining bit needs a documented
+   source and disposition before the mask can be considered safe upstream.
+
+#### Video API and signal-state correctness
+
+4. **The measured colorimetry correction is absent from the current branch.**
+   Hardware work established BT.601 coefficients and full-range quantization at
+   1080p. Commit `6f24ceb` (`media: report measured HWS colorimetry`) preserves
+   that correction on `audio-upstream-5patch-pulled-forward`, but it is not an
+   ancestor of the current v20 branch. The current height-derived defaults
+   report Rec.709 for HD, which misdescribes the measured image. Live geometry
+   changes also resize the format without refreshing colorimetry. The measured
+   metadata fix must be restored and applied consistently on every mode change.
+
+5. **DV-timings discovery can report a plausible but false mode.**
+   `hws_get_live_dv_geometry()` reads the resolution register without first
+   requiring the channel's signal-present status. Query can consequently fall
+   back to cached geometry and succeed with no link instead of returning
+   `-ENOLINK`. When no exact width/height/frame-rate entry matches, the timing
+   matcher falls back to width and height alone, so an unsupported refresh such
+   as 1080p50 can be reported as a supported 1080p60 timing rather than
+   `-ERANGE`. Detection must require a live, stable signal and an exact supported
+   mode.
+
+6. **Configured, detected, and enumerated timings remain conflated.**
+   `VIDIOC_G_DV_TIMINGS` should return the configured timing, while
+   `VIDIOC_QUERY_DV_TIMINGS` reports detected input and
+   `VIDIOC_ENUM_DV_TIMINGS` enumerates the driver's supported set. The current
+   implementation substitutes live state for configured state and filters
+   enumeration around the current signal. `hws_set_current_dv_timings()` also
+   caches only a partial timing structure. These operations need distinct,
+   complete state and consistent capability bounds.
+
+7. **The monitor changes capture geometry behind userspace's back.** On a live
+   mode change it rewrites `pix`, buffer size, and output programming rather
+   than reporting `V4L2_EVENT_SOURCE_CHANGE` and waiting for userspace to stop,
+   renegotiate, and reallocate buffers. An FPS-only change can update cached
+   state without sending a source-change event at all. In addition,
+   `handle_hwv2_path()` reads format/control state and programs registers
+   without the format state lock, racing ioctls and stream transitions.
+
+8. **Buffer timestamps describe the wrong completion point.** The queue
+   advertises monotonic EOF timestamps, but a completed frame inherits the
+   timestamp recorded for its first half. That timestamp is roughly half a
+   frame early and is neither a frame-start nor frame-end timestamp. For EOF
+   semantics, publication should use the second-half completion timestamp.
+
+9. **Sequence numbering excludes dropped complete frames.** The sequence
+   counter advances only when a queued VB2 buffer is delivered. If no buffer is
+   available when the first half arrives, a complete hardware frame is skipped
+   without advancing the counter. V4L2 sequence numbers must expose dropped or
+   repeated frames, so the driver needs a hardware-frame completion counter
+   independent of userspace buffer availability.
+
+10. **No-signal output is neither color-correct nor cadence-correct.** The
+    monitor produces at most one synthetic frame per approximately one-second
+    pass while stream parameters continue to advertise the normal 50/60 fps
+    cadence. Filling every YUYV byte with `0x10` also makes both chroma
+    components 16 instead of neutral 128. The driver should either report the
+    signal loss and stop frame delivery, or generate correctly encoded neutral
+    frames at a behavior and cadence that match its advertised API.
+
+11. **Capability metadata is incomplete.** `VIDIOC_QUERYCAP` does not populate
+    a PCIe `bus_info` value, making otherwise identical multi-card devices hard
+    for userspace to identify stably.
+
+#### Probe, power-management, and removal lifetime
+
+12. **Probe enables the core before all interrupt-facing resources exist.**
+    Core initialization occurs before scratch arenas, workqueues, the final IRQ
+    gate mask, and the installed handler. The later call described as starting
+    the permanent arenas is currently a no-op because its enable-state guard
+    returns early. This creates at least a sequencing/documentation error and
+    may create a pre-handler interrupt window. The device should remain
+    quiescent until all DMA targets, workers, locks, and IRQ handling are ready,
+    then be enabled once in an explicit final step.
+
+13. **Suspend hides quiesce failures.** The PM suspend path records video and
+    audio stop errors but returns success unconditionally. The system can then
+    enter a power transition even though queue ownership or DMA isolation was
+    not established. A failed quiesce must abort suspend or transition through
+    a proved device-wide isolation path.
+
+14. **Remove orders unregister before device-wide quiescence.** Video
+    unregister initiates channel-by-channel streaming teardown while the
+    existing stop path still relies on a device-global busy bit. One active
+    channel can therefore turn another channel's ordinary close into the
+    card-wide fatal path. Removal should first block new opens, perform one
+    coordinated device-wide stop/isolation, drain all workers, and only then
+    unregister and release the interfaces and DMA memory.
+
+15. **ALSA removal can wait indefinitely for open files.**
+    `hws_audio_unregister()` disconnects and then calls the synchronous
+    `snd_card_free()`, which waits for all users to close. A sysfs unbind or
+    physical hot-unplug with an open PCM/control descriptor can therefore block
+    removal. A deferred-free design must retain the PCI parent and driver state
+    until the final ALSA reference is gone. By contrast, the suspected analogous
+    V4L2 late-close use-after-free was ruled out: VB2 video unregister releases
+    the queue synchronously and the retained V4L2 parent reference protects the
+    containing state during close.
+
+#### Build quality, performance, and validation scope
+
+16. **The module Makefile suppresses compiler warnings with `-w`.** A
+    warning-enabled `W=1` build and GCC analyzer build otherwise completed, but
+    exposed a real format mismatch in the video diagnostics: a `size_t` split
+    value is passed to `%08x`. It should use `%zx` or an explicitly sized cast,
+    and warning suppression should be removed so ordinary kernel builds retain
+    diagnostic value. The Clang attempt was not a valid driver result because
+    the installed Arch kernel tree was configured with GCC-only flags.
+
+17. **Every video half performs both a full copy and a full comparison inside
+    the deadline.** The `memcpy()` followed by `memcmp()` doubles source-memory
+    read traffic for each half and consumes a substantial share of the 7.5 ms
+    safety window at 1080p60. The comparison is not a proof against a write that
+    lands after both reads. It should be treated as diagnostic instrumentation
+    unless a documented ordering contract makes it useful, and performance must
+    be measured without weakening fail-closed behavior.
+
+18. **The successful hardware matrix is still narrow.** The 20/20 E2E pass
+    proves the 8888:8504 card's channel-3 1080p60 path, including concurrent
+    HDMI audio, CPU load, rapid STREAMON/OFF, and forced-INTx video ambiguity.
+    It does not characterize four simultaneous channels, every accepted mode,
+    slower or real-time workloads, audio post-W1C ambiguity, independent stream
+    stop, suspend/resume, or active-handle removal. Deadline failures remain
+    safely fail-closed, but could still become false EIOs outside the measured
+    load.
+
+19. **Start/stop telemetry is too heavy for the final production path.** Audio
+    trigger emits information-level telemetry and reads several MMIO registers
+    on every start and stop. This was useful for diagnosis but can add latency
+    and log noise in an atomic-sensitive ALSA path. Keep detailed snapshots
+    behind a debug mechanism or rate limit them once the audio investigation is
+    complete.
+
+The review did not find a new obvious buffer overrun or use-after-free in the
+staged video/audio copy paths. The independent video workers are explicitly
+drained, and the audio staging, generation, toggle, cadence, and deadline logic
+is internally coherent for the tested path. Those positive results narrow the
+remaining work, but do not offset the ordering, lifecycle, and public-API
+blockers above.
+
+### 2026-08-30 DV-timing remediation
+
+The current working tree now corrects the DV-timing and source-state cluster
+identified in findings 4 through 7, 10, 11, and 16 above. These corrections
+build successfully but have not yet passed the hardware E2E matrix or
+`v4l2-compliance`, so their status is **implemented, hardware validation
+pending**.
+
+- The timing table uses complete kernel CEA-861 and DMT presets instead of
+  width/height-only records. The unsupported 1080x1920 portrait entry was
+  removed, and capability bounds now include the actual minimum/maximum pixel
+  clocks and standards derived from the retained table.
+- Live detection samples signal/interlace state and input resolution on both
+  sides of the frame-rate read. No signal returns `-ENOLINK`, a changing or
+  incomplete sample returns `-ENOLCK`, and a stable timing absent from the
+  exact width/height/interlace/rate table returns `-ERANGE` with the partial
+  detected geometry preserved. The old width/height-only refresh fallback is
+  gone.
+- `VIDIOC_QUERY_DV_TIMINGS` now reports detector state without changing driver
+  configuration. `VIDIOC_G_DV_TIMINGS` returns only the configured timing,
+  `VIDIOC_ENUM_DV_TIMINGS` always enumerates the full supported list, and
+  `VIDIOC_S_DV_TIMINGS` accepts canonical complete modes, updates the default
+  capture layout, and rejects a timing change while VB2 buffers exist.
+- STREAMON requires the configured and detected timings to match exactly. It
+  no longer changes `pix.interlaced` from a raw live bit or silently accepts a
+  different refresh rate.
+- The monitor keeps detected state separate from configured DV timing and
+  pixel layout. Signal appearance/loss, lock-state changes, resolution changes,
+  and FPS-only changes produce `V4L2_EVENT_SOURCE_CHANGE`. If streaming, the
+  monitor disables that channel's producer, synchronizes its IRQ, drains its
+  worker, and fails dequeues so userspace can STREAMOFF, query, set, free, and
+  reallocate. It no longer resizes buffers, rewrites configured timing, or
+  restarts DMA behind userspace's back.
+- Synthetic one-frame-per-monitor-pass no-signal delivery was removed. A lost
+  signal now follows the source-change/error path instead of advertising 50/60
+  fps while returning incorrectly encoded `0x10`-filled frames.
+- Monitor output/control programming now holds the per-channel state mutex.
+  `VIDIOC_QUERYCAP` reports `PCI:<BDF>` in `bus_info`.
+- The measured BT.601/full-range colorimetry correction was restored for both
+  public format negotiation and internal pixel state, including timing-driven
+  format changes.
+- The module Makefile no longer suppresses all compiler warnings with `-w`.
+  The hidden `size_t` diagnostic format mismatch was corrected. A clean `W=1`
+  build and a `W=1 KCFLAGS=-fanalyzer` build both completed against Arch kernel
+  `7.1.9-arch1-2`.
+- `hws_v20_e2e_test.sh` now verifies multi-entry timing enumeration, bounded
+  timing capabilities, independence of configured and detected timing state,
+  no-signal query rejection, and PCI `bus_info`, then restores the live timing
+  before the existing capture tests.
+
+The retained timing list still represents inherited claimed support rather
+than complete per-mode hardware characterization. The next run must prove the
+live 1080p60 path, the no-signal nodes, and at least one deliberate source mode
+change. Every retained table entry must eventually be exercised or removed;
+interlaced input remains deliberately unsupported and should return
+`-ERANGE` rather than changing the capture layout.
+
+### Required evidence after correction
+
+The next hardware gate must stop video and audio independently while other
+channels remain active, rather than stopping the only live streams together.
+It must also exercise every retained PCI ID or prove that unsupported IDs have
+been removed, characterize the audio write boundary with guards, force an audio
+post-W1C ambiguity, and test every accepted progressive mode. It must explicitly
+reject or validate interlaced input; test no-link, unsupported-refresh, and
+source-change DV-timings behavior; verify EOF timestamps and dropped-frame
+sequence numbers; force the bounded startup-resync branch; and cover
+suspend/resume plus active-stream unbind/remove with open video and ALSA file
+descriptors. Multi-channel load and ordering tests must be run with Relaxed
+Ordering disabled unless an endpoint contract proves it safe. Passing the
+existing channel-3 matrix remains a required regression test, not a substitute
+for these cases.
 
 ## Submission and review status
 
@@ -390,23 +739,26 @@ channel, with CPU assembly into queued VB2 buffers:
    the successor branch has the guarded fixed native half-ring, CPU two-half
    assembly, and extended startup synchronization. The bounded resync branch
    and broader channel/mode matrix remain to be forced.
-4. Implemented, awaiting hardware proof: explicit W1C ambiguity, phase,
-   generation, copy-deadline, copy verification, and fail-closed handling.
-5. Implemented, awaiting hardware proof: stable per-channel audio packet
-   staging, cadence priming, monotonic completion generations, and post-copy
-   toggle/generation/deadline validation before ALSA publication.
-6. Implemented, awaiting hardware proof: the YUYV API and DMA assembly layout
-   are strictly packed, with padded stride requests normalized away and
-   fail-closed invariant checks before buffer use or capture start.
-7. Validate every supported channel and mode, concurrent audio/video,
-   STREAMOFF, suspend/resume, active-stream unbind/remove, delayed copies, DMA
-   idle, and allocation guards.
-8. Port by patch subject and order to a fresh Linux branch based on current
+4. Implemented and targeted hardware-proved: explicit W1C ambiguity, phase,
+   generation, copy-deadline, copy verification, and fail-closed handling. The
+   bounded startup-resync branch still needs a forced test.
+5. Implemented and hardware-proved for channel 3: stable audio staging,
+   cadence priming, completion generations, and post-copy
+   toggle/generation/deadline validation with a live HDMI tone.
+6. Implemented and negotiation-tested: strictly packed YUYV and padded-stride
+   normalization. Even-width and minimum streamable-size normalization remain
+   to be added.
+7. Resolve the code-value blockers above, beginning with independent
+   per-stream stop semantics and a guarded, characterized audio DMA extent.
+8. Validate every retained channel and mode, independent and concurrent
+   audio/video stop, suspend/resume, active-stream unbind/remove, delayed
+   copies, DMA isolation, allocation guards, and the public DV-timings API.
+9. Port by patch subject and order to a fresh Linux branch based on current
    media-next. Generate the next revision, build each boundary, run checkpatch,
    apply the mailbox in isolation, and perform a send-email dry-run.
-9. Confirm upstream status of the device-information and colorimetry patches
+10. Confirm upstream status of the device-information and colorimetry patches
    before sending or duplicating them.
-10. Inventory untracked test artifacts before cleanup; retain reproducers with
+11. Inventory untracked test artifacts before cleanup; retain reproducers with
    the exact branch, commit, mode, channel, and expected result documented.
 
 ## History API operational note

@@ -40,12 +40,28 @@ struct hws_pix_state {
 	u32 sizeimage;		/* full frame */
 	enum v4l2_field field;	/* V4L2_FIELD_NONE or INTERLACED */
 	enum v4l2_colorspace colorspace;	/* e.g., REC709 */
-	enum v4l2_ycbcr_encoding ycbcr_enc;	/* V4L2_YCBCR_ENC_DEFAULT */
-	enum v4l2_quantization quantization;	/* V4L2_QUANTIZATION_LIM_RANGE */
+	enum v4l2_ycbcr_encoding ycbcr_enc;	/* V4L2_YCBCR_ENC_601 */
+	enum v4l2_quantization quantization;	/* V4L2_QUANTIZATION_FULL_RANGE */
 	enum v4l2_xfer_func xfer_func;	/* V4L2_XFER_FUNC_DEFAULT */
 	bool interlaced;	/* cached hardware state */
 	u32 half_size;		/* hardware half-frame size */
 };
+
+static inline void hws_set_pix_colorimetry(struct hws_pix_state *pix)
+{
+	bool sd = pix->height <= 576;
+
+	/*
+	 * Measurements show BT.601 Y'CbCr coefficients and full range at both
+	 * SD and HD. Keep resolution-derived primaries/transfer metadata, but
+	 * explicitly describe the matrix used for the captured YUYV samples.
+	 */
+	pix->colorspace = sd ? V4L2_COLORSPACE_SMPTE170M :
+				 V4L2_COLORSPACE_REC709;
+	pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+	pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+}
 
 static inline u32 hws_yuyv_packed_stride(u32 width)
 {
@@ -149,8 +165,12 @@ struct hws_video {
 
 	/* Capture queue status */
 	struct hws_pix_state pix;
-	struct v4l2_dv_timings cur_dv_timings; /* last configured/notified DV timings */
-	u32 current_fps; /* Hz, updated by mode changes, not by read-only queries */
+	struct v4l2_dv_timings cur_dv_timings; /* configured DV timings */
+	struct v4l2_dv_timings detected_dv_timings;
+	int detected_dv_status;
+	u32 detected_fps;
+	bool source_state_initialized;
+	u32 current_fps; /* configured/active rate used by the completion deadline */
 
 	/* Per-channel capture state */
 	bool cap_active;
@@ -211,23 +231,6 @@ enum hws_audio_xrun_reason {
 	HWS_AUDIO_XRUN_STAGING_MISSING,
 	HWS_AUDIO_XRUN_WORKQUEUE_MISSING,
 };
-
-static inline void hws_set_current_dv_timings(struct hws_video *vid,
-					      u32 width, u32 height,
-					      bool interlaced)
-{
-	if (!vid)
-		return;
-
-	vid->cur_dv_timings = (struct v4l2_dv_timings) {
-		.type = V4L2_DV_BT_656_1120,
-		.bt = {
-			.width = width,
-			.height = height,
-			.interlaced = interlaced,
-		},
-	};
-}
 
 struct hws_audio {
 	/* linkage */

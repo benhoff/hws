@@ -828,6 +828,118 @@ test_packed_yuyv() {
 	fi
 }
 
+dv_timing_signature() {
+	awk -F: '/Active width|Active height|Pixelclock/ {
+		gsub(/^[[:space:]]+/, "", $2)
+		split($2, value, /[[:space:]]+/)
+		printf "%s/", value[1]
+	}' "$1"
+}
+
+test_dv_timing_api() {
+	local list_log="$OUTPUT_DIR/dv-list.log"
+	local cap_log="$OUTPUT_DIR/dv-cap.log"
+	local query_log="$OUTPUT_DIR/dv-query.log"
+	local query_after_log="$OUTPUT_DIR/dv-query-after-set.log"
+	local get_log="$OUTPUT_DIR/dv-get.log"
+	local info_log="$OUTPUT_DIR/dv-info.log"
+	local no_signal_log="$OUTPUT_DIR/dv-no-signal.log"
+	local query_sig candidate_sig query_after_sig
+	local candidate_found=0 modes=0 no_signal_tested=0
+	local node idx
+
+	if timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --list-dv-timings \
+		>"$list_log" 2>&1; then
+		modes=$(grep -Ec '^[[:space:]]*Index[[:space:]]*:' "$list_log" || true)
+		if ((modes > 1)); then
+			pass "DV enumeration returned the full supported list ($modes modes)"
+		else
+			fail "DV enumeration returned only $modes mode(s)"
+		fi
+	else
+		fail "DV timing enumeration failed"
+	fi
+
+	if timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --get-dv-timings-cap \
+		>"$cap_log" 2>&1 && grep -q 'Pixelclock' "$cap_log"; then
+		pass "DV capabilities include bounded pixel-clock metadata"
+	else
+		fail "DV timing capabilities were incomplete"
+	fi
+
+	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --query-dv-timings \
+		>"$query_log" 2>&1; then
+		fail "QUERY_DV_TIMINGS failed on the live input"
+		return
+	fi
+	query_sig=$(dv_timing_signature "$query_log")
+	if [[ -z "$query_sig" ]]; then
+		fail "could not parse detected DV timings"
+		return
+	fi
+
+	for idx in 0 1; do
+		if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
+			--set-dv-bt-timings="index=$idx" \
+			>"$OUTPUT_DIR/dv-set-index-$idx.log" 2>&1; then
+			continue
+		fi
+		if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --get-dv-timings \
+			>"$get_log" 2>&1; then
+			continue
+		fi
+		candidate_sig=$(dv_timing_signature "$get_log")
+		if [[ -n "$candidate_sig" && "$candidate_sig" != "$query_sig" ]]; then
+			candidate_found=1
+			break
+		fi
+	done
+
+	if ((candidate_found)) &&
+		timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --query-dv-timings \
+			>"$query_after_log" 2>&1; then
+		query_after_sig=$(dv_timing_signature "$query_after_log")
+		if [[ "$query_after_sig" == "$query_sig" ]]; then
+			pass "configured and detected DV timing state remained independent"
+		else
+			fail "QUERY_DV_TIMINGS changed after configuring a different mode"
+		fi
+	else
+		fail "could not exercise independent configured/detected DV state"
+	fi
+
+	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
+		--set-dv-bt-timings=query \
+		>"$OUTPUT_DIR/dv-restore-live.log" 2>&1; then
+		fail "could not restore the detected DV timing after API checks"
+		return
+	fi
+
+	if timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --info >"$info_log" 2>&1 &&
+		grep -Eq 'Bus info[[:space:]]*:[[:space:]]*PCI:' "$info_log"; then
+		pass "QUERYCAP reports stable PCI bus_info"
+	else
+		fail "QUERYCAP did not report PCI bus_info"
+	fi
+
+	for node in "${VIDEO_NODES[@]}"; do
+		if video_has_live_signal "$node"; then
+			continue
+		fi
+		no_signal_tested=1
+		if timeout 5s v4l2-ctl -d "$node" --query-dv-timings \
+			>"$no_signal_log" 2>&1; then
+			fail "QUERY_DV_TIMINGS succeeded without a signal on $node"
+		else
+			pass "QUERY_DV_TIMINGS rejected no-signal input on $node"
+		fi
+		break
+	done
+	if ((!no_signal_tested)); then
+		skip "no inactive video node was available for the ENOLINK check"
+	fi
+}
+
 start_cpu_stress() {
 	local workers=$CPU_WORKERS
 	local available worker
@@ -1276,11 +1388,12 @@ main() {
 	test_startup_and_normal_capture
 	finish_clean_phase normal-capture "startup and normal capture"
 
-	step "Verify packed YUYV and MMAP-only VB2 capture"
+	step "Verify DV timings, packed YUYV, and MMAP-only VB2 capture"
 	phase_begin
+	test_dv_timing_api
 	test_packed_yuyv
 	test_memory_model
-	finish_clean_phase memory-model "packed format and memory-model checks"
+	finish_clean_phase memory-model "DV timing, packed format, and memory-model checks"
 
 	step "Exercise copy deadlines under CPU contention"
 	phase_begin

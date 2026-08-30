@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include <linux/io.h>
 #include <linux/math64.h>
+#include <linux/v4l2-dv-timings.h>
 
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-dev.h>
@@ -23,207 +24,65 @@ struct hws_dv_mode {
 };
 
 static const struct hws_dv_mode *
-hws_find_dv_by_wh(u32 w, u32 h, bool interlaced);
-static const struct hws_dv_mode *
 hws_find_dv_by_wh_fps(u32 w, u32 h, bool interlaced, u32 fps);
-static u32 hws_get_live_fps(struct hws_video *vid);
 static u32 hws_input_status(struct hws_video *vid);
-static int hws_fill_dv_timings(u32 w, u32 h, bool interlace, u32 fps,
-			       struct v4l2_dv_timings *timings);
 
 static const struct hws_dv_mode hws_dv_modes[] = {
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1920,
-				.height = 1080,
-				.hfrontporch = 88,
-				.hsync = 44,
-				.hbackporch = 148,
-				.vfrontporch = 4,
-				.vsync = 5,
-				.vbackporch = 36,
-				.pixelclock = 148500000,
-				.polarities = V4L2_DV_VSYNC_POS_POL |
-					      V4L2_DV_HSYNC_POS_POL,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_CEA_1920X1080P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1920,
-				.height = 1080,
-				.hfrontporch = 88,
-				.hsync = 44,
-				.hbackporch = 148,
-				.vfrontporch = 4,
-				.vsync = 5,
-				.vbackporch = 36,
-				.pixelclock = 74250000,
-				.polarities = V4L2_DV_VSYNC_POS_POL |
-					      V4L2_DV_HSYNC_POS_POL,
-				.interlaced = 0,
-			},
-		},
-		30,
+		.timings = V4L2_DV_BT_CEA_1920X1080P30,
+		.refresh_hz = 30,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1280,
-				.height = 720,
-				.hfrontporch = 110,
-				.hsync = 40,
-				.hbackporch = 220,
-				.vfrontporch = 5,
-				.vsync = 5,
-				.vbackporch = 20,
-				.pixelclock = 74250000,
-				.polarities = V4L2_DV_VSYNC_POS_POL |
-					      V4L2_DV_HSYNC_POS_POL,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_CEA_1280X720P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 720,
-				.height = 480,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_CEA_720X480P59_94,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 720,
-				.height = 576,
-				.interlaced = 0,
-			},
-		},
-		50,
+		.timings = V4L2_DV_BT_CEA_720X576P50,
+		.refresh_hz = 50,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 800,
-				.height = 600,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_800X600P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 640,
-				.height = 480,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_640X480P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1024,
-				.height = 768,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_1024X768P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1280,
-				.height = 768,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_1280X768P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1280,
-				.height = 800,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_1280X800P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1280,
-				.height = 1024,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_1280X1024P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1360,
-				.height = 768,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_1360X768P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1440,
-				.height = 900,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_1440X900P60,
+		.refresh_hz = 60,
 	},
 	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1680,
-				.height = 1050,
-				.interlaced = 0,
-			},
-		},
-		60,
-	},
-	/* Portrait */
-	{
-		{
-			.type = V4L2_DV_BT_656_1120,
-			.bt = {
-				.width = 1080,
-				.height = 1920,
-				.interlaced = 0,
-			},
-		},
-		60,
+		.timings = V4L2_DV_BT_DMT_1680X1050P60,
+		.refresh_hz = 60,
 	},
 };
 
@@ -245,54 +104,19 @@ static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,
 	(void)readl(hws->bar0_base + HWS_REG_BCHS(ch)); /* post write */
 }
 
-/* Helper: find a supported DV mode by W/H + interlace flag */
+/* S_DV_TIMINGS accepts only complete timings returned by our enumeration. */
 static const struct hws_dv_mode *
 hws_match_supported_dv(const struct v4l2_dv_timings *req)
 {
-	const struct v4l2_bt_timings *bt;
-	u32 fps;
+	size_t i;
 
 	if (!req || req->type != V4L2_DV_BT_656_1120)
 		return NULL;
 
-	bt = &req->bt;
-	fps = 0;
-	if (bt->pixelclock) {
-		u32 total_w = bt->width + bt->hfrontporch + bt->hsync +
-			      bt->hbackporch;
-		u32 total_h = bt->height + bt->vfrontporch + bt->vsync +
-			      bt->vbackporch;
-
-		if (total_w && total_h)
-			fps = DIV_ROUND_CLOSEST_ULL((u64)bt->pixelclock,
-						    (u64)total_w * total_h);
-	}
-	if (fps) {
-		const struct hws_dv_mode *exact =
-			hws_find_dv_by_wh_fps(bt->width, bt->height,
-					      !!bt->interlaced, fps);
-		if (exact)
-			return exact;
-	}
-	return hws_find_dv_by_wh(bt->width, bt->height, !!bt->interlaced);
-}
-
-/* Helper: find a supported DV mode by W/H + interlace flag */
-static const struct hws_dv_mode *
-hws_find_dv_by_wh(u32 w, u32 h, bool interlaced)
-{
-	size_t i;
-
 	for (i = 0; i < ARRAY_SIZE(hws_dv_modes); i++) {
-		const struct hws_dv_mode *t = &hws_dv_modes[i];
-		const struct v4l2_bt_timings *bt = &t->timings.bt;
-
-		if (t->timings.type != V4L2_DV_BT_656_1120)
-			continue;
-
-		if (bt->width == w && bt->height == h &&
-		    !!bt->interlaced == interlaced)
-			return t;
+		if (v4l2_match_dv_timings(req, &hws_dv_modes[i].timings,
+					  0, true))
+			return &hws_dv_modes[i];
 	}
 	return NULL;
 }
@@ -317,73 +141,87 @@ hws_find_dv_by_wh_fps(u32 w, u32 h, bool interlaced, u32 fps)
 	return NULL;
 }
 
-static bool hws_get_live_dv_geometry(struct hws_video *vid,
-				     u32 *w, u32 *h, bool *interlaced)
-{
-	struct hws_pcie_dev *pdx;
-	u32 reg;
-
-	if (!vid)
-		return false;
-
-	pdx = vid->parent;
-	if (!pdx || !pdx->bar0_base)
-		return false;
-
-	reg = readl(pdx->bar0_base + HWS_REG_IN_RES(vid->channel_index));
-	if (!reg || reg == 0xFFFFFFFF)
-		return false;
-
-	if (w)
-		*w = reg & 0xFFFF;
-	if (h)
-		*h = (reg >> 16) & 0xFFFF;
-	if (interlaced) {
-		reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
-		*interlaced = !!(reg & BIT(8 + vid->channel_index));
-	}
-	return true;
-}
-
-static u32 hws_get_live_fps(struct hws_video *vid)
-{
-	struct hws_pcie_dev *pdx;
-	u32 fps;
-
-	if (!vid)
-		return 0;
-
-	pdx = vid->parent;
-	if (!pdx || !pdx->bar0_base)
-		return 0;
-
-	fps = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(vid->channel_index));
-	if (!fps || fps == 0xFFFFFFFF || fps > 240)
-		return 0;
-
-	return fps;
-}
-
-static u32 hws_pick_fps_from_mode(u32 w, u32 h, bool interlaced)
-{
-	const struct hws_dv_mode *m = hws_find_dv_by_wh(w, h, interlaced);
-
-	if (m && m->refresh_hz)
-		return m->refresh_hz;
-	/* Fallback to a sane default */
-	return 60;
-}
-
-static int hws_fill_dv_timings(u32 w, u32 h, bool interlace, u32 fps,
-			       struct v4l2_dv_timings *timings)
+int hws_dv_timings_from_mode(u32 width, u32 height, bool interlaced, u32 fps,
+			     struct v4l2_dv_timings *timings)
 {
 	const struct hws_dv_mode *m;
 
-	m = fps ? hws_find_dv_by_wh_fps(w, h, interlace, fps) : NULL;
+	if (!timings)
+		return -EINVAL;
+
+	m = hws_find_dv_by_wh_fps(width, height, interlaced, fps);
 	if (!m)
-		m = hws_find_dv_by_wh(w, h, interlace);
-	if (!m)
+		return -EINVAL;
+
+	*timings = m->timings;
+	return 0;
+}
+
+int hws_detect_dv_timings(struct hws_video *vid,
+			  struct v4l2_dv_timings *timings, u32 *fps)
+{
+	struct hws_pcie_dev *pdx;
+	const struct hws_dv_mode *m;
+	u32 active0, active1, res0, res1, live_fps;
+	u32 channel_mask;
+	u32 width, height;
+	bool interlaced;
+
+	if (!timings)
+		return -EINVAL;
+
+	memset(timings, 0, sizeof(*timings));
+	if (fps)
+		*fps = 0;
+	if (!vid)
+		return -ENODEV;
+
+	pdx = vid->parent;
+	if (!pdx || !pdx->bar0_base ||
+	    vid->channel_index < 0 || vid->channel_index >= pdx->max_channels)
+		return -ENODEV;
+
+	channel_mask = BIT(vid->channel_index) |
+		       BIT(8 + vid->channel_index);
+	active0 = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+	if (active0 == U32_MAX)
+		return -ENODEV;
+	if (!(active0 & BIT(vid->channel_index)))
 		return -ENOLINK;
+
+	res0 = readl(pdx->bar0_base + HWS_REG_IN_RES(vid->channel_index));
+	live_fps = readl(pdx->bar0_base +
+			 HWS_REG_FRAME_RATE(vid->channel_index));
+	res1 = readl(pdx->bar0_base + HWS_REG_IN_RES(vid->channel_index));
+	active1 = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+	if (res0 == U32_MAX || res1 == U32_MAX || active1 == U32_MAX ||
+	    live_fps == U32_MAX)
+		return -ENODEV;
+	if (!(active1 & BIT(vid->channel_index)))
+		return -ENOLINK;
+
+	width = res1 & 0xffff;
+	height = res1 >> 16;
+	interlaced = !!(active1 & BIT(8 + vid->channel_index));
+	*timings = (struct v4l2_dv_timings) {
+		.type = V4L2_DV_BT_656_1120,
+		.bt = {
+			.width = width,
+			.height = height,
+			.interlaced = interlaced,
+		},
+	};
+	if (fps)
+		*fps = live_fps;
+
+	/* A mode transition between the paired samples is not a stable lock. */
+	if ((active0 & channel_mask) != (active1 & channel_mask) ||
+	    res0 != res1 || !width || !height || !live_fps || live_fps > 240)
+		return -ENOLCK;
+
+	m = hws_find_dv_by_wh_fps(width, height, interlaced, live_fps);
+	if (!m)
+		return -ERANGE;
 
 	*timings = m->timings;
 	return 0;
@@ -391,84 +229,41 @@ static int hws_fill_dv_timings(u32 w, u32 h, bool interlace, u32 fps,
 
 static u32 hws_input_status(struct hws_video *vid)
 {
-	struct hws_pcie_dev *pdx;
-	u32 reg;
+	struct v4l2_dv_timings timings;
+	int ret;
 
 	if (!vid)
 		return V4L2_IN_ST_NO_SIGNAL;
 
-	pdx = vid->parent;
-	if (!pdx || !pdx->bar0_base)
+	ret = hws_detect_dv_timings(vid, &timings, NULL);
+	if (ret == -ENOLCK)
+		return V4L2_IN_ST_NO_SYNC;
+	if (ret == -ENOLINK || ret == -ENODEV)
 		return V4L2_IN_ST_NO_SIGNAL;
-
-	reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
-	if (reg == 0xffffffff)
-		return V4L2_IN_ST_NO_SIGNAL;
-
-	return (reg & BIT(vid->channel_index)) ? 0 : V4L2_IN_ST_NO_SIGNAL;
+	return 0;
 }
 
-/* Query the *current detected* DV timings on the input.
- * If you have a real hardware detector, call it here; otherwise we
- * derive from the cached pix state and map to the closest supported DV mode.
- */
+/* QUERY reports only what the receiver detects and never changes state. */
 int hws_vidioc_query_dv_timings(struct file *file, void *fh,
 				struct v4l2_dv_timings *timings)
 {
 	struct hws_video *vid = video_drvdata(file);
-	u32 w, h;
-	u32 fps;
-	bool interlace;
 
 	if (!timings)
 		return -EINVAL;
 
-	w = vid->pix.width;
-	h = vid->pix.height;
-	interlace = vid->pix.interlaced;
-	hws_get_live_dv_geometry(vid, &w, &h, &interlace);
-	fps = hws_get_live_fps(vid);
-	if (!fps)
-		fps = vid->current_fps ? vid->current_fps :
-		      hws_pick_fps_from_mode(w, h, interlace);
-
-	return hws_fill_dv_timings(w, h, interlace, fps, timings);
+	return hws_detect_dv_timings(vid, timings, NULL);
 }
 
 /* Enumerate the Nth supported DV timings from our static table. */
 int hws_vidioc_enum_dv_timings(struct file *file, void *fh,
 			       struct v4l2_enum_dv_timings *edv)
 {
-	struct hws_video *vid = video_drvdata(file);
-	const struct hws_dv_mode *m;
-	u32 w, h;
-	u32 fps;
-	bool interlace;
-
 	if (!edv)
 		return -EINVAL;
 
 	if (edv->pad)
 		return -EINVAL;
-
-	w = 0;
-	h = 0;
-	interlace = false;
-	if (hws_get_live_dv_geometry(vid, &w, &h, &interlace)) {
-		fps = hws_get_live_fps(vid);
-		if (!fps)
-			fps = vid->current_fps ? vid->current_fps :
-			      hws_pick_fps_from_mode(w, h, interlace);
-		m = fps ? hws_find_dv_by_wh_fps(w, h, interlace, fps) : NULL;
-		if (!m)
-			m = hws_find_dv_by_wh(w, h, interlace);
-		if (m) {
-			if (edv->index)
-				return -EINVAL;
-			edv->timings = m->timings;
-			return 0;
-		}
-	}
 
 	if (edv->index >= hws_dv_modes_cnt)
 		return -EINVAL;
@@ -482,36 +277,12 @@ int hws_vidioc_g_dv_timings(struct file *file, void *fh,
 			    struct v4l2_dv_timings *timings)
 {
 	struct hws_video *vid = video_drvdata(file);
-	u32 w, h;
-	u32 fps;
-	bool interlace;
 
 	if (!timings)
 		return -EINVAL;
 
-	w = vid->pix.width;
-	h = vid->pix.height;
-	interlace = vid->pix.interlaced;
-	if (hws_get_live_dv_geometry(vid, &w, &h, &interlace)) {
-		fps = hws_get_live_fps(vid);
-		if (!fps)
-			fps = vid->current_fps ? vid->current_fps :
-			      hws_pick_fps_from_mode(w, h, interlace);
-		return hws_fill_dv_timings(w, h, interlace, fps, timings);
-	}
-
 	*timings = vid->cur_dv_timings;
 	return 0;
-}
-
-static inline void hws_set_colorimetry_state(struct hws_pix_state *p)
-{
-	bool sd = p->height <= 576;
-
-	p->colorspace   = sd ? V4L2_COLORSPACE_SMPTE170M : V4L2_COLORSPACE_REC709;
-	p->ycbcr_enc    = V4L2_YCBCR_ENC_DEFAULT;
-	p->quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	p->xfer_func    = V4L2_XFER_FUNC_DEFAULT;
 }
 
 /* Set DV timings: must match one of our supported modes.
@@ -524,14 +295,7 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	struct hws_video *vid = video_drvdata(file);
 	const struct hws_dv_mode *m;
 	const struct v4l2_bt_timings *bt;
-	u32 new_w, new_h;
-	bool interlaced;
-	int ret = 0;
-	unsigned long was_busy;
-	u32 live_w, live_h;
-	u32 live_fps;
-	bool live_interlaced;
-	bool live_present;
+	bool timing_changed;
 
 	if (!timings)
 		return -EINVAL;
@@ -542,58 +306,43 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 
 	bt = &m->timings.bt;
 	if (bt->interlaced)
-		return -EINVAL; /* only progressive modes are advertised */
-	new_w = bt->width;
-	new_h = bt->height;
-	interlaced = false;
+		return -EINVAL;
 
 	lockdep_assert_held(&vid->state_lock);
-	live_present = hws_get_live_dv_geometry(vid, &live_w, &live_h,
-						&live_interlaced);
+	timing_changed = !v4l2_match_dv_timings(&vid->cur_dv_timings,
+						&m->timings, 0, true);
 
-	/* If vb2 has active buffers and size would change, reject. */
-	was_busy = vb2_is_busy(&vid->buffer_queue);
-	if (was_busy &&
-	    (new_w != vid->pix.width || new_h != vid->pix.height ||
-	     interlaced != vid->pix.interlaced)) {
-		ret = -EBUSY;
-		return ret;
+	/* Timing changes also change the default capture format and its size. */
+	if (vb2_is_busy(&vid->buffer_queue)) {
+		if (timing_changed)
+			return -EBUSY;
+		*timings = m->timings;
+		return 0;
 	}
 
-	/* When a live input signal is present, the receiver owns the timing.
-	 * Allow setting the already-active timings so v4l2-compliance can
-	 * round-trip them, but reject attempts to retime the live source.
-	 */
-	if (live_present) {
-		live_fps = hws_get_live_fps(vid);
-		if (!live_fps)
-			live_fps = vid->current_fps ? vid->current_fps :
-					hws_pick_fps_from_mode(live_w, live_h,
-							       live_interlaced);
-		if (live_w == new_w && live_h == new_h &&
-		    live_interlaced == interlaced &&
-		    m->refresh_hz == live_fps)
-			return 0;
-		return -EBUSY;
-	}
-
-	/* Update software pixel state (and recalc sizes) */
-	vid->pix.width      = new_w;
-	vid->pix.height     = new_h;
-	vid->pix.field      = interlaced ? V4L2_FIELD_INTERLACED
-					 : V4L2_FIELD_NONE;
-	vid->pix.interlaced = interlaced;
+	vid->pix.width      = bt->width;
+	vid->pix.height     = bt->height;
+	vid->pix.field      = V4L2_FIELD_NONE;
+	vid->pix.interlaced = false;
 	vid->pix.fourcc     = V4L2_PIX_FMT_YUYV;
-
-	hws_set_colorimetry_state(&vid->pix);
+	hws_set_pix_colorimetry(&vid->pix);
 
 	/* Recompute stride, sizeimage, and half_size. */
-	vid->pix.bytesperline = hws_yuyv_packed_stride(new_w);
-	vid->pix.sizeimage = (u32)hws_yuyv_packed_size(new_w, new_h);
+	vid->pix.bytesperline = hws_yuyv_packed_stride(bt->width);
+	vid->pix.sizeimage = (u32)hws_yuyv_packed_size(bt->width, bt->height);
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->cur_dv_timings   = m->timings;
 	vid->current_fps      = m->refresh_hz;
-	return ret;
+	if (vid->parent && vid->parent->bar0_base &&
+	    !READ_ONCE(vid->parent->pci_lost)) {
+		writel((bt->height << 16) | bt->width,
+		       vid->parent->bar0_base +
+		       HWS_REG_OUT_RES(vid->channel_index));
+		(void)readl(vid->parent->bar0_base +
+			    HWS_REG_OUT_RES(vid->channel_index));
+	}
+	*timings = m->timings;
+	return 0;
 }
 
 /* Report DV timings capability: advertise BT.656/1120 with
@@ -604,9 +353,13 @@ int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 {
 	u32 min_w = ~0U, min_h = ~0U;
 	u32 max_w = 0,       max_h = 0;
+	u64 min_pixelclock = U64_MAX, max_pixelclock = 0;
+	u32 standards = 0;
 	size_t i, n = 0;
 
 	if (!cap)
+		return -EINVAL;
+	if (cap->pad)
 		return -EINVAL;
 
 	memset(cap, 0, sizeof(*cap));
@@ -627,6 +380,11 @@ int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 			max_w = bt->width;
 		if (bt->height > max_h)
 			max_h = bt->height;
+		if (bt->pixelclock < min_pixelclock)
+			min_pixelclock = bt->pixelclock;
+		if (bt->pixelclock > max_pixelclock)
+			max_pixelclock = bt->pixelclock;
+		standards |= bt->standards;
 	}
 
 	/* If the table was empty, fail gracefully. */
@@ -637,15 +395,13 @@ int hws_vidioc_dv_timings_cap(struct file *file, void *fh,
 	cap->bt.max_width  = max_w;
 	cap->bt.min_height = min_h;
 	cap->bt.max_height = max_h;
-
-	/* We support both CEA-861- and VESA-style modes in the list. */
-	cap->bt.standards =
-		V4L2_DV_BT_STD_CEA861 | V4L2_DV_BT_STD_DMT | V4L2_DV_BT_STD_CVT;
+	cap->bt.min_pixelclock = min_pixelclock;
+	cap->bt.max_pixelclock = max_pixelclock;
+	cap->bt.standards = standards;
 
 	/* Only progressive modes are advertised. */
 	cap->bt.capabilities = V4L2_DV_BT_CAP_PROGRESSIVE;
 
-	/* Leave pixelclock/porch limits unconstrained (0) for now. */
 	return 0;
 }
 
@@ -699,6 +455,9 @@ int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *c
 	strscpy(cap->driver, KBUILD_MODNAME, sizeof(cap->driver));
 	snprintf(cap->card, sizeof(cap->card),
 		 "AVMatrix HWS Capture %d", vi_index);
+	if (vid->parent && vid->parent->pdev)
+		snprintf(cap->bus_info, sizeof(cap->bus_info), "PCI:%s",
+			 pci_name(vid->parent->pdev));
 	return 0;
 }
 
@@ -733,7 +492,7 @@ static inline void hws_set_colorimetry_fmt(struct v4l2_pix_format *p)
 	bool sd = p->height <= 576;
 
 	p->colorspace   = sd ? V4L2_COLORSPACE_SMPTE170M : V4L2_COLORSPACE_REC709;
-	p->ycbcr_enc    = V4L2_YCBCR_ENC_DEFAULT;
+	p->ycbcr_enc    = V4L2_YCBCR_ENC_601;
 	p->quantization = V4L2_QUANTIZATION_FULL_RANGE;
 	p->xfer_func    = V4L2_XFER_FUNC_DEFAULT;
 }
@@ -823,12 +582,6 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 							vid->pix.height);
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->pix.interlaced   = false;
-	/* S_FMT negotiates buffer layout only. Keep detector-owned DV timing
-	 * state unchanged so a harmless restart cannot clobber the live FPS.
-	 */
-	/* Or:
-	 * hws_calc_sizeimage(vid, vid->pix.width, vid->pix.height, false);
-	 */
 
 	dev_dbg(&vid->parent->pdev->dev,
 		"s_fmt:   w=%u h=%u bpl=%u size=%u\n",
@@ -841,13 +594,13 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *param)
 {
 	struct hws_video *vid = video_drvdata(file);
+	struct v4l2_dv_timings detected;
 	u32 fps;
 
 	if (param->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	fps = hws_get_live_fps(vid);
-	if (!fps)
+	if (hws_detect_dv_timings(vid, &detected, &fps))
 		fps = vid->current_fps ? vid->current_fps : 60;
 
 	/* HDMI receivers report the detected frame period, they don't set it. */

@@ -5,7 +5,14 @@
 #include <media/v4l2-ctrls.h>
 #include <linux/fs.h>
 
+struct hws_video;
+
 extern const struct v4l2_ctrl_ops hws_ctrl_ops;
+
+int hws_dv_timings_from_mode(u32 width, u32 height, bool interlaced, u32 fps,
+			     struct v4l2_dv_timings *timings);
+int hws_detect_dv_timings(struct hws_video *vid,
+			  struct v4l2_dv_timings *timings, u32 *fps);
 
 int hws_vidioc_querycap(struct file *file, void *priv, struct v4l2_capability *cap);
 int hws_vidioc_enum_fmt_vid_cap(struct file *file, void *priv_fh, struct v4l2_fmtdesc *f);

@@ -13,7 +13,7 @@ EXTRA_CFLAGS += -I$(src)
 EXTRA_LDFLAGS += -S
 
 # -------- Extra compile flags for every obj in this makefile ----------
-ccflags-y += -fno-ipa-icf -w
+ccflags-y += -fno-ipa-icf
 ccflags-y += -I$(src)
 
 ifneq ($(KERNELRELEASE),)
@@ -26,10 +26,10 @@ all:
 	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) modules
 
 install:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules_install
+	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) modules_install
 
 clean:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) clean
+	$(MAKE) -C $(KERNELDIR) M=$(CURDIR) clean
 
 # --------------------------------------------------------------------
 # clang-tidy setup (optional)
