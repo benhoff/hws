@@ -234,7 +234,7 @@ static inline u32 hws_calc_bpl_yuyv(u32 w)     { return ALIGN(w * 2, 64); }
 static inline u32 hws_calc_size_yuyv(u32 w, u32 h) { return hws_calc_bpl_yuyv(w) * h; }
 static inline u32 hws_calc_half_size(u32 sizeimage)
 {
-	return sizeimage / 2;
+	return hws_video_native_split(sizeimage);
 }
 
 static inline void hws_hw_write_bchs(struct hws_pcie_dev *hws, unsigned int ch,

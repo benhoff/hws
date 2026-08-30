@@ -4,6 +4,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/string.h>
 
@@ -14,9 +15,14 @@
 #include "hws_audio.h"
 
 #define MAX_INT_LOOPS 100
+/* Characterized minimum reuse was 7,950 us at 1080p60. */
+#define HWS_VIDEO_COPY_DEADLINE_NS (7500ULL * NSEC_PER_USEC)
+#define HWS_VIDEO_REUSE_MARGIN_NS  (500ULL * NSEC_PER_USEC)
+#define HWS_VIDEO_SYNC_EVENTS 2
 
 struct hws_vdone_event {
 	u64 timestamp_ns;
+	u64 deadline_ns;
 	u64 generation;
 	u8 toggle;
 };
@@ -27,14 +33,104 @@ enum hws_vdone_record_result {
 	HWS_VDONE_OVERRUN,
 };
 
+enum hws_vdone_ambiguity {
+	HWS_VDONE_AMBIG_NONE,
+	HWS_VDONE_AMBIG_INFLIGHT,
+	HWS_VDONE_AMBIG_DUPLICATE,
+	HWS_VDONE_AMBIG_TIMESTAMP,
+	HWS_VDONE_AMBIG_CADENCE,
+};
+
+static u64 hws_video_phase_period_ns(const struct hws_video *v)
+{
+	u32 fps = READ_ONCE(v->current_fps);
+
+	if (!fps || fps > 240)
+		return 0;
+	return div_u64(NSEC_PER_SEC, (u64)fps * 2);
+}
+
+static u64 hws_video_copy_deadline_ns(const struct hws_video *v)
+{
+	u64 period_ns = hws_video_phase_period_ns(v);
+
+	if (!period_ns || period_ns <= HWS_VIDEO_REUSE_MARGIN_NS)
+		return 0;
+	/* Faster modes get a tighter limit than the characterized 7.5 ms. */
+	return min_t(u64, HWS_VIDEO_COPY_DEADLINE_NS,
+		     period_ns - HWS_VIDEO_REUSE_MARGIN_NS);
+}
+
+static bool hws_video_deadline_expired(u64 deadline_ns, u64 irq_ns,
+				       u64 now_ns)
+{
+	return !deadline_ns || !irq_ns || now_ns < irq_ns ||
+	       now_ns - irq_ns >= deadline_ns;
+}
+
+static bool hws_video_cadence_ambiguous(const struct hws_video *v,
+					u64 previous_ns, u64 current_ns)
+{
+	u64 period_ns = hws_video_phase_period_ns(v);
+	u64 interval_ns;
+
+	if (!period_ns || !previous_ns || current_ns <= previous_ns)
+		return true;
+	interval_ns = current_ns - previous_ns;
+	/* Match the diagnostic's 2/3-to-3/2 cadence acceptance window. */
+	return interval_ns > period_ns + period_ns / 2 ||
+	       interval_ns + interval_ns / 2 < period_ns;
+}
+
+static const char *
+hws_vdone_ambiguity_name(enum hws_vdone_ambiguity ambiguity)
+{
+	switch (ambiguity) {
+	case HWS_VDONE_AMBIG_INFLIGHT:
+		return "completion still pending";
+	case HWS_VDONE_AMBIG_DUPLICATE:
+		return "duplicate toggle after W1C coalescing";
+	case HWS_VDONE_AMBIG_TIMESTAMP:
+		return "non-monotonic completion timestamp";
+	case HWS_VDONE_AMBIG_CADENCE:
+		return "completion cadence outside half-period bounds";
+	case HWS_VDONE_AMBIG_NONE:
+	default:
+		return "none";
+	}
+}
+
 static void hws_irq_reset_completion_locked(struct hws_video *v)
 {
 	lockdep_assert_held(&v->irq_lock);
 
 	v->completion_state = HWS_VIDEO_COMPLETION_IDLE;
 	v->completion_timestamp_ns = 0;
+	v->completion_deadline_ns = 0;
 	v->completion_generation = 0;
 	v->completion_toggle = 0;
+}
+
+static void hws_irq_mark_failure_locked(struct hws_video *v, int ret)
+{
+	lockdep_assert_held(&v->irq_lock);
+
+	if (v->completion_state != HWS_VIDEO_COMPLETION_OVERRUN) {
+		v->completion_overruns++;
+		v->error_count++;
+	}
+	if (ret == -ETIME) {
+		v->deadline_misses++;
+		v->timeout_count++;
+	} else if (ret == -EILSEQ || ret == -EOVERFLOW) {
+		v->phase_errors++;
+	} else if (ret == -EBADMSG) {
+		v->copy_mismatches++;
+	} else if (ret == -EUCLEAN) {
+		v->guard_errors++;
+		WRITE_ONCE(v->ring_corrupt, true);
+	}
+	v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
 }
 
 static struct hwsvideo_buffer *
@@ -67,9 +163,16 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	size_t offset;
 	size_t length;
 	u8 completed_half = event->toggle ^ 1;
+	u8 toggle_after_copy;
+	u8 toggle_after_verify;
 	u8 live_toggle;
+	u64 verify_ns;
+	bool skip_copy = false;
 
 	*done = NULL;
+	if (hws_video_deadline_expired(event->deadline_ns, event->timestamp_ns,
+				       ktime_get_mono_fast_ns()))
+		return -ETIME;
 	ring = hws_video_ring_cpu(hws, ch);
 	if (!ring || !v->ring_split || v->ring_split >= v->pix.sizeimage ||
 	    v->ring_extent < v->pix.sizeimage)
@@ -80,34 +183,75 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	if (live_toggle != event->toggle)
 		return -EOVERFLOW;
 
-	/* Half 0 starts a frame; half 1 may finish only that same buffer. */
+	/* Establish steady-state cadence before accepting an assembly half. */
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
 	    v->completion_generation != event->generation) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		return -EOVERFLOW;
 	}
-	if (!completed_half) {
+	if (v->half_phase == HWS_VIDEO_PHASE_SYNC) {
+		if (v->phase_generation &&
+		    event->generation != v->phase_generation + 1) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			return -EILSEQ;
+		}
+		v->phase_generation = event->generation;
+		v->sync_events++;
+		if (v->sync_events >= HWS_VIDEO_SYNC_EVENTS)
+			v->half_phase = completed_half ?
+				HWS_VIDEO_PHASE_EXPECT_HALF0 :
+				HWS_VIDEO_PHASE_EXPECT_HALF1;
+		skip_copy = true;
+		buf = NULL;
+	} else if ((!completed_half &&
+		    v->half_phase != HWS_VIDEO_PHASE_EXPECT_HALF0) ||
+		   (completed_half &&
+		    v->half_phase != HWS_VIDEO_PHASE_EXPECT_HALF1) ||
+		   !v->phase_generation ||
+		   event->generation != v->phase_generation + 1) {
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return -EILSEQ;
+	} else if (!completed_half) {
 		if (v->active || v->frame_half0_valid) {
 			spin_unlock_irqrestore(&v->irq_lock, flags);
-			return -EOVERFLOW;
+			return -EILSEQ;
 		}
+		v->phase_generation = event->generation;
+		v->half_phase = HWS_VIDEO_PHASE_EXPECT_HALF1;
 		buf = hws_irq_take_queued_buffer_locked(v);
 		if (!buf) {
-			spin_unlock_irqrestore(&v->irq_lock, flags);
-			return 0;
+			v->frame_generation = 0;
+			v->frame_timestamp_ns = 0;
+			skip_copy = true;
+		} else {
+			v->active = buf;
+			v->frame_generation = event->generation;
+			v->frame_half0_valid = false;
+			v->frame_timestamp_ns = event->timestamp_ns;
 		}
-		v->active = buf;
-		v->frame_half0_valid = false;
-		v->frame_timestamp_ns = event->timestamp_ns;
 	} else {
-		if (!v->active || !v->frame_half0_valid) {
-			spin_unlock_irqrestore(&v->irq_lock, flags);
-			return 0;
+		v->phase_generation = event->generation;
+		v->half_phase = HWS_VIDEO_PHASE_EXPECT_HALF0;
+		if (!v->active) {
+			if (v->frame_half0_valid || v->frame_generation) {
+				spin_unlock_irqrestore(&v->irq_lock, flags);
+				return -EILSEQ;
+			}
+			skip_copy = true;
+			buf = NULL;
+		} else {
+			if (!v->frame_half0_valid || !v->frame_generation ||
+			    event->generation != v->frame_generation + 1) {
+				spin_unlock_irqrestore(&v->irq_lock, flags);
+				return -EILSEQ;
+			}
+			buf = v->active;
 		}
-		buf = v->active;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
+	if (skip_copy)
+		goto verify_phase;
 
 	vb2v = &buf->vb;
 	if (vb2_plane_size(&vb2v->vb2_buf, 0) < v->pix.sizeimage)
@@ -122,11 +266,33 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	dma_rmb();
 	memcpy((u8 *)dst + offset, (u8 *)ring + offset, length);
 	dma_rmb();
+	toggle_after_copy = readl_relaxed(hws->bar0_base +
+					  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	if (memcmp((u8 *)dst + offset, (u8 *)ring + offset, length))
+		return -EBADMSG;
+	verify_ns = ktime_get_mono_fast_ns();
+	toggle_after_verify = readl_relaxed(hws->bar0_base +
+					    HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	if (toggle_after_copy != event->toggle ||
+	    toggle_after_verify != event->toggle)
+		return -EOVERFLOW;
+	if (hws_video_deadline_expired(event->deadline_ns,
+				       event->timestamp_ns, verify_ns))
+		return -ETIME;
+
+verify_phase:
+	verify_ns = ktime_get_mono_fast_ns();
 	live_toggle = readl_relaxed(hws->bar0_base +
 				    HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-	if (live_toggle != event->toggle ||
-	    !hws_video_ring_guards_ok(hws, ch, v->ring_extent))
+	if (live_toggle != event->toggle)
 		return -EOVERFLOW;
+	if (hws_video_deadline_expired(event->deadline_ns,
+				       event->timestamp_ns, verify_ns))
+		return -ETIME;
+	if (!hws_video_ring_guards_ok(hws, ch, v->ring_extent))
+		return -EUCLEAN;
+	if (skip_copy)
+		return 0;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
@@ -136,11 +302,18 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		return -EOVERFLOW;
 	}
 	if (!completed_half) {
+		if (v->frame_generation != event->generation ||
+		    v->half_phase != HWS_VIDEO_PHASE_EXPECT_HALF1) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			return -EILSEQ;
+		}
 		v->frame_half0_valid = true;
 	} else {
-		if (!v->frame_half0_valid) {
+		if (!v->frame_half0_valid ||
+		    event->generation != v->frame_generation + 1 ||
+		    v->half_phase != HWS_VIDEO_PHASE_EXPECT_HALF0) {
 			spin_unlock_irqrestore(&v->irq_lock, flags);
-			return -EOVERFLOW;
+			return -EILSEQ;
 		}
 		/*
 		 * Keep the assembled buffer attached until the caller rechecks the
@@ -166,12 +339,18 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state == HWS_VIDEO_COMPLETION_OVERRUN) {
+		event.timestamp_ns = v->completion_timestamp_ns;
+		event.deadline_ns = v->completion_deadline_ns;
+		event.generation = v->completion_generation;
+		event.toggle = v->completion_toggle;
+		ret = -EOVERFLOW;
 		fail = true;
 	} else if (v->completion_state != HWS_VIDEO_COMPLETION_PENDING) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		return;
 	} else {
 		event.timestamp_ns = v->completion_timestamp_ns;
+		event.deadline_ns = v->completion_deadline_ns;
 		event.generation = v->completion_generation;
 		event.toggle = v->completion_toggle;
 		v->completion_state = HWS_VIDEO_COMPLETION_COPYING;
@@ -200,31 +379,37 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		   !READ_ONCE(v->cap_active)) {
 		hws_irq_reset_completion_locked(v);
 		abort = true;
-	} else if (ret ||
-		   v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
-		   v->completion_generation != event.generation) {
-		v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
-		v->completion_overruns++;
-		v->error_count++;
-		fail = true;
-	} else if (done &&
-		   (v->active != done || !v->frame_half0_valid)) {
-		v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
-		v->completion_overruns++;
-		v->error_count++;
-		fail = true;
 	} else {
-		if (done) {
+		if (!ret &&
+		    hws_video_deadline_expired(event.deadline_ns,
+					       event.timestamp_ns,
+					       ktime_get_mono_fast_ns()))
+			ret = -ETIME;
+		if (!ret &&
+		    (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
+		     v->completion_generation != event.generation))
+			ret = -EILSEQ;
+		if (!ret && done &&
+		    (v->active != done || !v->frame_half0_valid ||
+		     event.generation != v->frame_generation + 1))
+			ret = -EILSEQ;
+		if (ret) {
+			hws_irq_mark_failure_locked(v, ret);
+			fail = true;
+		} else if (done) {
 			v->active = NULL;
+			v->frame_generation = 0;
 			v->frame_half0_valid = false;
 			done->vb.vb2_buf.timestamp = v->frame_timestamp_ns;
+			v->frame_timestamp_ns = 0;
 			vb2_set_plane_payload(&done->vb.vb2_buf, 0,
 					      v->pix.sizeimage);
 			done->vb.field = v->pix.field;
 			done->vb.sequence =
 				(u32)atomic_fetch_inc(&v->sequence_number);
 		}
-		hws_irq_reset_completion_locked(v);
+		if (!fail)
+			hws_irq_reset_completion_locked(v);
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
@@ -243,11 +428,24 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	return;
 
 fail_queue:
-	dev_err_ratelimited(&hws->pdev->dev,
-			    "VDONE half-ring failure ch=%u generation=%llu toggle=%u ret=%d\n",
-			    ch, (unsigned long long)event.generation,
-			    event.toggle, ret);
-	hws_video_fail_queue(v, "VDONE half-ring phase, copy, or guard failure");
+	{
+		u64 now_ns = ktime_get_mono_fast_ns();
+		u64 elapsed_us = event.timestamp_ns && now_ns >= event.timestamp_ns ?
+			div_u64(now_ns - event.timestamp_ns, NSEC_PER_USEC) : 0;
+
+		dev_err_ratelimited(&hws->pdev->dev,
+			"VDONE half-ring failure ch=%u generation=%llu toggle=%u phase=%u elapsed=%lluus ret=%d ambiguity=%u phase_errors=%u deadlines=%u mismatches=%u guards=%u\n",
+			ch, (unsigned long long)event.generation,
+			event.toggle, READ_ONCE(v->half_phase),
+			(unsigned long long)elapsed_us, ret,
+			READ_ONCE(v->w1c_ambiguities),
+			READ_ONCE(v->phase_errors),
+			READ_ONCE(v->deadline_misses),
+			READ_ONCE(v->copy_mismatches),
+			READ_ONCE(v->guard_errors));
+	}
+	hws_video_fail_queue(v,
+		"ambiguous VDONE phase, generation, copy, guard, or deadline");
 }
 
 static void hws_irq_ack_status(struct hws_pcie_dev *pdx, u32 int_state)
@@ -278,7 +476,10 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 {
 	struct hws_video *v;
 	unsigned long flags;
+	enum hws_vdone_ambiguity ambiguity = HWS_VDONE_AMBIG_NONE;
 	enum hws_vdone_record_result result;
+	u64 generation = 0;
+	u64 previous_ns = 0;
 
 	if (!pdx || ch >= MAX_VID_CHANNELS)
 		return HWS_VDONE_IGNORED;
@@ -287,38 +488,55 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (!READ_ONCE(v->cap_active) || READ_ONCE(v->stop_requested)) {
 		result = HWS_VDONE_IGNORED;
-	} else if (v->completion_state != HWS_VIDEO_COMPLETION_IDLE ||
-		   (v->half_seen && toggle == v->last_buf_half_toggle)) {
-		/*
-		 * A pending/copying event means the source half may already be
-		 * reused. A duplicate toggle means sticky W1C status hid an even
-		 * number of capture phases. Neither case has a trustworthy frame.
-		 */
-		v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
-		v->completion_overruns++;
-		v->error_count++;
-		WRITE_ONCE(v->stop_requested, true);
-		WRITE_ONCE(v->cap_active, false);
-		result = HWS_VDONE_OVERRUN;
 	} else {
 		v->next_completion_generation++;
 		if (!v->next_completion_generation)
 			v->next_completion_generation++;
+		generation = v->next_completion_generation;
+		previous_ns = v->last_vdone_timestamp_ns;
+
+		if (v->completion_state != HWS_VIDEO_COMPLETION_IDLE)
+			ambiguity = HWS_VDONE_AMBIG_INFLIGHT;
+		else if (v->half_seen && timestamp_ns <= previous_ns)
+			ambiguity = HWS_VDONE_AMBIG_TIMESTAMP;
+		else if (v->half_seen &&
+			 toggle == v->last_buf_half_toggle)
+			ambiguity = HWS_VDONE_AMBIG_DUPLICATE;
+		else if (v->half_seen &&
+			 hws_video_cadence_ambiguous(v, previous_ns,
+						     timestamp_ns))
+			ambiguity = HWS_VDONE_AMBIG_CADENCE;
+
 		v->completion_timestamp_ns = timestamp_ns;
-		v->completion_generation = v->next_completion_generation;
+		v->completion_deadline_ns = hws_video_copy_deadline_ns(v);
+		v->completion_generation = generation;
 		v->completion_toggle = toggle;
-		v->completion_state = HWS_VIDEO_COMPLETION_PENDING;
-		WRITE_ONCE(v->last_buf_half_toggle, toggle);
-		WRITE_ONCE(v->half_seen, true);
-		result = HWS_VDONE_QUEUED;
+		if (ambiguity != HWS_VDONE_AMBIG_NONE) {
+			hws_irq_mark_failure_locked(v, -EOVERFLOW);
+			v->w1c_ambiguities++;
+			WRITE_ONCE(v->stop_requested, true);
+			WRITE_ONCE(v->cap_active, false);
+			result = HWS_VDONE_OVERRUN;
+		} else {
+			v->completion_state = HWS_VIDEO_COMPLETION_PENDING;
+			WRITE_ONCE(v->last_buf_half_toggle, toggle);
+			WRITE_ONCE(v->half_seen, true);
+			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
+			result = HWS_VDONE_QUEUED;
+		}
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	if (result == HWS_VDONE_OVERRUN) {
+		u64 interval_us = timestamp_ns > previous_ns ?
+			div_u64(timestamp_ns - previous_ns, NSEC_PER_USEC) : 0;
+
 		hws_enable_video_capture(pdx, ch, false);
 		dev_err_ratelimited(&pdx->pdev->dev,
-				    "VDONE overrun ch=%u: pending copy or duplicate half-ring toggle\n",
-				    ch);
+				    "VDONE ambiguity ch=%u generation=%llu toggle=%u interval=%lluus: %s\n",
+				    ch, (unsigned long long)generation, toggle,
+				    (unsigned long long)interval_us,
+				    hws_vdone_ambiguity_name(ambiguity));
 	}
 	if (result != HWS_VDONE_IGNORED)
 		hws_irq_queue_vdone_work(pdx, ch);
@@ -439,7 +657,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 			int_state);
 		return IRQ_NONE;
 	}
-	timestamp_ns = ktime_get_ns();
+	timestamp_ns = ktime_get_mono_fast_ns();
 	dev_dbg(&pdx->pdev->dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
 
 	wake_thread = hws_irq_queue_video(pdx, int_state, timestamp_ns);

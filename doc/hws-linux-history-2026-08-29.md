@@ -225,6 +225,7 @@ On 2026-08-29, the production successor work on
 with a permanent private native half-ring per channel. The implementation is
 source-complete for this architectural step and passes software checks, but no
 v20 module has yet been loaded or exercised on the capture hardware.
+The fixed-ring architectural step is preserved as commit `f265440`.
 
 The implemented invariants are:
 
@@ -241,23 +242,36 @@ The implemented invariants are:
   before VCAP is enabled. The programming helper rejects any live retargeting.
 - Video DMA always targets the permanent ring. VB2 buffers are CPU-mapped MMAP
   buffers and their addresses are never written to the video DMA registers.
-- The hard IRQ records toggle, timestamp, and generation only. The threaded
-  handler treats `toggle ^ 1` as the completed half, checks the live toggle
-  before and after each copy, assembles half 0 and half 1 into one VB2 buffer,
-  and detaches that buffer only after the event state is revalidated.
+- The hard IRQ records toggle, monotonic timestamp, and a nonzero generation.
+  A pending/copying event, duplicate toggle, non-monotonic timestamp, or event
+  interval outside two-thirds through three-halves of the expected native-half
+  period is classified as W1C completion ambiguity and stops capture.
+- The first two boundaries after every start or recovery are synchronization
+  events and are never copied. Steady-state processing explicitly expects half
+  0 and half 1 in order and requires consecutive event and frame generations.
+- The threaded handler treats `toggle ^ 1` as the completed half, checks the
+  live toggle before, during, and after each copy, compares the destination
+  with the stable source, and assembles half 0 and half 1 into one VB2 buffer.
+  It detaches that buffer only after a final state, generation, and deadline
+  check under the IRQ lock.
+- The characterized IRQ-to-verified-copy limit is 7,500 us with 500 us reserved
+  before nominal source reuse. Faster modes automatically receive a tighter
+  deadline based on their half period.
 - An orphan half 1 is dropped. A missing destination at half 0 drops the whole
   frame. A pending copy, duplicate toggle, half-order mismatch, destination
   mapping/size error, or guard failure stops capture and fails the queue
   instead of delivering an ambiguous buffer.
 - STREAMOFF synchronizes the threaded IRQ, retains the permanent arena until
   teardown, and checks the active extent guard after the existing DMA-idle
-  barrier.
+  barrier. A persistent `dma_needs_idle` bit ensures an error path cannot avoid
+  that proof by clearing `cap_active` early. Guard corruption is sticky and
+  prevents a later STREAMON from reusing the channel arena.
 
 The module builds against Arch kernel `7.1.9-arch1-2`, `git diff --check` is
 clean, and Linux `checkpatch.pl` reports zero errors and zero warnings for the
-change. Still outstanding are the explicit 7,500 us copy-deadline gate,
-stronger W1C phase-ambiguity detection, and the complete hardware validation
-matrix. Until those pass, v20 is not submission-ready.
+change. The deadline, W1C ambiguity, phase, generation, and fail-closed step is
+now implemented and software-checked. The complete hardware validation matrix
+is still outstanding. Until it passes, v20 is not submission-ready.
 
 ## Validation matrix
 
@@ -273,8 +287,9 @@ matrix. Until those pass, v20 is not submission-ready.
 | Colorimetry | Passed for measured mode | Measurements support the metadata correction |
 | Native half-ring diagnostic | Passed for characterized scope | Strong channel 3/1080p60 diagnostic evidence; not generalized |
 | v20 fixed half-ring implementation | Software checks passed | Module build, whitespace, and checkpatch pass; hardware execution is pending |
+| v20 ambiguity/deadline gate | Software checks passed | Explicit sync, cadence, generation, copy verification, deadline, and fail-closed state are implemented; production hardware execution is pending |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
-| v20 submission readiness | Blocked | Deadline/ambiguity gate and full hardware validation remain |
+| v20 submission readiness | Blocked | Full hardware validation remains |
 
 ## Submission and review status
 
@@ -329,8 +344,8 @@ channel, with CPU assembly into queued VB2 buffers:
    `audio-upstream-v20-dma-safety` was created from its exact tip.
 3. Implemented, awaiting hardware proof: the successor branch has the guarded
    fixed native half-ring and CPU two-half assembly.
-4. Add explicit W1C ambiguity, phase, generation, copy-deadline, and fail-closed
-   handling.
+4. Implemented, awaiting hardware proof: explicit W1C ambiguity, phase,
+   generation, copy-deadline, copy verification, and fail-closed handling.
 5. Validate every supported channel and mode, concurrent audio/video,
    STREAMOFF, suspend/resume, active-stream unbind/remove, delayed copies, DMA
    idle, and allocation guards.

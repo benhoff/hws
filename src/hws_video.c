@@ -46,6 +46,7 @@ static int hws_program_video_ring_locked(struct hws_video *vid);
 static struct hwsvideo_buffer *
 hws_take_queued_buffer_locked(struct hws_video *vid);
 static void hws_video_reset_completion_locked(struct hws_video *vid);
+static void hws_video_reset_stream_phase_locked(struct hws_video *vid);
 
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
@@ -61,11 +62,6 @@ static bool dma_window_verify;
 module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
 MODULE_PARM_DESC(dma_window_verify,
 		 "Read back DMA window registers after programming (debug)");
-
-static size_t hws_video_native_split(size_t frame_size)
-{
-	return round_down(frame_size / 2, (size_t)SZ_2K);
-}
 
 static size_t hws_video_dma_extent(size_t frame_size)
 {
@@ -221,21 +217,27 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 		vb2_queue_error(&v->buffer_queue);
 		goto out_unlock;
 	}
+	WRITE_ONCE(v->dma_needs_idle, false);
 	extent = hws_video_dma_extent(v->pix.sizeimage);
 	if (v->ring_extent &&
 	    !hws_video_ring_guards_ok(hws, v->channel_index,
 				      v->ring_extent)) {
-		ret = -EOVERFLOW;
+		WRITE_ONCE(v->ring_corrupt, true);
+		v->guard_errors++;
+		ret = -EUCLEAN;
 		goto fail_queue;
 	}
 	ret = hws_video_ring_prepare(hws, v->channel_index, extent);
-	if (ret)
+	if (ret) {
+		if (ret == -EOVERFLOW) {
+			WRITE_ONCE(v->ring_corrupt, true);
+			v->guard_errors++;
+		}
 		goto fail_queue;
+	}
 
 	spin_lock_irqsave(&v->irq_lock, flags);
-	hws_video_reset_completion_locked(v);
-	WRITE_ONCE(v->half_seen, false);
-	v->frame_half0_valid = false;
+	hws_video_reset_stream_phase_locked(v);
 	if (v->active) {
 		buf = v->active;
 		v->active = NULL;
@@ -352,10 +354,15 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	atomic_set(&vid->sequence_number, 0);
 	vid->active = NULL;
 	vid->completion_timestamp_ns = 0;
+	vid->completion_deadline_ns = 0;
 	vid->completion_generation = 0;
 	vid->next_completion_generation = 0;
 	vid->completion_state = HWS_VIDEO_COMPLETION_IDLE;
 	vid->completion_toggle = 0;
+	vid->half_phase = HWS_VIDEO_PHASE_SYNC;
+	vid->sync_events = 0;
+	vid->phase_generation = 0;
+	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
 	vid->frame_timestamp_ns = 0;
 
@@ -363,6 +370,11 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->timeout_count = 0;
 	vid->error_count = 0;
 	vid->completion_overruns = 0;
+	vid->w1c_ambiguities = 0;
+	vid->phase_errors = 0;
+	vid->deadline_misses = 0;
+	vid->copy_mismatches = 0;
+	vid->guard_errors = 0;
 
 	vid->queued_count = 0;
 	vid->window_valid = false;
@@ -395,8 +407,11 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	/* capture state */
 	vid->cap_active = false;
 	vid->stop_requested = false;
+	vid->dma_needs_idle = false;
+	vid->ring_corrupt = false;
 	vid->last_buf_half_toggle = 0;
 	vid->half_seen = false;
+	vid->last_vdone_timestamp_ns = 0;
 	vid->signal_loss_cnt = 0;
 
 	/* Create BCHS + DV power-present as modern controls */
@@ -419,13 +434,31 @@ static void hws_video_reset_completion_locked(struct hws_video *vid)
 
 	vid->completion_state = HWS_VIDEO_COMPLETION_IDLE;
 	vid->completion_timestamp_ns = 0;
+	vid->completion_deadline_ns = 0;
 	vid->completion_generation = 0;
 	vid->completion_toggle = 0;
 }
 
+static void hws_video_reset_stream_phase_locked(struct hws_video *vid)
+{
+	lockdep_assert_held(&vid->irq_lock);
+
+	hws_video_reset_completion_locked(vid);
+	vid->next_completion_generation = 0;
+	vid->half_phase = HWS_VIDEO_PHASE_SYNC;
+	vid->sync_events = 0;
+	vid->phase_generation = 0;
+	vid->frame_generation = 0;
+	vid->frame_half0_valid = false;
+	vid->frame_timestamp_ns = 0;
+	WRITE_ONCE(vid->last_buf_half_toggle, 0);
+	WRITE_ONCE(vid->half_seen, false);
+	WRITE_ONCE(vid->last_vdone_timestamp_ns, 0);
+}
+
 static void hws_video_drain_queue_locked(struct hws_video *vid)
 {
-	hws_video_reset_completion_locked(vid);
+	hws_video_reset_stream_phase_locked(vid);
 
 	/* Return in-flight first */
 	if (vid->active) {
@@ -485,7 +518,7 @@ static void hws_video_collect_done_locked(struct hws_video *vid,
 	}
 
 	vid->queued_count = 0;
-	hws_video_reset_completion_locked(vid);
+	hws_video_reset_stream_phase_locked(vid);
 }
 
 void hws_video_fail_queue(struct hws_video *vid, const char *reason)
@@ -516,14 +549,15 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 {
 	struct hws_video *vid;
 	unsigned long flags;
-	bool was_active;
+	bool needs_idle;
 	int ret;
 
 	if (!pdev || ch < 0 || ch >= pdev->max_channels)
 		return;
 
 	vid = &pdev->video[ch];
-	was_active = READ_ONCE(vid->cap_active);
+	needs_idle = READ_ONCE(vid->dma_needs_idle) ||
+		READ_ONCE(vid->cap_active);
 
 	/* 1) Stop HW best-effort for this channel */
 	hws_enable_video_capture(vid->parent, vid->channel_index, false);
@@ -536,7 +570,7 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	if (vid->parent && vid->parent->irq >= 0)
 		synchronize_irq(vid->parent->irq);
 	ret = 0;
-	if (was_active)
+	if (needs_idle)
 		ret = hws_wait_dma_idle(pdev, "video cleanup", ch);
 	if (ret) {
 		dev_crit(&pdev->pdev->dev,
@@ -544,6 +578,7 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 			 ch, ret);
 		return;
 	}
+	WRITE_ONCE(vid->dma_needs_idle, false);
 
 	/* 4) Drain SW capture queue & in-flight under lock */
 	spin_lock_irqsave(&vid->irq_lock, flags);
@@ -560,10 +595,12 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	mutex_destroy(&vid->state_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
 	vid->active = NULL;
+	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
 	vid->stop_requested = false;
 	vid->last_buf_half_toggle = 0;
 	vid->half_seen = false;
+	vid->last_vdone_timestamp_ns = 0;
 	vid->signal_loss_cnt = 0;
 }
 
@@ -618,6 +655,8 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	}
 	status = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	status = on ? (status | BIT(chan)) : (status & ~BIT(chan));
+	if (on)
+		WRITE_ONCE(hws->video[chan].dma_needs_idle, true);
 	writel(status, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	WRITE_ONCE(hws->video[chan].cap_active, on);
@@ -1011,6 +1050,15 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 		mutex_unlock(&v->state_lock);
 		return;
 	}
+	WRITE_ONCE(v->dma_needs_idle, false);
+	if (v->ring_extent &&
+	    !hws_video_ring_guards_ok(pdx, ch, v->ring_extent)) {
+		WRITE_ONCE(v->ring_corrupt, true);
+		v->guard_errors++;
+		vb2_queue_error(&v->buffer_queue);
+		mutex_unlock(&v->state_lock);
+		return;
+	}
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	hws_video_collect_done_locked(v, &done);
@@ -1239,8 +1287,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	unsigned long flags;
 	dma_addr_t ring_dma;
 	size_t extent;
+	u32 live_fps;
 	LIST_HEAD(queued);
 	bool scratch_acquired = false;
+	int idle_ret;
 	int ret;
 
 	dev_dbg(&hws->pdev->dev, "start_streaming: ch=%u count=%u\n",
@@ -1249,6 +1299,18 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = hws_check_card_status(hws);
 	if (ret)
 		goto fail_return_buffers;
+	if (READ_ONCE(v->dma_needs_idle)) {
+		ret = -EBUSY;
+		goto fail_return_buffers;
+	}
+	if (READ_ONCE(v->ring_corrupt)) {
+		ret = -EUCLEAN;
+		goto fail_return_buffers;
+	}
+	live_fps = readl(hws->bar0_base +
+			 HWS_REG_FRAME_RATE(v->channel_index));
+	if (live_fps && live_fps != U32_MAX && live_fps <= 240)
+		WRITE_ONCE(v->current_fps, live_fps);
 
 	ret = hws_alloc_channel_scratch(hws, v->channel_index);
 	if (ret)
@@ -1256,8 +1318,13 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	scratch_acquired = true;
 	extent = hws_video_dma_extent(v->pix.sizeimage);
 	ret = hws_video_ring_prepare(hws, v->channel_index, extent);
-	if (ret)
+	if (ret) {
+		if (ret == -EOVERFLOW) {
+			WRITE_ONCE(v->ring_corrupt, true);
+			v->guard_errors++;
+		}
 		goto fail_return_buffers;
+	}
 
 	(void)hws_read_active_state(hws, v->channel_index,
 				       &v->pix.interlaced);
@@ -1266,17 +1333,12 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	/* init per-stream state */
 	WRITE_ONCE(v->stop_requested, false);
 	WRITE_ONCE(v->cap_active, false);
-	WRITE_ONCE(v->half_seen, false);
-	WRITE_ONCE(v->last_buf_half_toggle, 0);
 	atomic_set(&v->sequence_number, 0);
 
 	/* Program the permanent ring once, before enabling VCAP. */
 	spin_lock_irqsave(&v->irq_lock, flags);
-	hws_video_reset_completion_locked(v);
+	hws_video_reset_stream_phase_locked(v);
 	v->active = NULL;
-	v->frame_half0_valid = false;
-	v->frame_timestamp_ns = 0;
-	v->next_completion_generation = 0;
 	ret = hws_program_video_ring_locked(v);
 	if (!ret) {
 		hws_ack_video_pending(hws, v->channel_index);
@@ -1293,6 +1355,17 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
+	if (ret && READ_ONCE(v->dma_needs_idle)) {
+		hws_enable_video_capture(hws, v->channel_index, false);
+		if (hws->irq >= 0)
+			synchronize_irq(hws->irq);
+		idle_ret = hws_wait_dma_idle(hws, "video STREAMON failure",
+					     v->channel_index);
+		if (idle_ret)
+			ret = idle_ret;
+		else
+			WRITE_ONCE(v->dma_needs_idle, false);
+	}
 	if (ret)
 		goto complete_return_buffers;
 
@@ -1328,6 +1401,11 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	unsigned int queued = 0;
 	unsigned int tracked = 0;
 	unsigned int seq = 0;
+	unsigned int ambiguity_count;
+	unsigned int deadline_count;
+	unsigned int phase_error_count;
+	enum hws_video_half_phase half_phase;
+	u64 phase_generation;
 	struct hwsvideo_buffer *b;
 	bool streaming = vb2_is_streaming(&v->buffer_queue);
 	bool cap_active;
@@ -1342,12 +1420,19 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	active = v->active;
 	tracked = v->queued_count;
 	seq = (u32)atomic_read(&v->sequence_number);
+	half_phase = v->half_phase;
+	phase_generation = v->phase_generation;
+	ambiguity_count = v->w1c_ambiguities;
+	phase_error_count = v->phase_errors;
+	deadline_count = v->deadline_misses;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	dev_dbg(&hws->pdev->dev,
-		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u\n",
+		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u phase=%u generation=%llu ambiguity=%u phase_errors=%u deadlines=%u\n",
 		action, phase, v->channel_index, streaming, cap_active,
-		stop_requested, active, queued, tracked, seq);
+		stop_requested, active, queued, tracked, seq, half_phase,
+		(unsigned long long)phase_generation, ambiguity_count,
+		phase_error_count, deadline_count);
 }
 
 static void hws_stop_streaming(struct vb2_queue *q)
@@ -1360,11 +1445,12 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	unsigned int done_cnt = 0;
 	u64 start_ns = ktime_get_mono_fast_ns();
 	bool guards_ok = true;
-	bool was_active;
+	bool needs_idle;
 	int ret;
 
 	hws_log_video_state(v, "streamoff", "begin");
-	was_active = READ_ONCE(v->cap_active);
+	needs_idle = READ_ONCE(v->dma_needs_idle) ||
+		READ_ONCE(v->cap_active);
 
 	/* 1) Quiesce SW/HW first */
 	lockdep_assert_held(&v->state_lock);
@@ -1377,7 +1463,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
 	ret = 0;
-	if (was_active)
+	if (needs_idle)
 		ret = hws_wait_dma_idle(hws, "video STREAMOFF",
 					v->channel_index);
 	if (ret) {
@@ -1387,10 +1473,13 @@ static void hws_stop_streaming(struct vb2_queue *q)
 			 v->channel_index, ret);
 		return;
 	}
+	WRITE_ONCE(v->dma_needs_idle, false);
 	if (v->ring_extent)
 		guards_ok = hws_video_ring_guards_ok(hws, v->channel_index,
 						     v->ring_extent);
 	if (!guards_ok) {
+		WRITE_ONCE(v->ring_corrupt, true);
+		v->guard_errors++;
 		vb2_queue_error(&v->buffer_queue);
 		dev_crit(&hws->pdev->dev,
 			 "video STREAMOFF ch=%u detected DMA guard corruption\n",
@@ -1601,7 +1690,16 @@ int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
 
 void hws_video_pm_resume(struct hws_pcie_dev *hws)
 {
-	/* Nothing mandatory to do here for vb2; userspace will STREAMON
-	 * again when ready.
-	 */
+	unsigned long flags;
+	unsigned int ch;
+
+	/* D3 transition proved global DMA idle; require fresh phase sync. */
+	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+		struct hws_video *vid = &hws->video[ch];
+
+		spin_lock_irqsave(&vid->irq_lock, flags);
+		hws_video_reset_stream_phase_locked(vid);
+		WRITE_ONCE(vid->dma_needs_idle, false);
+		spin_unlock_irqrestore(&vid->irq_lock, flags);
+	}
 }
