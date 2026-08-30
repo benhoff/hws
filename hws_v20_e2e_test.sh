@@ -22,6 +22,7 @@ FRAMES=120
 STRESS_FRAMES=240
 RAPID_LOOPS=40
 AUDIO_SECONDS=5
+AUDIO_SOURCE_PCM=
 CPU_WORKERS=auto
 
 MODULE_NAME=HwsCapture
@@ -44,6 +45,7 @@ TOTAL_STEPS=8
 SUMMARY_FILE=
 PRIMARY_DEVICE=
 PRIMARY_NAME=
+AUDIO_SOURCE_PID=
 
 declare -a VIDEO_NODES=()
 declare -a LIVE_VIDEO_NODES=()
@@ -78,6 +80,8 @@ Options:
   --stress-frames N        Frames captured under CPU load. Default: 240
   --rapid-loops N          Short STREAMON/OFF iterations. Default: 40
   --audio-seconds N        Concurrent ALSA capture duration. Default: 5
+  --audio-source-pcm PCM   Play a 48 kHz stereo test tone through PCM while
+                           validating embedded audio, for example hw:1,3
   --cpu-workers N          CPU load workers. Default: min(nproc, 8)
   --output-dir DIR         Evidence directory. Default: /tmp timestamp directory
   --enable-audio           Load the test module with enable_audio=Y
@@ -180,6 +184,10 @@ parse_args() {
 			AUDIO_SECONDS=${2:?missing value for --audio-seconds}
 			shift 2
 			;;
+		--audio-source-pcm)
+			AUDIO_SOURCE_PCM=${2:?missing value for --audio-source-pcm}
+			shift 2
+			;;
 		--cpu-workers)
 			CPU_WORKERS=${2:?missing value for --cpu-workers}
 			shift 2
@@ -241,6 +249,14 @@ validate_args() {
 		is_uint "$CPU_WORKERS" || die "--cpu-workers must be a positive integer"
 		((CPU_WORKERS > 0)) || die "--cpu-workers must be nonzero"
 	fi
+	if [[ -n "$AUDIO_SOURCE_PCM" ]]; then
+		[[ "$AUDIO_SOURCE_PCM" =~ ^hw:[0-9]+,[0-9]+$ ]] ||
+			die "--audio-source-pcm must use hw:CARD,DEVICE syntax"
+		((SKIP_AUDIO == 0)) ||
+			die "--audio-source-pcm cannot be combined with --skip-audio"
+		[[ "$AUDIO_PARAMETER_OVERRIDE" != N ]] ||
+			die "--audio-source-pcm cannot be combined with --disable-audio"
+	fi
 	if ((FAULT_INJECTION && SKIP_MODULE_RELOAD)); then
 		die "--fault-injection cannot be combined with --skip-module-reload; recovery must be tested"
 	fi
@@ -259,6 +275,7 @@ require_commands() {
 	if ((RUN)); then
 		commands+=(insmod rmmod udevadm fuser journalctl)
 		((SKIP_AUDIO)) || commands+=(arecord)
+		[[ -n "$AUDIO_SOURCE_PCM" ]] && commands+=(speaker-test)
 		((FAULT_INJECTION)) && commands+=(setpci)
 	fi
 	for command in "${commands[@]}"; do
@@ -555,6 +572,7 @@ cleanup() {
 	if ! restore_intx; then
 		exit_code=1
 	fi
+	stop_audio_source
 	stop_children
 	if ((RUN && MODULE_TOUCHED)); then
 		if [[ ! -d "/sys/module/$MODULE_NAME" ]]; then
@@ -872,6 +890,83 @@ run_audio_capture() {
 		-c 2 -d "$AUDIO_SECONDS" /dev/null >"$logfile" 2>&1
 }
 
+audio_source_paths() {
+	local spec=${AUDIO_SOURCE_PCM#hw:}
+	local card=${spec%%,*}
+	local device=${spec##*,}
+
+	printf '%s\n' "/dev/snd/pcmC${card}D${device}p"
+	printf '%s\n' "/proc/asound/card${card}/pcm${device}p/info"
+	printf '%s\n' "/proc/asound/card${card}/pcm${device}p/sub0/status"
+}
+
+start_audio_source() {
+	local spec=${AUDIO_SOURCE_PCM#hw:}
+	local card=${spec%%,*}
+	local node info status attempt rc eld
+	local -a paths=()
+
+	[[ -n "$AUDIO_SOURCE_PCM" ]] || return 0
+	mapfile -t paths < <(audio_source_paths)
+	node=${paths[0]}
+	info=${paths[1]}
+	status=${paths[2]}
+	[[ -c "$node" ]] || {
+		log "Audio source playback node is missing: $node"
+		return 1
+	}
+	[[ -r "$info" ]] && grep -qx 'stream: PLAYBACK' "$info" || {
+		log "Audio source is not a playback PCM: $AUDIO_SOURCE_PCM"
+		return 1
+	}
+	cp "$info" "$OUTPUT_DIR/audio-source-pcm-info.txt"
+	{
+		shopt -s nullglob
+		for eld in "/proc/asound/card${card}"/eld*; do
+			printf '[%s]\n' "$eld"
+			cat "$eld"
+		done
+		shopt -u nullglob
+	} >"$OUTPUT_DIR/audio-source-eld.txt"
+
+	log "Starting 48 kHz stereo HDMI tone on $AUDIO_SOURCE_PCM"
+	speaker-test -D "$AUDIO_SOURCE_PCM" -r 48000 -c 2 -F S16_LE \
+		-t sine -f 1000 -l 0 >"$OUTPUT_DIR/audio-source.log" 2>&1 &
+	AUDIO_SOURCE_PID=$!
+	for ((attempt = 0; attempt < 50; attempt++)); do
+		if ! kill -0 "$AUDIO_SOURCE_PID" 2>/dev/null; then
+			set +e
+			wait "$AUDIO_SOURCE_PID"
+			rc=$?
+			set -e
+			AUDIO_SOURCE_PID=
+			log "Audio source exited before reaching RUNNING (exit $rc)"
+			log "Audio source log: $OUTPUT_DIR/audio-source.log"
+			return 1
+		fi
+		if [[ -r "$status" ]] && grep -qx 'state: RUNNING' "$status"; then
+			cp "$status" "$OUTPUT_DIR/audio-source-running.txt"
+			return 0
+		fi
+		sleep 0.1
+	done
+	log "Audio source did not reach RUNNING (see $OUTPUT_DIR/audio-source.log)"
+	return 1
+}
+
+stop_audio_source() {
+	local rc
+
+	[[ -n "$AUDIO_SOURCE_PID" ]] || return 0
+	kill -TERM "$AUDIO_SOURCE_PID" 2>/dev/null || true
+	set +e
+	wait "$AUDIO_SOURCE_PID"
+	rc=$?
+	set -e
+	printf '%s\n' "$rc" >"$OUTPUT_DIR/audio-source-stop-rc.txt"
+	AUDIO_SOURCE_PID=
+}
+
 video_node_channel() {
 	local node=$1
 	local name
@@ -906,6 +1001,17 @@ test_concurrent_capture() {
 	local -a pids=()
 
 	discover_audio_pcms
+	if ((!SKIP_AUDIO)) && [[ -n "$AUDIO_SOURCE_PCM" ]]; then
+		if start_audio_source; then
+			pass "audio source $AUDIO_SOURCE_PCM reached RUNNING"
+		else
+			stop_audio_source
+			fail "could not establish a verified HDMI audio source on $AUDIO_SOURCE_PCM"
+			return
+		fi
+	elif ((!SKIP_AUDIO)); then
+		log "Audio source is externally managed and was not verified by the harness"
+	fi
 	for node in "${LIVE_VIDEO_NODES[@]}"; do
 		run_video_capture "$node" "$FRAMES" \
 			"$OUTPUT_DIR/concurrent-${node##*/}.log" &
@@ -946,6 +1052,7 @@ test_concurrent_capture() {
 	done
 	set -e
 	CHILD_PIDS=()
+	stop_audio_source
 	if ((failures == 0)); then
 		pass "concurrent capture completed (${#LIVE_VIDEO_NODES[@]} video, $audio_started audio)"
 	else
@@ -1059,6 +1166,7 @@ write_metadata() {
 		printf 'module_srcversion=%s\n' "$(modinfo -F srcversion "$MODULE_PATH")"
 		printf 'module_vermagic=%s\n' "$(modinfo -F vermagic "$MODULE_PATH")"
 		printf 'test_enable_audio=%s\n' "$TEST_AUDIO_PARAMETER"
+		printf 'audio_source_pcm=%s\n' "${AUDIO_SOURCE_PCM:-external-unverified}"
 		printf 'normal_force_intx=N\n'
 		printf 'fault_force_intx=%s\n' "$FAULT_INJECTION"
 		printf 'git_head=%s\n' "$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || printf unknown)"
@@ -1078,6 +1186,7 @@ dry_run_summary() {
 	printf '  SHA-256:      %s\n' "$(sha256sum "$MODULE_PATH" | awk '{print $1}')"
 	printf '  srcversion:   %s\n' "$(modinfo -F srcversion "$MODULE_PATH")"
 	printf '  loaded now:   %s\n' "$loaded"
+	printf '  Audio source: %s\n' "${AUDIO_SOURCE_PCM:-external/unverified}"
 	printf '\nNo module, device, or PCI state was changed. Run with sudo and --run to test hardware.\n'
 }
 
@@ -1102,6 +1211,9 @@ main() {
 	TEST_AUDIO_PARAMETER=$ORIGINAL_AUDIO_PARAMETER
 	if [[ "$AUDIO_PARAMETER_OVERRIDE" != auto ]]; then
 		TEST_AUDIO_PARAMETER=$AUDIO_PARAMETER_OVERRIDE
+	fi
+	if [[ -n "$AUDIO_SOURCE_PCM" && "$TEST_AUDIO_PARAMETER" == N ]]; then
+		die "--audio-source-pcm requires audio capture; add --enable-audio"
 	fi
 	if ((FAULT_INJECTION)); then
 		TOTAL_STEPS=9

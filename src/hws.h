@@ -164,6 +164,20 @@ enum hws_audio_packet_state {
 	HWS_AUDIO_PACKET_XRUN,
 };
 
+enum hws_audio_xrun_reason {
+	HWS_AUDIO_XRUN_NONE,
+	HWS_AUDIO_XRUN_PACKET_IN_FLIGHT,
+	HWS_AUDIO_XRUN_DUPLICATE_TOGGLE,
+	HWS_AUDIO_XRUN_WORK_DEADLINE,
+	HWS_AUDIO_XRUN_STREAM_STATE,
+	HWS_AUDIO_XRUN_SUBSTREAM_MISSING,
+	HWS_AUDIO_XRUN_RUNTIME_MISSING,
+	HWS_AUDIO_XRUN_RING_INVALID,
+	HWS_AUDIO_XRUN_SCRATCH_MISSING,
+	HWS_AUDIO_XRUN_SCRATCH_BOUNDS,
+	HWS_AUDIO_XRUN_WORKQUEUE_MISSING,
+};
+
 static inline void hws_set_current_dv_timings(struct hws_video *vid,
 					      u32 width, u32 height,
 					      bool interlaced)
@@ -214,6 +228,9 @@ struct hws_audio {
 	u32 irq_count;
 	u32 delivered_count;
 	u32 dropped_packets;
+	u64 last_work_latency_ns;
+	u64 max_work_latency_ns;
+	enum hws_audio_xrun_reason xrun_reason;
 
 	/* PCM format */
 	u32 output_sample_rate;

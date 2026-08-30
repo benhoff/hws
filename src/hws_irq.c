@@ -603,7 +603,8 @@ static bool hws_irq_queue_video(struct hws_pcie_dev *pdx, u32 int_state,
 	return wake_thread;
 }
 
-static void hws_irq_handle_audio(struct hws_pcie_dev *pdx, u32 int_state)
+static void hws_irq_handle_audio(struct hws_pcie_dev *pdx, u32 int_state,
+				 u64 timestamp_ns)
 {
 	unsigned int ch;
 
@@ -629,7 +630,7 @@ static void hws_irq_handle_audio(struct hws_pcie_dev *pdx, u32 int_state)
 		 */
 		cur_toggle = readl_relaxed(pdx->bar0_base +
 					   HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-		hws_audio_queue_interrupt(pdx, ch, cur_toggle);
+		hws_audio_queue_interrupt(pdx, ch, cur_toggle, timestamp_ns);
 	}
 }
 
@@ -661,7 +662,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	dev_dbg(&pdx->pdev->dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
 
 	wake_thread = hws_irq_queue_video(pdx, int_state, timestamp_ns);
-	hws_irq_handle_audio(pdx, int_state);
+	hws_irq_handle_audio(pdx, int_state, timestamp_ns);
 	hws_irq_ack_status(pdx, int_state);
 
 	return wake_thread ? IRQ_WAKE_THREAD : IRQ_HANDLED;
