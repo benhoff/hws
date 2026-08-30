@@ -329,12 +329,14 @@ be resolved before broader testing alone could make v20 submission-ready.
 | Exact v19 hardware capture | Not performed | Earlier capture results cannot be attributed to the exact final v19 tree |
 | STREAMOFF race | Passed for the targeted fix | 500 post-fix attempts with no ownership warning |
 | Remove/unbind | Partial | Minimal open-FD case only; active streaming case remains unproved |
-| Colorimetry | Passed for measured mode | Measurements support the metadata correction |
+| Colorimetry | Measured correction passed; cache fix software-validated | Measurements support BT.601/full-range metadata. All configured geometry paths now refresh the four cached colorimetry fields; post-fix hardware regression remains pending |
 | Native half-ring diagnostic | Passed for characterized scope | Strong channel 3/1080p60 diagnostic evidence; not generalized |
 | v20 fixed half-ring implementation | Targeted hardware pass | The exact module passed normal, CPU-stressed, 40-cycle rapid STREAMON/OFF, concurrent A/V, forced ambiguity, and recovery checks on channel 3 at 1080p60 |
 | v20 ambiguity/deadline gate | Targeted hardware pass | Stable post-W1C sampling and the eight-event startup window passed; forced-INTx ambiguity failed closed and recovered. The bounded startup-resync branch was not independently forced |
 | v20 audio staging gate | Hardware passed for channel 3 | Concurrent run reported 237 IRQs, one primed packet, 236 delivered packets, zero drops/errors, and 157 us maximum work latency |
-| v20 packed YUYV layout | Negotiation test passed | A deliberately padded 720x576 request normalized to `bytesperline=1440`, `sizeimage=829440`; queue, buffer, ring, and STREAMON paths reject inconsistent internal state |
+| v20 audio W1C and DMA bounds | Targeted hardware pass; exact ack-window branches unforced | Channel 3 normal capture delivered 236 packets without a drop and observed no write beyond the 8 KiB ring. A 50 ms forced-INTx gate produced a duplicate-toggle XRUN, one dropped packet, userspace overrun, and an intact trailing guard. Ordered post-W1C ambiguity reasons remain implemented but need a deterministic acknowledge-window injector |
+| v20 DV/source-loss behavior | Targeted hardware pass; transition matrix pending | Hardware returned all 14 modes, bounded capabilities, preserved configured/detected independence, reported stable PCI `bus_info`, and rejected no-signal QUERY and STREAMON with `ENOLINK`. Mid-stream unplug/replug and deliberate mode changes remain untested |
+| v20 packed YUYV layout | Targeted hardware pass | Commit `9104861` and the exact module normalized padded 720x576, tiny 1x1, and odd 641x481 requests as expected, then passed normal, stressed, and rapid capture on channel 3 |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
 | v20 submission readiness | Blocked | The targeted E2E matrix passed, but the code still has multi-stream global-idle, audio DMA-boundary, device-scope, interlaced-layout, and V4L2 API blockers |
 
@@ -381,6 +383,14 @@ cover the following code-level problems.
    canary, verification after proved idle, and a failure policy equivalent to
    the video ring.
 
+   **Resolution status (2026-08-30): implemented in the working tree,
+   hardware characterization pending.** The two 4 KiB packet halves retain an
+   8 KiB logical ring inside a 12 KiB page-rounded DMA capacity. The 8..12 KiB
+   padding and a separate 4 KiB trailing guard use an offset-dependent canary.
+   After DMA idle is proved, the driver reports the furthest modified byte and
+   permanently refuses reuse if either the shared leading guard or trailing
+   guard changed.
+
 3. **The PCI match table is broader than the established implementation
    scope.** It binds unknown SKUs plus HDMI and SDI families, while the complete
    validation covers only the 8888:8504 HDMI card. Older device revisions enter
@@ -415,6 +425,14 @@ cover the following code-level problems.
    even-width hardware geometry and maintain that invariant across live mode
    changes.
 
+   **Resolution status (2026-08-30): superseded after hardware compliance
+   evidence.** Commit `9104861` made every accepted layout strictly packed and
+   streamable in software, but still exposed 640x480..1920x1080 scaling.
+   Compliance testing proved that a 640x480 output request on a live 1080p60
+   input does not constrain the hardware DMA geometry. The working tree now
+   normalizes capture geometry to the configured native DV timing and retains
+   the exact packed stride/size invariant.
+
 ### Additional code issues
 
 - PCIe Relaxed Ordering is enabled unconditionally even though the correctness
@@ -431,6 +449,13 @@ cover the following code-level problems.
   backing would better match ownership and avoid large unnecessary coherent
   allocations, although this is an architectural refinement rather than the
   primary safety blocker.
+
+The two color-related bullets above describe the `ac3c784` assessment state.
+They are resolved in the current branch, with hardware regression still
+pending: live detection no longer mutates configured geometry; initialization,
+`S_FMT`, and `S_DV_TIMINGS` all refresh colorspace, Y'CbCr encoding,
+quantization, and transfer-function metadata; and source loss now stops and
+fails the stream rather than manufacturing a synthetic YUYV frame.
 
 ### 2026-08-30 comprehensive follow-up findings
 
@@ -464,6 +489,13 @@ outside the assessment.
    toggles is lost or no later audio interrupt arrives. Post-ack audio bits must
    fail the affected PCM stream closed immediately, with a focused forced-INTx
    regression test analogous to the video ambiguity test.
+
+   **Resolution status (2026-08-30): implemented in the working tree,
+   hardware validation pending.** ADONE now has a pre-ack toggle and two
+   ordered post-ack samples. Status reassertion, unstable post-ack samples, or
+   a toggle change across W1C disables ACAP in hard-IRQ context and reports a
+   reason-specific ALSA XRUN. The forced-INTx harness now requires the W1C XRUN
+   and a clean post-idle DMA guard result.
 
 3. **The enabled interrupt mask is broader than the sources the handler
    decodes.** `HWS_INT_EN_MASK` enables bits 0 through 17, while the current
@@ -530,6 +562,13 @@ outside the assessment.
     components 16 instead of neutral 128. The driver should either report the
     signal loss and stop frame delivery, or generate correctly encoded neutral
     frames at a behavior and cadence that match its advertised API.
+
+    **Resolution status (2026-08-30): implemented in `0626f47`, hardware
+    validation pending.** The driver chose the V4L2 source-change model: it
+    disables the channel producer, drains IRQ/copy work, marks the VB2 queue
+    failed, and emits `V4L2_EVENT_SOURCE_CHANGE`. It delivers no synthetic
+    frame. The working-tree harness additionally requires a no-signal
+    STREAMON attempt to fail promptly instead of returning a frame.
 
 11. **Capability metadata is incomplete.** `VIDIOC_QUERYCAP` does not populate
     a PCIe `bus_info` value, making otherwise identical multi-card devices hard
@@ -613,7 +652,7 @@ blockers above.
 
 ### 2026-08-30 DV-timing remediation
 
-The current working tree now corrects the DV-timing and source-state cluster
+Commit `0626f47` corrects the DV-timing and source-state cluster
 identified in findings 4 through 7, 10, 11, and 16 above. These corrections
 build successfully but have not yet passed the hardware E2E matrix or
 `v4l2-compliance`, so their status is **implemented, hardware validation
@@ -658,8 +697,10 @@ pending**.
   `7.1.9-arch1-2`.
 - `hws_v20_e2e_test.sh` now verifies multi-entry timing enumeration, bounded
   timing capabilities, independence of configured and detected timing state,
-  no-signal query rejection, and PCI `bus_info`, then restores the live timing
-  before the existing capture tests.
+  no-signal query and STREAMON rejection, and PCI `bus_info`, then restores the
+  live timing before the existing capture tests. Requiring no-signal STREAMON
+  to fail promptly prevents regression to synthetic, incorrectly encoded
+  YUYV frames.
 
 The retained timing list still represents inherited claimed support rather
 than complete per-mode hardware characterization. The next run must prove the
@@ -670,9 +711,9 @@ interlaced input remains deliberately unsupported and should return
 
 ### 2026-08-30 format-negotiation remediation
 
-The current working tree now implements the correction for finding 6 above.
-It passes build and static script checks but has not yet run on hardware, so its
-status is **implemented, hardware validation pending**.
+Commit `9104861` implemented the first correction for finding 6 above. Its
+packed-layout portion passed the targeted 1080p60 hardware matrix, but the
+scaler-range assumption was later disproved by `v4l2-compliance`.
 
 - `TRY_FMT` clamps progressive YUYV requests to 640x480 through 1920x1080 and
   rounds odd widths up to the next complete two-pixel YUYV chroma pair.
@@ -686,23 +727,217 @@ status is **implemented, hardware validation pending**.
   normalized to packed 640x480, and a 641x481 request normalized to packed
   642x481.
 
-The 640x480 lower bound is deliberately conservative: it matches the smallest
-retained supported DV geometry and is safely above the native split boundary.
-Smaller scaler output should not be exposed unless hardware evidence defines
-and validates its real lower limit.
+Those range semantics are historical. Current hardware evidence shows that
+OUT_RES cannot be treated as a safe DMA scaler: a 640x480 request while the
+input remained 1080p60 overwrote guards well beyond the nominal 640x480 DMA
+extent. The working tree therefore exposes only the configured native DV
+width/height. `TRY_FMT` still forces YUYV, progressive field-none, exact
+`width * 2` stride, and exact `stride * height` `sizeimage`; arbitrary padded,
+tiny, odd, or scaled requests all normalize to that same native packed layout.
+The E2E probes now derive the configured native geometry and verify this
+contract rather than expecting 640x480 or 642x481 scaler output.
+
+### 2026-08-30 audio W1C and DMA-bound remediation
+
+The current working tree implements the two remaining audio safety mechanisms;
+both are **hardware validation pending**.
+
+- The hard IRQ samples each asserted ADONE toggle before W1C, acknowledges the
+  sticky status, then takes two ordered toggle samples and consumes the
+  post-ack status. Reasserted ADONE, an unstable post-ack sample, or a toggle
+  change across the acknowledge window is uncountable and therefore disables
+  that channel's ACAP immediately. Deferred work reports a reason-specific
+  ALSA XRUN rather than delivering a packet of uncertain identity.
+- Each audio channel now places its 8 KiB two-packet ring in a 12 KiB
+  page-rounded capacity followed by a 4 KiB patterned guard. The existing
+  video suffix guard is also checked as the audio leading guard. Bytes from
+  8..12 KiB are canary-filled to measure any contained hardware write tail.
+- Guard and tail inspection happens only after the driver has disabled ACAP,
+  synchronized IRQ/work ownership, and positively proved DMA idle. The driver
+  logs the furthest observed modified byte. A leading or trailing guard change
+  marks the scratch permanently corrupt and rejects reuse until module reload.
+- `hws_audio_focus_test.sh` now requires a post-idle bounds record for a normal
+  capture. When an audio source PCM is supplied, the E2E forced-INTx phase adds
+  live embedded-audio capture and requires an ADONE W1C XRUN plus an intact DMA
+  guard.
+
+The 12 KiB capacity is containment based on page-rounding the inherited 10 KiB
+window, not a claim that hardware writes all 12 KiB. The first hardware runs
+must record the observed extent across channels and modes; the guard must stay
+intact before that capacity can be treated as characterized.
+
+### 2026-08-30 partial post-remediation hardware run
+
+Evidence directory `/tmp/hws-v20-e2e-20260830-115159` records 24 passes and
+four failures. The failures separate into one video behavior requiring a code
+change and three harness/environment issues:
+
+- The exact module loaded in MSI mode after manually loading
+  `v4l2-dv-timings`. This proved the prior `Unknown symbol
+  v4l2_match_dv_timings` error was raw `insmod` dependency resolution, not an
+  ABI or implementation failure. Both harnesses now preload the module's ALSA,
+  VB2, and DV-timings dependencies before every normal or cleanup `insmod`.
+- DV enumeration returned all 14 modes, configured and detected timing state
+  remained independent, `QUERYCAP` returned stable PCI `bus_info`, and
+  no-signal `QUERY_DV_TIMINGS` failed as required. The capability ioctl also
+  returned complete width, height, pixel-clock, standards, and progressive
+  bounds; the reported failure was only a harness mismatch between the
+  `v4l2-ctl` labels `PClock` and `Pixelclock`, now accepted by the parser.
+- No-signal STREAMON did not fail promptly. The working tree now performs the
+  live/matching timing gate in the `VIDIOC_STREAMON` wrapper before VB2 can
+  enter a userspace dequeue loop, and repeats it in `start_streaming()` to
+  close the setup race. It built with `W=1` and subsequently passed the direct
+  no-signal ioctl test in the final run below.
+- All three packed-YUYV probes passed, as did normal startup/capture, CPU-load
+  capture, 40 rapid STREAMON/OFF cycles, forced video W1C failure, and recovery.
+- The two audio-source failures did not exercise the new audio code: USB card
+  enumeration moved NVIDIA HDMI from card 1 to card 2, making the supplied
+  `hw:1,3` node nonexistent. The harness now accepts a stable ALSA card ID;
+  subsequent runs should use `hw:NVidia,3`. Audio W1C ambiguity and DMA-bound
+  characterization therefore remain pending.
+
+A second run at `/tmp/hws-v20-e2e-20260830-115644` used the stable
+`hw:NVidia,3` source and advanced the result to 28 passes and two failures:
+
+- Normal concurrent channel-3 audio/video passed. Audio recorded 237 ADONE
+  IRQs, one priming packet, 236 delivered packets, zero drops, and 294 us
+  maximum worker latency. Post-idle inspection observed writes through byte
+  8192 only; the 8..12 KiB measurement area and trailing guard remained intact.
+- Gating forced legacy INTx for 50 ms during audio produced an ALSA XRUN with
+  `reason=duplicate-toggle`, 45 delivered packets, one dropped packet, and a
+  clean 8192-byte observed extent. This is a valid fail-closed result for
+  completions coalesced before the W1C acknowledge window. The harness had
+  incorrectly required only a `w1c-*` reason; it now accepts the bounded set of
+  completion-loss detectors (`w1c-*`, duplicate toggle, or invalid cadence)
+  while still requiring userspace termination and a clean DMA guard. The exact
+  post-ack reassert/unstable/change branches remain unforced.
+- The only driver-facing failure was again the no-signal STREAMON probe. Its
+  empty `v4l2-ctl` log did not expose the ioctl result and the tool entered its
+  streaming wait. The harness now invokes `VIDIOC_STREAMON` directly on a
+  nonblocking descriptor and accepts only the driver's prompt link/timing
+  errors; it cannot mistake a userspace dequeue wait for driver acceptance.
+
+The final rerun at `/tmp/hws-v20-e2e-20260830-115945` passed the complete
+targeted matrix: **30 passed, 0 failed, 0 skipped**. It tested module SHA-256
+`5c47f9a810e4fe99f4d28027410ef9b40a35efe2f04833abdeca3b86372bc52e`
+with source version `1863098A2C3F673A1986998` on Arch kernel
+`7.1.9-arch1-2` and PCI function `0000:17:00.0`.
+
+- The direct no-signal ioctl returned `ENOLINK` (`errno 67`) immediately.
+- Normal channel-3 audio recorded 237 IRQs, one primed packet, 236 delivered
+  packets, zero drops or validation errors, and 127 us maximum worker latency.
+  DMA inspection observed exactly 8192 bytes inside the 12288-byte capacity;
+  the trailing guard remained intact.
+- Forced legacy-INTx audio loss again produced a duplicate-toggle XRUN after
+  47 IRQs, with 45 delivered packets, one dropped packet, 115 us maximum worker
+  latency, an 8192-byte observed extent, and an intact guard.
+- The same exact module also passed complete-frame startup, 120-frame normal
+  capture, all DV/format/API checks, 240-frame CPU-stressed capture, 40 rapid
+  STREAMON/OFF cycles, concurrent video/audio, forced video W1C failure to
+  userspace `EIO`, MSI-mode restoration, and a 30-frame recovery capture with
+  no kernel safety failure.
+
+This is a targeted channel-3/1080p60 hardware pass. It does not replace the
+broader mode, channel, transition, independent-stop, lifecycle, or suspend
+matrix listed below, and it did not deterministically enter the three narrow
+post-W1C audio acknowledge-window branches.
+
+### 2026-08-30 v4l2-compliance format-transition follow-up
+
+Running `v4l2-compliance 1.32.0 -d /dev/video3 -f -v` after the 30/30 E2E
+pass produced 53 tests: 49 succeeded, four failed, and one warning was
+reported. Required ioctls, multiple opens, input/DV timing ioctls, controls,
+format negotiation, buffer ioctls, blocking waits, and 640x480 MMAP streaming
+all passed. The warning was the absence of the recommended read-only
+`V4L2_CID_DV_RX_POWER_PRESENT` control.
+
+The first substantive failure was 1920x1080 STREAMON immediately after the
+successful 640x480 iteration. Kernel evidence showed four bounded startup
+resynchronizations with alternating approximately 15 ms and 1 ms VDONE
+intervals, followed by fail-closed ambiguity and a changed DMA guard. The
+three subsequent Top/Bottom/Alternating failures occurred after that queue had
+entered its error state and are treated as secondary until the first failure
+is retested.
+
+The first suspected cause was asynchronous output-scaler programming: `S_FMT`
+changed software geometry, but the one-second monitor later wrote `OUT_RES`,
+potentially while the next VCAP ownership interval was starting. The working
+tree was changed to program and verify `OUT_RES` synchronously while idle from
+`S_FMT`, `S_DV_TIMINGS`, and STREAMON, reject the write while VCAP or unresolved
+DMA ownership is active, and stop the monitor changing it in either state.
+
+A repeat compliance run at
+`/tmp/hws-v4l2-compliance-20260830-120515.log` produced the identical four
+failures and identical approximately 15.5 ms/1.15 ms VDONE pairing. The exact
+module source version matched the rebuilt tree, so asynchronous `OUT_RES`
+programming was real unsafe behavior but not the complete cause of this
+failure. The remaining state difference is the engine's retained internal ring
+position after the successful 640x480 stream: changing only its split before
+the 1920x1080 stream did not re-arm the fixed base. The working tree now
+invalidates the programming cache on idle geometry changes, forcing the same
+permanent remap, base, and new split to be rewritten before VCAP is enabled.
+It also reports the first changed byte in each guard page if the retest still
+crosses a boundary. This second correction builds cleanly with `W=1` and strict
+checkpatch.
+
+The next run, `/tmp/hws-v4l2-compliance-20260830-120825.log`, again produced
+the same surface result, but the new telemetry identified the root cause:
+`video DMA guard mismatch ch=3 extent=614400 leading_off=-1 trailing_off=0`.
+The guard was crossed by the successful 640x480 stream, not by the following
+1920x1080 stream. The latter correctly failed closed because the channel had
+already been marked corrupt, and the interlaced cases then inherited the VB2
+queue error.
+
+Packed 640x480 YUYV is exactly 614400 bytes and already page-aligned. The
+working-tree extent formula used `PAGE_ALIGN(sizeimage)`, which therefore
+reserved no space for the independently characterized 2048-byte hardware write
+tail. At 1920x1080 the same formula happened to add 2048 bytes because
+4147200 is half-page-aligned, masking the invariant error in all prior 1080p60
+testing. The corrected invariant is now
+`PAGE_ALIGN(sizeimage + HWS_VIDEO_DMA_TAIL_BYTES)`, with
+`HWS_VIDEO_DMA_TAIL_BYTES = 2048`; maximum ring capacity uses the identical
+formula. This gives 618496 bytes for the 614400-byte 640x480 frame and 4149248
+bytes for the 4147200-byte 1080p frame. The correction builds cleanly with
+`W=1` and strict checkpatch but remains hardware pending; both full compliance
+and the 30-test E2E matrix must be rerun. The power-present control warning
+remains a separate non-fatal API cleanup item.
+
+The following run,
+`/tmp/hws-v4l2-compliance-20260830-121005.log`, used the corrected tail formula
+and moved the dynamic guard to extent 618496, but hardware again changed byte
+zero of that guard and retained the same approximately 15.5 ms/1.15 ms VDONE
+pairing. This disproves the interpretation as a fixed tail attached to a
+640x480 DMA frame. The HDMI input remained 1080p60: the device continued native
+DMA despite the smaller OUT_RES request. Treating arbitrary output dimensions
+as a supported scaler is therefore unsafe. The working tree now binds capture
+width/height to `cur_dv_timings`, while keeping the corrected `sizeimage + 2
+KiB` extent invariant for actual native modes. This native-only negotiation
+builds cleanly with `W=1` and strict checkpatch.
+
+The native-only retest at
+`/tmp/hws-v4l2-compliance-20260830-121259.log` passed all 49 tests with zero
+failures. Compliance now reports scaling as unsupported and exercises only the
+configured native 1920x1080 packed-YUYV mode; that stream passed. The sole
+remaining warning was the missing `V4L2_CID_DV_RX_POWER_PRESENT` control. The
+working tree now exposes that standard read-only single-input bitmask and
+updates bit zero from the channel's hardware `ACTIVE_STATUS` source indication;
+this final control addition is build-tested but still needs a compliance rerun.
 
 ### Required evidence after correction
 
 The next hardware gate must stop video and audio independently while other
 channels remain active, rather than stopping the only live streams together.
 It must also exercise every retained PCI ID or prove that unsupported IDs have
-been removed, characterize the audio write boundary with guards, force an audio
-post-W1C ambiguity, and test every accepted progressive mode. It must explicitly
+been removed, record the post-idle audio write extent and intact guards on
+every channel, force the new audio post-W1C ambiguity path, and test every
+accepted progressive mode. It must explicitly
 reject or validate interlaced input; test no-link, unsupported-refresh, and
-source-change DV-timings behavior; verify EOF timestamps and dropped-frame
-sequence numbers; force the bounded startup-resync branch; and cover
-suspend/resume plus active-stream unbind/remove with open video and ALSA file
-descriptors. Multi-channel load and ordering tests must be run with Relaxed
+source-change DV-timings behavior, including an actual mid-stream unplug,
+prompt `EIO`/source-change notification, STREAMOFF cleanup, same-mode replug,
+changed-mode reconfiguration, and restart; verify EOF timestamps and
+dropped-frame sequence numbers; force the bounded startup-resync branch; and
+cover suspend/resume plus active-stream unbind/remove with open video and ALSA
+file descriptors. Multi-channel load and ordering tests must be run with Relaxed
 Ordering disabled unless an endpoint contract proves it safe. Passing the
 existing channel-3 matrix remains a required regression test, not a substitute
 for these cases.
@@ -768,20 +1003,30 @@ channel, with CPU assembly into queued VB2 buffers:
 5. Implemented and hardware-proved for channel 3: stable audio staging,
    cadence priming, completion generations, and post-copy
    toggle/generation/deadline validation with a live HDMI tone.
-6. Implemented and negotiation-tested: strictly packed YUYV and padded-stride
-   normalization. Even-width and minimum streamable-size normalization remain
-   to be added.
-7. Resolve the code-value blockers above, beginning with independent
-   per-stream stop semantics and a guarded, characterized audio DMA extent.
-8. Validate every retained channel and mode, independent and concurrent
+6. Packed YUYV and shared queue/STREAMON validation are targeted
+   hardware-proved. Removing the disproved scaler range and normalizing all
+   format requests to configured native DV geometry produced a 49/49
+   `v4l2-compliance` pass. The subsequent DV receiver power-present control
+   addition still needs its compliance rerun, as does the full E2E matrix.
+7. Implemented in `0626f47` and targeted hardware-proved: geometry updates
+   refresh the complete colorimetry cache, no-signal QUERY/STREAMON fail, and
+   source loss does not generate synthetic frames. The full mid-stream
+   unplug/replug and changed-mode recovery sequence remains pending.
+8. Implemented and targeted hardware-proved in the working tree: post-W1C
+   ADONE resampling fails ambiguous completion closed, and the page-rounded
+   audio DMA capacity recorded an 8192-byte extent behind an intact trailing
+   guard. Deterministic forcing of each narrow post-ack branch remains pending.
+9. Resolve the remaining code-value blockers above, beginning with independent
+   per-stream stop semantics, PCIe completion ordering, and lifecycle teardown.
+10. Validate every retained channel and mode, independent and concurrent
    audio/video stop, suspend/resume, active-stream unbind/remove, delayed
    copies, DMA isolation, allocation guards, and the public DV-timings API.
-9. Port by patch subject and order to a fresh Linux branch based on current
+11. Port by patch subject and order to a fresh Linux branch based on current
    media-next. Generate the next revision, build each boundary, run checkpatch,
    apply the mailbox in isolation, and perform a send-email dry-run.
-10. Confirm upstream status of the device-information and colorimetry patches
+12. Confirm upstream status of the device-information and colorimetry patches
    before sending or duplicating them.
-11. Inventory untracked test artifacts before cleanup; retain reproducers with
+13. Inventory untracked test artifacts before cleanup; retain reproducers with
    the exact branch, commit, mode, channel, and expected result documented.
 
 ## History API operational note

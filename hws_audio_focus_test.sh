@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
 # Focused HWS embedded-audio diagnostic. Reloads the in-tree module in normal
-# MSI mode, captures one PCM, and correlates ALSA, IRQ, and driver telemetry.
+# MSI mode, captures one PCM, and correlates ALSA, IRQ, bounds, and telemetry.
 
 set -Eeuo pipefail
 
@@ -25,7 +25,8 @@ usage() {
 	cat <<'EOF'
 Usage: ./hws_audio_focus_test.sh [options]
 
-Reload HwsCapture in MSI-preferred mode and diagnose one embedded-audio PCM.
+Reload HwsCapture in MSI-preferred mode, diagnose one embedded-audio PCM, and
+require a post-idle DMA-tail/guard observation.
 Without --run, print the resolved targets without changing hardware.
 
 Options:
@@ -118,7 +119,7 @@ validate_args() {
 
 require_commands() {
 	local command
-	local -a commands=(arecord dmesg fuser insmod modinfo realpath rg rmmod
+	local -a commands=(arecord dmesg fuser insmod modinfo modprobe realpath rg rmmod
 		sha256sum strace timeout udevadm v4l2-ctl)
 
 	for command in "${commands[@]}"; do
@@ -240,6 +241,9 @@ reload_test_module() {
 		print_command rmmod "$MODULE_NAME"
 		rmmod "$MODULE_NAME"
 	fi
+	# insmod does not resolve the dependencies recorded in the module.
+	modprobe -a snd-pcm videobuf2-dma-contig videobuf2-v4l2 \
+		v4l2-dv-timings
 	print_command insmod "$MODULE_PATH" enable_audio=Y force_intx=N
 	insmod "$MODULE_PATH" enable_audio=Y force_intx=N
 	udevadm settle --timeout=10 || true
@@ -294,7 +298,12 @@ cleanup() {
 	fi
 	if ((RUN && MODULE_TOUCHED)) && [[ ! -d "/sys/module/$MODULE_NAME" ]]; then
 		printf 'Cleanup: restoring %s in MSI-preferred mode\n' "$MODULE_NAME" >&2
-		insmod "$MODULE_PATH" enable_audio=Y force_intx=N || exit_code=1
+		if ! modprobe -a snd-pcm videobuf2-dma-contig videobuf2-v4l2 \
+			v4l2-dv-timings; then
+			exit_code=1
+		elif ! insmod "$MODULE_PATH" enable_audio=Y force_intx=N; then
+			exit_code=1
+		fi
 	fi
 	exit "$exit_code"
 }
@@ -346,7 +355,8 @@ stop_video_capture() {
 }
 
 run_capture() {
-	local channel vector irq_before irq_after irq_delta rc
+	local bounds_line capacity channel guard irq_after irq_before irq_delta
+	local observed rc result_rc vector
 
 	channel=$(pcm_channel)
 	vector=$(irq_vector) || die "could not resolve the active MSI vector"
@@ -375,6 +385,16 @@ run_capture() {
 	collect_kernel_delta
 	rg "audio telemetry .*ch=$channel([[:space:]]|$)" \
 		"$OUTPUT_DIR/kernel-delta.log" >"$OUTPUT_DIR/audio-telemetry.log" || true
+	rg "audio DMA (bounds|guard corruption) ch=$channel([[:space:]]|$)" \
+		"$OUTPUT_DIR/kernel-delta.log" >"$OUTPUT_DIR/audio-dma-bounds.log" || true
+	bounds_line=$(tail -n 1 "$OUTPUT_DIR/audio-dma-bounds.log" 2>/dev/null || true)
+	observed=$(sed -n 's/.* observed=\([0-9][0-9]*\).*/\1/p' \
+		<<<"$bounds_line")
+	capacity=$(sed -n 's/.* capacity=\([0-9][0-9]*\).*/\1/p' \
+		<<<"$bounds_line")
+	guard=$(sed -n 's/.* guard=\([^[:space:]]*\).*/\1/p' \
+		<<<"$bounds_line")
+	result_rc=$rc
 
 	{
 		printf 'pcm=%s\n' "$PCM"
@@ -390,8 +410,20 @@ run_capture() {
 		printf 'irq_delta=%s\n' "$irq_delta"
 		printf 'telemetry_events=%s\n' \
 			"$(wc -l <"$OUTPUT_DIR/audio-telemetry.log")"
-		if ((rc == 0)); then
+		printf 'dma_bounds_events=%s\n' \
+			"$(wc -l <"$OUTPUT_DIR/audio-dma-bounds.log")"
+		printf 'dma_observed_extent=%s\n' "${observed:-unknown}"
+		printf 'dma_capacity=%s\n' "${capacity:-unknown}"
+		printf 'dma_guard=%s\n' "${guard:-unknown}"
+		if rg -q 'audio DMA guard corruption' \
+			"$OUTPUT_DIR/audio-dma-bounds.log"; then
+			printf 'result=FAIL_DMA_GUARD\n'
+			result_rc=1
+		elif ((rc == 0)) && [[ "$guard" == ok ]]; then
 			printf 'result=PASS\n'
+		elif ((rc == 0)); then
+			printf 'result=FAIL_NO_DMA_BOUNDS\n'
+			result_rc=1
 		elif rg -q 'event=xrun' "$OUTPUT_DIR/audio-telemetry.log"; then
 			printf 'result=XRUN_DIAGNOSED\n'
 		elif rg -q 'event=stop .*irq=0 .*delivered=0' \
@@ -405,8 +437,10 @@ run_capture() {
 	cat "$OUTPUT_DIR/summary.txt"
 	printf '\nAudio telemetry:\n'
 	cat "$OUTPUT_DIR/audio-telemetry.log"
+	printf '\nAudio DMA bounds:\n'
+	cat "$OUTPUT_DIR/audio-dma-bounds.log"
 	printf '\nEvidence: %s\n' "$OUTPUT_DIR"
-	return "$rc"
+	return "$result_rc"
 }
 
 main() {

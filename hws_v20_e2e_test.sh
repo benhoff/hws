@@ -68,7 +68,7 @@ Normal execution:
   5. Capture complete MMAP frames after startup synchronization.
   6. Verify packed YUYV, reject USERPTR, stress copies, and repeat STREAMON/OFF.
   7. Capture all live video inputs concurrently with embedded audio.
-  8. Optionally reload with forced INTx and inject W1C coalescing.
+  8. Optionally reload with forced INTx and inject video/audio W1C coalescing.
   9. Reload in normal MSI-preferred mode and prove capture recovers.
 
 Options:
@@ -81,7 +81,8 @@ Options:
   --rapid-loops N          Short STREAMON/OFF iterations. Default: 40
   --audio-seconds N        Concurrent ALSA capture duration. Default: 5
   --audio-source-pcm PCM   Play a 48 kHz stereo test tone through PCM while
-                           validating embedded audio, for example hw:1,3
+                           validating embedded audio; card may be a number or
+                           stable ALSA ID, for example hw:NVidia,3
   --cpu-workers N          CPU load workers. Default: min(nproc, 8)
   --output-dir DIR         Evidence directory. Default: /tmp timestamp directory
   --enable-audio           Load the test module with enable_audio=Y
@@ -92,7 +93,8 @@ Options:
   --skip-module-reload     Test the already-loaded module; require srcversion match
   --allow-stale-module     Permit a module older than a driver source/header file
   --fault-injection        Reload with force_intx=Y, gate INTx for 50 ms,
-                           and require W1C ambiguity to fail the queue closed
+                           and require video plus available audio ambiguity to
+                           fail closed
   -h, --help               Show this help
 
 Build and run:
@@ -250,7 +252,7 @@ validate_args() {
 		((CPU_WORKERS > 0)) || die "--cpu-workers must be nonzero"
 	fi
 	if [[ -n "$AUDIO_SOURCE_PCM" ]]; then
-		[[ "$AUDIO_SOURCE_PCM" =~ ^hw:[0-9]+,[0-9]+$ ]] ||
+		[[ "$AUDIO_SOURCE_PCM" =~ ^hw:[[:alnum:]_-]+,[0-9]+$ ]] ||
 			die "--audio-source-pcm must use hw:CARD,DEVICE syntax"
 		((SKIP_AUDIO == 0)) ||
 			die "--audio-source-pcm cannot be combined with --skip-audio"
@@ -273,7 +275,7 @@ require_commands() {
 	local -a commands=(modinfo sha256sum realpath v4l2-ctl timeout)
 
 	if ((RUN)); then
-		commands+=(insmod rmmod udevadm fuser journalctl)
+		commands+=(insmod modprobe python3 rmmod udevadm fuser journalctl)
 		((SKIP_AUDIO)) || commands+=(arecord)
 		[[ -n "$AUDIO_SOURCE_PCM" ]] && commands+=(speaker-test)
 		((FAULT_INJECTION)) && commands+=(setpci)
@@ -525,6 +527,10 @@ load_test_module() {
 	if [[ -d "/sys/module/$MODULE_NAME" ]]; then
 		unload_test_module
 	fi
+	# insmod does not resolve the dependencies recorded in the module.  Keep
+	# local-tree testing reliable even when no earlier HWS load left them live.
+	modprobe -a snd-pcm videobuf2-dma-contig videobuf2-v4l2 \
+		v4l2-dv-timings
 	print_command insmod "$MODULE_PATH" "enable_audio=$audio_parameter" \
 		"force_intx=$force_intx"
 	insmod "$MODULE_PATH" "enable_audio=$audio_parameter" \
@@ -586,6 +592,10 @@ cleanup() {
 			if [[ -d "/sys/module/$MODULE_NAME" ]] && ! rmmod "$MODULE_NAME"; then
 				printf 'CRITICAL: could not unload forced-INTx module; manual reload is required\n' >&2
 				exit_code=1
+			elif ! modprobe -a snd-pcm videobuf2-dma-contig \
+				videobuf2-v4l2 v4l2-dv-timings; then
+				printf 'CRITICAL: could not load HWS module dependencies\n' >&2
+				exit_code=1
 			elif ! insmod "$MODULE_PATH" "enable_audio=$TEST_AUDIO_PARAMETER" \
 				"force_intx=N"; then
 				printf 'CRITICAL: could not restore HWS service; manual module load is required\n' >&2
@@ -643,7 +653,7 @@ phase_log_delta() {
 kernel_delta_is_clean() {
 	local delta=$1
 	local universal='BUG:|WARNING:|Oops:|KASAN:|KFENCE:|general protection fault|kernel panic|use-after-free'
-	local hws_fatal='VDONE ambiguity|VDONE half-ring failure|video queue failed|DMA guard corruption|retained DMA-owned|failed to restart guarded ring|threaded IRQ processing many VDONE events|audio ch[0-9]+ packet overrun|audio start refused|shared-window conflict'
+	local hws_fatal='VDONE ambiguity|VDONE half-ring failure|video queue failed|DMA guard corruption|audio DMA guard corruption|ADONE ambiguity|retained DMA-owned|failed to restart guarded ring|threaded IRQ processing many VDONE events|audio ch[0-9]+ packet overrun|audio start refused|shared-window conflict'
 
 	if grep -EinE "$universal" "$delta" >"$delta.failures"; then
 		return 1
@@ -806,72 +816,62 @@ test_memory_model() {
 }
 
 test_packed_yuyv() {
+	local native_log="$OUTPUT_DIR/native-yuyv.log"
 	local logfile="$OUTPUT_DIR/packed-yuyv.log"
 	local tiny_log="$OUTPUT_DIR/tiny-yuyv.log"
 	local odd_log="$OUTPUT_DIR/odd-yuyv.log"
-	local bytesperline sizeimage dimensions
+	local bytesperline sizeimage dimensions native_w native_h
+	local expected_bpl expected_size index
+	local -a labels=(padded tiny odd-width)
+	local -a logs=("$logfile" "$tiny_log" "$odd_log")
+	local -a requests=(
+		'width=720,height=576,pixelformat=YUYV,bytesperline=4096,sizeimage=4194304'
+		'width=1,height=1,pixelformat=YUYV'
+		'width=641,height=481,pixelformat=YUYV'
+	)
 
-	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
-		--try-fmt-video=width=720,height=576,pixelformat=YUYV,bytesperline=4096,sizeimage=4194304 \
-		>"$logfile" 2>&1; then
-		fail "packed YUYV TRY_FMT probe failed"
+	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --get-fmt-video \
+		>"$native_log" 2>&1; then
+		fail "could not read native YUYV format"
 		return
 	fi
-	bytesperline=$(awk -F: '/Bytes per Line/ {
+	dimensions=$(awk -F: '/Width\/Height/ {
 		gsub(/[[:space:]]/, "", $2); print $2; exit
-	}' "$logfile")
-	sizeimage=$(awk -F: '/Size Image/ {
-		gsub(/[[:space:]]/, "", $2); print $2; exit
-	}' "$logfile")
-	if [[ "$bytesperline" == 1440 && "$sizeimage" == 829440 ]]; then
-		pass "padded TRY_FMT request was normalized to packed 720x576 YUYV"
-	else
-		fail "TRY_FMT returned bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected 1440/829440"
+	}' "$native_log")
+	native_w=${dimensions%/*}
+	native_h=${dimensions#*/}
+	if ! is_uint "$native_w" || ! is_uint "$native_h" ||
+		((native_w == 0 || native_h == 0)); then
+		fail "could not parse native YUYV geometry"
+		return
 	fi
+	expected_bpl=$((native_w * 2))
+	expected_size=$((expected_bpl * native_h))
 
-	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
-		--try-fmt-video=width=1,height=1,pixelformat=YUYV \
-		>"$tiny_log" 2>&1; then
-		fail "tiny YUYV TRY_FMT probe failed"
-	else
+	for index in "${!requests[@]}"; do
+		if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
+			"--try-fmt-video=${requests[index]}" \
+			>"${logs[index]}" 2>&1; then
+			fail "${labels[index]} YUYV TRY_FMT probe failed"
+			continue
+		fi
 		dimensions=$(awk -F: '/Width\/Height/ {
 			gsub(/[[:space:]]/, "", $2); print $2; exit
-		}' "$tiny_log")
+		}' "${logs[index]}")
 		bytesperline=$(awk -F: '/Bytes per Line/ {
 			gsub(/[[:space:]]/, "", $2); print $2; exit
-		}' "$tiny_log")
+		}' "${logs[index]}")
 		sizeimage=$(awk -F: '/Size Image/ {
 			gsub(/[[:space:]]/, "", $2); print $2; exit
-		}' "$tiny_log")
-		if [[ "$dimensions" == 640/480 && "$bytesperline" == 1280 &&
-		      "$sizeimage" == 614400 ]]; then
-			pass "tiny TRY_FMT request was raised to streamable 640x480 packed YUYV"
+		}' "${logs[index]}")
+		if [[ "$dimensions" == "$native_w/$native_h" &&
+		      "$bytesperline" == "$expected_bpl" &&
+		      "$sizeimage" == "$expected_size" ]]; then
+			pass "${labels[index]} TRY_FMT request was normalized to native packed ${native_w}x${native_h} YUYV"
 		else
-			fail "tiny TRY_FMT returned ${dimensions:-missing} bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected 640x480/1280/614400"
+			fail "${labels[index]} TRY_FMT returned ${dimensions:-missing} bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected ${native_w}x${native_h}/${expected_bpl}/${expected_size}"
 		fi
-	fi
-
-	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
-		--try-fmt-video=width=641,height=481,pixelformat=YUYV \
-		>"$odd_log" 2>&1; then
-		fail "odd-width YUYV TRY_FMT probe failed"
-	else
-		dimensions=$(awk -F: '/Width\/Height/ {
-			gsub(/[[:space:]]/, "", $2); print $2; exit
-		}' "$odd_log")
-		bytesperline=$(awk -F: '/Bytes per Line/ {
-			gsub(/[[:space:]]/, "", $2); print $2; exit
-		}' "$odd_log")
-		sizeimage=$(awk -F: '/Size Image/ {
-			gsub(/[[:space:]]/, "", $2); print $2; exit
-		}' "$odd_log")
-		if [[ "$dimensions" == 642/481 && "$bytesperline" == 1284 &&
-		      "$sizeimage" == 617604 ]]; then
-			pass "odd-width TRY_FMT request was normalized to an even packed layout"
-		else
-			fail "odd-width TRY_FMT returned ${dimensions:-missing} bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected 642x481/1284/617604"
-		fi
-	fi
+	done
 }
 
 dv_timing_signature() {
@@ -882,6 +882,41 @@ dv_timing_signature() {
 	}' "$1"
 }
 
+test_no_signal_streamon() {
+	local node=$1
+	local logfile=$2
+
+	# Test VIDIOC_STREAMON itself without entering v4l2-ctl's dequeue loop.
+	# The driver performs its source gate before VB2 buffer validation, so an
+	# inactive input must return a link/timing error immediately.
+	timeout 5s python3 - "$node" >"$logfile" 2>&1 <<'PY'
+import errno
+import fcntl
+import os
+import struct
+import sys
+
+VIDIOC_STREAMON = 0x40045612
+V4L2_BUF_TYPE_VIDEO_CAPTURE = 1
+accepted = {errno.ENOLINK, errno.EPIPE, errno.ERANGE}
+if hasattr(errno, "ENOLCK"):
+    accepted.add(errno.ENOLCK)
+
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NONBLOCK)
+try:
+    try:
+        fcntl.ioctl(fd, VIDIOC_STREAMON,
+                    struct.pack("I", V4L2_BUF_TYPE_VIDEO_CAPTURE))
+    except OSError as error:
+        print(f"VIDIOC_STREAMON errno={error.errno} ({error.strerror})")
+        raise SystemExit(0 if error.errno in accepted else 1)
+    print("VIDIOC_STREAMON unexpectedly succeeded")
+    raise SystemExit(1)
+finally:
+    os.close(fd)
+PY
+}
+
 test_dv_timing_api() {
 	local list_log="$OUTPUT_DIR/dv-list.log"
 	local cap_log="$OUTPUT_DIR/dv-cap.log"
@@ -890,6 +925,7 @@ test_dv_timing_api() {
 	local get_log="$OUTPUT_DIR/dv-get.log"
 	local info_log="$OUTPUT_DIR/dv-info.log"
 	local no_signal_log="$OUTPUT_DIR/dv-no-signal.log"
+	local no_signal_stream_log="$OUTPUT_DIR/dv-no-signal-stream.log"
 	local query_sig candidate_sig query_after_sig
 	local candidate_found=0 modes=0 no_signal_tested=0
 	local node idx
@@ -907,7 +943,7 @@ test_dv_timing_api() {
 	fi
 
 	if timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" --get-dv-timings-cap \
-		>"$cap_log" 2>&1 && grep -q 'Pixelclock' "$cap_log"; then
+		>"$cap_log" 2>&1 && grep -Eq 'P(ixel)?[Cc]lock' "$cap_log"; then
 		pass "DV capabilities include bounded pixel-clock metadata"
 	else
 		fail "DV timing capabilities were incomplete"
@@ -978,6 +1014,11 @@ test_dv_timing_api() {
 			fail "QUERY_DV_TIMINGS succeeded without a signal on $node"
 		else
 			pass "QUERY_DV_TIMINGS rejected no-signal input on $node"
+		fi
+		if test_no_signal_streamon "$node" "$no_signal_stream_log"; then
+			pass "no-signal STREAMON failed promptly on $node"
+		else
+			fail "no-signal STREAMON returned the wrong result on $node (see $no_signal_stream_log)"
 		fi
 		break
 	done
@@ -1071,9 +1112,33 @@ run_audio_capture() {
 		-c 2 -d "$AUDIO_SECONDS" /dev/null >"$logfile" 2>&1
 }
 
-audio_source_paths() {
+audio_source_card_number() {
 	local spec=${AUDIO_SOURCE_PCM#hw:}
-	local card=${spec%%,*}
+	local requested=${spec%%,*}
+	local card_path card_id
+
+	if [[ "$requested" =~ ^[0-9]+$ ]]; then
+		printf '%s\n' "$requested"
+		return 0
+	fi
+
+	shopt -s nullglob
+	for card_path in /proc/asound/card[0-9]*; do
+		[[ -r "$card_path/id" ]] || continue
+		card_id=$(<"$card_path/id")
+		if [[ "$card_id" == "$requested" ]]; then
+			printf '%s\n' "${card_path##*card}"
+			shopt -u nullglob
+			return 0
+		fi
+	done
+	shopt -u nullglob
+	return 1
+}
+
+audio_source_paths() {
+	local card=$1
+	local spec=${AUDIO_SOURCE_PCM#hw:}
 	local device=${spec##*,}
 
 	printf '%s\n' "/dev/snd/pcmC${card}D${device}p"
@@ -1082,13 +1147,16 @@ audio_source_paths() {
 }
 
 start_audio_source() {
-	local spec=${AUDIO_SOURCE_PCM#hw:}
-	local card=${spec%%,*}
+	local card
 	local node info status attempt rc eld
 	local -a paths=()
 
 	[[ -n "$AUDIO_SOURCE_PCM" ]] || return 0
-	mapfile -t paths < <(audio_source_paths)
+	card=$(audio_source_card_number) || {
+		log "Audio source card is missing: ${AUDIO_SOURCE_PCM#hw:}"
+		return 1
+	}
+	mapfile -t paths < <(audio_source_paths "$card")
 	node=${paths[0]}
 	info=${paths[1]}
 	status=${paths[2]}
@@ -1174,7 +1242,7 @@ audio_pcm_matches_live_video() {
 }
 
 test_concurrent_capture() {
-	local node pcm pid rc
+	local bounds_count bounds_delta node pcm pid rc
 	local failures=0
 	local audio_started=0
 	local index=0
@@ -1239,11 +1307,22 @@ test_concurrent_capture() {
 	else
 		fail "$failures concurrent video/audio capture process(es) failed"
 	fi
+	if ((audio_started > 0)); then
+		bounds_delta=$(phase_log_delta concurrent-audio-bounds)
+		bounds_count=$(grep -Ec \
+			'audio DMA bounds ch=[0-9]+ .*guard=ok' "$bounds_delta" || true)
+		if ((bounds_count >= audio_started)); then
+			pass "post-idle DMA bounds remained guarded for $audio_started audio capture(s)"
+		else
+			fail "only $bounds_count/$audio_started audio capture(s) produced clean DMA bounds evidence"
+		fi
+	fi
 }
 
 test_fault_injection() {
-	local original_command rc delta
-	local capture_pid
+	local audio_channel audio_delta audio_pcm audio_pid audio_rc
+	local original_command primary_channel rc delta
+	local capture_pid pcm
 
 	if ((!FAULT_INJECTION)); then
 		skip "W1C/INTx coalescing injection not requested"
@@ -1301,6 +1380,78 @@ test_fault_injection() {
 		fail "capture hung after ambiguity and had to be timed out"
 	else
 		fail "fault did not produce the complete kernel-to-userspace fail-closed sequence (see $delta)"
+	fi
+
+	if ((SKIP_AUDIO)); then
+		skip "audio W1C injection disabled by --skip-audio"
+		return
+	fi
+	if [[ -z "$AUDIO_SOURCE_PCM" ]]; then
+		skip "audio W1C injection requires --audio-source-pcm"
+		return
+	fi
+
+	discover_audio_pcms
+	primary_channel=$(video_node_channel "$PRIMARY_DEVICE" 2>/dev/null || true)
+	audio_pcm=
+	for pcm in "${AUDIO_PCMS[@]}"; do
+		audio_channel=${pcm##*,}
+		if [[ -n "$primary_channel" && "$audio_channel" == "$primary_channel" ]]; then
+			audio_pcm=$pcm
+			break
+		fi
+	done
+	if [[ -z "$audio_pcm" ]]; then
+		skip "no embedded-audio PCM matches $PRIMARY_DEVICE for W1C injection"
+		return
+	fi
+	if ! start_audio_source; then
+		stop_audio_source
+		fail "could not establish HDMI audio for W1C injection"
+		return
+	fi
+
+	phase_begin
+	timeout --signal=TERM --kill-after=2s 15s \
+		arecord -q --fatal-errors -D "$audio_pcm" -t raw -f S16_LE \
+		-r 48000 -c 2 -d 30 /dev/null \
+		>"$OUTPUT_DIR/fault-audio.log" 2>&1 &
+	audio_pid=$!
+	CHILD_PIDS+=("$audio_pid")
+	sleep 1
+	if ! kill -0 "$audio_pid" 2>/dev/null; then
+		fail "audio capture exited before INTx fault could be injected"
+		wait "$audio_pid" 2>/dev/null || true
+		CHILD_PIDS=()
+		stop_audio_source
+		return
+	fi
+	log "Gating legacy INTx on $BDF for 50 ms during $audio_pcm capture"
+	PCI_INTX_GATED=1
+	setpci -s "$BDF" COMMAND=0400:0400
+	sleep 0.050
+	restore_intx || die "could not restore INTx after audio fault injection"
+
+	set +e
+	wait "$audio_pid"
+	audio_rc=$?
+	set -e
+	CHILD_PIDS=()
+	stop_audio_source
+	audio_delta=$(phase_log_delta audio-fault-injection)
+	if grep -EinE 'BUG:|WARNING:|Oops:|KASAN:|KFENCE:|general protection fault|kernel panic|use-after-free' \
+		"$audio_delta" >"$audio_delta.failures"; then
+		fail "audio fault injection caused a kernel fault (see $audio_delta.failures)"
+	elif ((audio_rc != 124)) &&
+		grep -Eq 'audio telemetry event=xrun .*reason=(w1c-[^ ]+|duplicate-toggle|cadence)' \
+			"$audio_delta" &&
+		grep -Eq "audio DMA bounds ch=$audio_channel .*guard=ok" \
+			"$audio_delta"; then
+		pass "lost/coalesced ADONE failed the PCM closed and retained the audio DMA guard"
+	elif ((audio_rc == 124)); then
+		fail "audio capture hung after W1C injection and had to be timed out"
+	else
+		fail "audio fault did not produce a completion-loss XRUN plus clean DMA bounds evidence (see $audio_delta)"
 	fi
 }
 
