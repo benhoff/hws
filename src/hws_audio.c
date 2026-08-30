@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/interrupt.h>
 #include <linux/ktime.h>
+#include <linux/slab.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 
@@ -43,7 +44,12 @@ static void hws_audio_reset_counters(struct hws_audio *a)
 
 	WRITE_ONCE(a->irq_count, 0);
 	WRITE_ONCE(a->delivered_count, 0);
+	WRITE_ONCE(a->primed_packets, 0);
 	WRITE_ONCE(a->dropped_packets, 0);
+	WRITE_ONCE(a->cadence_errors, 0);
+	WRITE_ONCE(a->toggle_errors, 0);
+	WRITE_ONCE(a->generation_errors, 0);
+	WRITE_ONCE(a->deadline_misses, 0);
 	WRITE_ONCE(a->last_work_latency_ns, 0);
 	WRITE_ONCE(a->max_work_latency_ns, 0);
 	WRITE_ONCE(a->xrun_reason, HWS_AUDIO_XRUN_NONE);
@@ -110,6 +116,10 @@ static void hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
 #define HWS_AUDIO_PERIODS_MAX       16U
 #define HWS_AUDIO_PERIOD_BYTES_MAX  (HWS_AUDIO_PACKET_BYTES * 4U)
 #define HWS_AUDIO_BUFFER_BYTES_MAX  (HWS_AUDIO_PACKET_BYTES * HWS_AUDIO_PERIODS_MAX)
+#define HWS_AUDIO_CADENCE_EARLY_NUM 2U
+#define HWS_AUDIO_CADENCE_EARLY_DEN 3U
+#define HWS_AUDIO_CADENCE_LATE_NUM  3U
+#define HWS_AUDIO_CADENCE_LATE_DEN  2U
 
 /*
  * Audio DMA completes in fixed-size packets. The driver copies whole packets
@@ -321,8 +331,16 @@ static const char *hws_audio_xrun_reason_name(enum hws_audio_xrun_reason reason)
 		return "packet-in-flight";
 	case HWS_AUDIO_XRUN_DUPLICATE_TOGGLE:
 		return "duplicate-toggle";
+	case HWS_AUDIO_XRUN_IRQ_TIMESTAMP:
+		return "irq-timestamp";
+	case HWS_AUDIO_XRUN_CADENCE:
+		return "cadence";
 	case HWS_AUDIO_XRUN_WORK_DEADLINE:
 		return "work-deadline";
+	case HWS_AUDIO_XRUN_POST_COPY_TOGGLE:
+		return "post-copy-toggle";
+	case HWS_AUDIO_XRUN_GENERATION:
+		return "generation";
 	case HWS_AUDIO_XRUN_STREAM_STATE:
 		return "stream-state";
 	case HWS_AUDIO_XRUN_SUBSTREAM_MISSING:
@@ -335,6 +353,8 @@ static const char *hws_audio_xrun_reason_name(enum hws_audio_xrun_reason reason)
 		return "scratch-missing";
 	case HWS_AUDIO_XRUN_SCRATCH_BOUNDS:
 		return "scratch-bounds";
+	case HWS_AUDIO_XRUN_STAGING_MISSING:
+		return "staging-missing";
 	case HWS_AUDIO_XRUN_WORKQUEUE_MISSING:
 		return "workqueue-missing";
 	default:
@@ -351,8 +371,10 @@ static void hws_audio_log_telemetry(struct hws_audio *a, const char *event,
 	enum hws_audio_xrun_reason reason;
 	unsigned long flags;
 	dma_addr_t scratch_dma;
-	u64 last_latency_ns, max_latency_ns;
-	u32 irq_count, delivered_count, dropped_packets;
+	u64 generation, last_interval_ns, last_latency_ns, max_latency_ns;
+	u32 irq_count, delivered_count, primed_packets, dropped_packets;
+	u32 cadence_errors;
+	u32 toggle_errors, generation_errors, deadline_misses;
 	u32 acap, int_status, audio_dma, remap_hi, remap_lo;
 	u8 last_toggle, live_toggle;
 	unsigned int ch;
@@ -372,7 +394,14 @@ static void hws_audio_log_telemetry(struct hws_audio *a, const char *event,
 	last_toggle = a->last_irq_toggle;
 	irq_count = a->irq_count;
 	delivered_count = a->delivered_count;
+	primed_packets = a->primed_packets;
 	dropped_packets = a->dropped_packets;
+	generation = a->next_generation;
+	last_interval_ns = a->last_irq_interval_ns;
+	cadence_errors = a->cadence_errors;
+	toggle_errors = a->toggle_errors;
+	generation_errors = a->generation_errors;
+	deadline_misses = a->deadline_misses;
 	last_latency_ns = a->last_work_latency_ns;
 	max_latency_ns = a->max_work_latency_ns;
 	spin_unlock_irqrestore(&a->pending_lock, flags);
@@ -390,14 +419,18 @@ static void hws_audio_log_telemetry(struct hws_audio *a, const char *event,
 			 HWS_AUDIO_REMAP_SLOT_OFF(ch) + PCIE_BARADDROFSIZE);
 
 #define HWS_AUDIO_TELEMETRY_FMT \
-	"audio telemetry event=%s ch=%u reason=%s state=%u running=%d cap=%d stop=%d irq=%u last_toggle=%u live_toggle=%u delivered=%u dropped=%u work_last=%lluus work_max=%lluus ACAP=0x%08x INT_STATUS=0x%08x AUD_DMA=0x%08x REMAP_HI=0x%08x REMAP_LO=0x%08x scratch=%pad/%zu\n"
+	"audio telemetry event=%s ch=%u reason=%s state=%u running=%d cap=%d stop=%d irq=%u generation=%llu cadence_last=%lluus cadence_errors=%u last_toggle=%u live_toggle=%u toggle_errors=%u generation_errors=%u deadline_misses=%u primed=%u delivered=%u dropped=%u work_last=%lluus work_max=%lluus ACAP=0x%08x INT_STATUS=0x%08x AUD_DMA=0x%08x REMAP_HI=0x%08x REMAP_LO=0x%08x scratch=%pad/%zu\n"
 	if (error)
 		dev_err(&hws->pdev->dev, HWS_AUDIO_TELEMETRY_FMT,
 			event, ch, hws_audio_xrun_reason_name(reason),
 			packet_state, READ_ONCE(a->stream_running),
 			READ_ONCE(a->cap_active), READ_ONCE(a->stop_requested),
-			irq_count, last_toggle, live_toggle, delivered_count,
-			dropped_packets,
+			irq_count, (unsigned long long)generation,
+			(unsigned long long)div_u64(last_interval_ns,
+						      NSEC_PER_USEC),
+			cadence_errors, last_toggle, live_toggle, toggle_errors,
+			generation_errors, deadline_misses, primed_packets,
+			delivered_count, dropped_packets,
 			(unsigned long long)div_u64(last_latency_ns,
 						      NSEC_PER_USEC),
 			(unsigned long long)div_u64(max_latency_ns,
@@ -409,8 +442,12 @@ static void hws_audio_log_telemetry(struct hws_audio *a, const char *event,
 			 event, ch, hws_audio_xrun_reason_name(reason),
 			 packet_state, READ_ONCE(a->stream_running),
 			 READ_ONCE(a->cap_active), READ_ONCE(a->stop_requested),
-			 irq_count, last_toggle, live_toggle, delivered_count,
-			 dropped_packets,
+			 irq_count, (unsigned long long)generation,
+			 (unsigned long long)div_u64(last_interval_ns,
+						       NSEC_PER_USEC),
+			 cadence_errors, last_toggle, live_toggle, toggle_errors,
+			 generation_errors, deadline_misses, primed_packets,
+			 delivered_count, dropped_packets,
 			 (unsigned long long)div_u64(last_latency_ns,
 						       NSEC_PER_USEC),
 			 (unsigned long long)div_u64(max_latency_ns,
@@ -430,8 +467,12 @@ static void hws_audio_clear_pending(struct hws_audio *a)
 	spin_lock_irqsave(&a->pending_lock, flags);
 	a->packet_state = HWS_AUDIO_PACKET_IDLE;
 	a->pending_toggle = 0;
+	a->pending_publish = false;
 	a->pending_irq_ns = 0;
+	a->pending_generation = 0;
 	a->last_irq_toggle = 0xff;
+	a->last_irq_ns = 0;
+	a->last_irq_interval_ns = 0;
 	a->xrun_reason = HWS_AUDIO_XRUN_NONE;
 	spin_unlock_irqrestore(&a->pending_lock, flags);
 }
@@ -542,6 +583,7 @@ static void hws_audio_release_scratch(struct hws_audio *a, bool dma_idle)
 }
 
 static bool hws_audio_deliver_packet(struct hws_audio *a, const void *src,
+				     u64 generation,
 				     enum hws_audio_xrun_reason *failure)
 {
 	struct snd_pcm_substream *ss;
@@ -576,11 +618,26 @@ static bool hws_audio_deliver_packet(struct hws_audio *a, const void *src,
 		return false;
 	}
 
-	spin_lock_irqsave(&a->ring_lock, flags);
+	/*
+	 * Keep lifecycle invalidation and a new ADONE generation out of the
+	 * userspace-visible copy. Trigger-stop never nests these locks in the
+	 * opposite order: it publishes ring state, drops ring_lock, then clears
+	 * pending state.
+	 */
+	spin_lock_irqsave(&a->pending_lock, flags);
+	if (a->packet_state != HWS_AUDIO_PACKET_COPYING ||
+	    a->pending_generation != generation) {
+		spin_unlock_irqrestore(&a->pending_lock, flags);
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_GENERATION;
+		return false;
+	}
+	spin_lock(&a->ring_lock);
 	if (!READ_ONCE(a->stream_running) || !READ_ONCE(a->cap_active) ||
 	    READ_ONCE(a->stop_requested) ||
 	    READ_ONCE(a->pcm_substream) != ss) {
-		spin_unlock_irqrestore(&a->ring_lock, flags);
+		spin_unlock(&a->ring_lock);
+		spin_unlock_irqrestore(&a->pending_lock, flags);
 		if (failure)
 			*failure = HWS_AUDIO_XRUN_STREAM_STATE;
 		return false;
@@ -628,7 +685,8 @@ static bool hws_audio_deliver_packet(struct hws_audio *a, const void *src,
 		elapsed++;
 	}
 out_unlock:
-	spin_unlock_irqrestore(&a->ring_lock, flags);
+	spin_unlock(&a->ring_lock);
+	spin_unlock_irqrestore(&a->pending_lock, flags);
 
 	if (!READ_ONCE(a->stream_running) || !READ_ONCE(a->cap_active) ||
 	    READ_ONCE(a->stop_requested))
@@ -639,37 +697,76 @@ out_unlock:
 	return delivered;
 }
 
-static bool hws_audio_packet_stale(struct hws_audio *a, u64 irq_ns)
+static u64 hws_audio_packet_period_ns(const struct hws_audio *a)
 {
-	u64 packet_ns;
 	size_t frame_bytes;
 	u32 rate;
 	u64 frames;
 
-	if (!a || !irq_ns)
-		return false;
+	if (!a)
+		return 0;
 
 	frame_bytes = READ_ONCE(a->frame_bytes);
 	rate = READ_ONCE(a->output_sample_rate);
 	if (!frame_bytes || !rate || a->hw_packet_bytes % frame_bytes)
-		return false;
+		return 0;
 
 	frames = a->hw_packet_bytes / frame_bytes;
 	if (!frames)
-		return false;
+		return 0;
 
-	packet_ns = div_u64(frames * NSEC_PER_SEC, rate);
-	return ktime_get_mono_fast_ns() - irq_ns >= packet_ns;
+	return div_u64(frames * NSEC_PER_SEC, rate);
 }
 
-static bool hws_audio_deliver_one_packet(struct hws_audio *a, u8 cur_toggle,
-					 enum hws_audio_xrun_reason *failure)
+static bool hws_audio_cadence_valid(u64 period_ns, u64 interval_ns)
+{
+	u64 early_ns, late_ns;
+
+	if (!period_ns || !interval_ns)
+		return false;
+
+	early_ns = div_u64(period_ns * HWS_AUDIO_CADENCE_EARLY_NUM,
+			   HWS_AUDIO_CADENCE_EARLY_DEN);
+	late_ns = div_u64(period_ns * HWS_AUDIO_CADENCE_LATE_NUM,
+			  HWS_AUDIO_CADENCE_LATE_DEN);
+	return interval_ns >= early_ns && interval_ns <= late_ns;
+}
+
+static bool hws_audio_deadline_expired(const struct hws_audio *a, u64 irq_ns,
+				       u64 now_ns)
+{
+	u64 period_ns = hws_audio_packet_period_ns(a);
+
+	if (!period_ns || !irq_ns || now_ns < irq_ns)
+		return true;
+
+	return now_ns - irq_ns >= period_ns;
+}
+
+static bool hws_audio_generation_valid(struct hws_audio *a, u64 generation)
+{
+	unsigned long flags;
+	bool valid;
+
+	spin_lock_irqsave(&a->pending_lock, flags);
+	valid = a->packet_state == HWS_AUDIO_PACKET_COPYING &&
+		a->pending_generation == generation;
+	spin_unlock_irqrestore(&a->pending_lock, flags);
+	return valid;
+}
+
+static bool hws_audio_stage_one_packet(struct hws_audio *a, u8 cur_toggle,
+				       u64 generation, u64 irq_ns,
+				       enum hws_audio_xrun_reason *failure)
 {
 	struct hws_pcie_dev *hws;
 	unsigned int ch;
 	void *cpu;
+	void *staging;
+	u64 now_ns;
 	size_t size;
 	size_t offset;
+	u8 live_toggle;
 
 	if (failure)
 		*failure = HWS_AUDIO_XRUN_NONE;
@@ -681,7 +778,7 @@ static bool hws_audio_deliver_one_packet(struct hws_audio *a, u8 cur_toggle,
 
 	hws = a->parent;
 	ch = a->channel_index;
-	if (!hws || ch >= hws->cur_max_audio_ch) {
+	if (!hws || !hws->bar0_base || ch >= hws->cur_max_audio_ch) {
 		if (failure)
 			*failure = HWS_AUDIO_XRUN_STREAM_STATE;
 		return false;
@@ -691,6 +788,32 @@ static bool hws_audio_deliver_one_packet(struct hws_audio *a, u8 cur_toggle,
 	    READ_ONCE(a->stop_requested)) {
 		if (failure)
 			*failure = HWS_AUDIO_XRUN_STREAM_STATE;
+		return false;
+	}
+	staging = READ_ONCE(a->staging_buffer);
+	if (!staging || READ_ONCE(a->staging_size) < a->hw_packet_bytes) {
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_STAGING_MISSING;
+		return false;
+	}
+	if (!hws_audio_generation_valid(a, generation)) {
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_GENERATION;
+		return false;
+	}
+
+	now_ns = ktime_get_mono_fast_ns();
+	if (hws_audio_deadline_expired(a, irq_ns, now_ns)) {
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_WORK_DEADLINE;
+		return false;
+	}
+
+	live_toggle = readl_relaxed(hws->bar0_base +
+				    HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+	if (live_toggle != cur_toggle) {
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_POST_COPY_TOGGLE;
 		return false;
 	}
 
@@ -708,7 +831,56 @@ static bool hws_audio_deliver_one_packet(struct hws_audio *a, u8 cur_toggle,
 	}
 
 	dma_rmb();
-	return hws_audio_deliver_packet(a, (char *)cpu + offset, failure);
+	memcpy(staging, (char *)cpu + offset, a->hw_packet_bytes);
+	/* Order the DMA read before observing whether hardware changed halves. */
+	dma_rmb();
+	live_toggle = readl_relaxed(hws->bar0_base +
+				    HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+	if (live_toggle != cur_toggle) {
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_POST_COPY_TOGGLE;
+		return false;
+	}
+
+	now_ns = ktime_get_mono_fast_ns();
+	if (hws_audio_deadline_expired(a, irq_ns, now_ns)) {
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_WORK_DEADLINE;
+		return false;
+	}
+	if (!hws_audio_generation_valid(a, generation)) {
+		if (failure)
+			*failure = HWS_AUDIO_XRUN_GENERATION;
+		return false;
+	}
+
+	return true;
+}
+
+static void
+hws_audio_count_failure_locked(struct hws_audio *a,
+			       enum hws_audio_xrun_reason reason)
+{
+	lockdep_assert_held(&a->pending_lock);
+
+	switch (reason) {
+	case HWS_AUDIO_XRUN_DUPLICATE_TOGGLE:
+	case HWS_AUDIO_XRUN_POST_COPY_TOGGLE:
+		a->toggle_errors++;
+		break;
+	case HWS_AUDIO_XRUN_IRQ_TIMESTAMP:
+	case HWS_AUDIO_XRUN_CADENCE:
+		a->cadence_errors++;
+		break;
+	case HWS_AUDIO_XRUN_GENERATION:
+		a->generation_errors++;
+		break;
+	case HWS_AUDIO_XRUN_WORK_DEADLINE:
+		a->deadline_misses++;
+		break;
+	default:
+		break;
+	}
 }
 
 static void hws_audio_deliver_work(struct work_struct *work)
@@ -717,6 +889,9 @@ static void hws_audio_deliver_work(struct work_struct *work)
 	enum hws_audio_xrun_reason delivery_failure;
 	unsigned long flags;
 	bool delivered;
+	bool publish;
+	bool staged;
+	u64 generation;
 	u64 latency_ns;
 	u64 irq_ns;
 	u8 toggle;
@@ -733,7 +908,9 @@ static void hws_audio_deliver_work(struct work_struct *work)
 			break;
 		}
 		toggle = a->pending_toggle;
+		publish = a->pending_publish;
 		irq_ns = a->pending_irq_ns;
+		generation = a->pending_generation;
 		a->packet_state = HWS_AUDIO_PACKET_COPYING;
 		spin_unlock_irqrestore(&a->pending_lock, flags);
 
@@ -744,99 +921,173 @@ static void hws_audio_deliver_work(struct work_struct *work)
 			a->max_work_latency_ns = latency_ns;
 		spin_unlock_irqrestore(&a->pending_lock, flags);
 
-		if (hws_audio_packet_stale(a, irq_ns)) {
-			spin_lock_irqsave(&a->pending_lock, flags);
-			if (a->packet_state == HWS_AUDIO_PACKET_COPYING) {
-				a->packet_state = HWS_AUDIO_PACKET_XRUN;
-				a->xrun_reason = HWS_AUDIO_XRUN_WORK_DEADLINE;
-				a->dropped_packets++;
-			}
-			spin_unlock_irqrestore(&a->pending_lock, flags);
-			continue;
-		}
-
-		delivered = hws_audio_deliver_one_packet(a, toggle,
-							 &delivery_failure);
+		staged = hws_audio_stage_one_packet(a, toggle, generation,
+						    irq_ns,
+						    &delivery_failure);
+		if (staged && publish)
+			delivered = hws_audio_deliver_packet(a, a->staging_buffer,
+							     generation,
+							     &delivery_failure);
+		else
+			delivered = staged;
 
 		spin_lock_irqsave(&a->pending_lock, flags);
-		if (a->packet_state == HWS_AUDIO_PACKET_COPYING) {
+		if (a->packet_state == HWS_AUDIO_PACKET_COPYING &&
+		    a->pending_generation != generation) {
+			a->packet_state = HWS_AUDIO_PACKET_XRUN;
+			a->xrun_reason = HWS_AUDIO_XRUN_GENERATION;
+			a->dropped_packets++;
+			hws_audio_count_failure_locked(a, a->xrun_reason);
+		} else if (a->packet_state == HWS_AUDIO_PACKET_COPYING) {
 			if (!READ_ONCE(a->stream_running) ||
 			    !READ_ONCE(a->cap_active) ||
 			    READ_ONCE(a->stop_requested)) {
 				a->packet_state = HWS_AUDIO_PACKET_IDLE;
+				a->pending_publish = false;
 				a->pending_irq_ns = 0;
+				a->pending_generation = 0;
 			} else if (delivered) {
 				a->packet_state = HWS_AUDIO_PACKET_IDLE;
+				a->pending_publish = false;
 				a->pending_irq_ns = 0;
-				a->delivered_count++;
+				a->pending_generation = 0;
+				if (publish)
+					a->delivered_count++;
+				else
+					a->primed_packets++;
 			} else {
 				a->packet_state = HWS_AUDIO_PACKET_XRUN;
 				a->xrun_reason = delivery_failure;
 				a->dropped_packets++;
+				hws_audio_count_failure_locked(a, delivery_failure);
 			}
 		}
 		spin_unlock_irqrestore(&a->pending_lock, flags);
 	}
 }
 
-void hws_audio_queue_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
-			       u8 cur_toggle, u64 irq_ns)
+bool hws_audio_record_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
+				u8 cur_toggle, u64 irq_ns)
 {
-	struct workqueue_struct *wq;
 	struct hws_audio *a;
 	enum hws_audio_packet_state state;
-	bool toggle_error;
 	bool xrun = false;
+	u64 generation;
+	u64 interval_ns = 0;
+	u64 period_ns;
 	u8 last_toggle;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
-		return;
+		return false;
 
 	a = &hws->audio[ch];
 	if (!READ_ONCE(a->stream_running) || !READ_ONCE(a->cap_active) ||
 	    READ_ONCE(a->stop_requested))
-		return;
-
-	wq = READ_ONCE(hws->audio_wq);
-	if (!wq) {
-		spin_lock(&a->pending_lock);
-		a->dropped_packets++;
-		a->xrun_reason = HWS_AUDIO_XRUN_WORKQUEUE_MISSING;
-		spin_unlock(&a->pending_lock);
-		hws_audio_log_telemetry(a, "xrun-irq", true);
-		return;
-	}
+		return false;
+	if (!irq_ns)
+		irq_ns = ktime_get_mono_fast_ns();
+	period_ns = hws_audio_packet_period_ns(a);
 
 	spin_lock(&a->pending_lock);
 	state = a->packet_state;
 	last_toggle = a->last_irq_toggle;
-	toggle_error = last_toggle != 0xff && cur_toggle == last_toggle;
 	a->irq_count++;
-	if (state != HWS_AUDIO_PACKET_IDLE || toggle_error) {
-		if (state != HWS_AUDIO_PACKET_XRUN)
+	generation = ++a->next_generation;
+	if (!generation)
+		generation = ++a->next_generation;
+	if (a->last_irq_ns && irq_ns > a->last_irq_ns)
+		interval_ns = irq_ns - a->last_irq_ns;
+	a->last_irq_interval_ns = interval_ns;
+	if (state != HWS_AUDIO_PACKET_IDLE) {
+		if (state != HWS_AUDIO_PACKET_XRUN) {
 			a->dropped_packets++;
+			a->xrun_reason = HWS_AUDIO_XRUN_PACKET_IN_FLIGHT;
+		}
 		a->packet_state = HWS_AUDIO_PACKET_XRUN;
-		a->xrun_reason = state != HWS_AUDIO_PACKET_IDLE ?
-			HWS_AUDIO_XRUN_PACKET_IN_FLIGHT :
-			HWS_AUDIO_XRUN_DUPLICATE_TOGGLE;
+		xrun = true;
+	} else if (!period_ns) {
+		a->dropped_packets++;
+		a->packet_state = HWS_AUDIO_PACKET_XRUN;
+		a->xrun_reason = HWS_AUDIO_XRUN_RING_INVALID;
+		xrun = true;
+	} else if (a->last_irq_ns && irq_ns <= a->last_irq_ns) {
+		a->dropped_packets++;
+		a->packet_state = HWS_AUDIO_PACKET_XRUN;
+		a->xrun_reason = HWS_AUDIO_XRUN_IRQ_TIMESTAMP;
+		hws_audio_count_failure_locked(a, a->xrun_reason);
+		xrun = true;
+	} else if (last_toggle != 0xff && cur_toggle == last_toggle) {
+		a->dropped_packets++;
+		a->packet_state = HWS_AUDIO_PACKET_XRUN;
+		a->xrun_reason = HWS_AUDIO_XRUN_DUPLICATE_TOGGLE;
+		hws_audio_count_failure_locked(a, a->xrun_reason);
+		xrun = true;
+	} else if (a->last_irq_ns &&
+		   !hws_audio_cadence_valid(period_ns, interval_ns)) {
+		a->dropped_packets++;
+		a->packet_state = HWS_AUDIO_PACKET_XRUN;
+		a->xrun_reason = HWS_AUDIO_XRUN_CADENCE;
+		hws_audio_count_failure_locked(a, a->xrun_reason);
 		xrun = true;
 	} else {
 		a->pending_toggle = cur_toggle;
-		a->pending_irq_ns = irq_ns ? irq_ns : ktime_get_mono_fast_ns();
+		/* The first staged packet establishes cadence; do not publish it. */
+		a->pending_publish = !!a->last_irq_ns;
+		a->pending_irq_ns = irq_ns;
+		a->pending_generation = generation;
 		a->last_irq_toggle = cur_toggle;
+		a->last_irq_ns = irq_ns;
 		a->packet_state = HWS_AUDIO_PACKET_PENDING;
 	}
 	spin_unlock(&a->pending_lock);
 
 	if (xrun) {
 		/* Stop reuse of the DMA halves before deferred XRUN reporting. */
-		hws_audio_log_telemetry(a, "xrun-irq", true);
 		WRITE_ONCE(a->cap_active, false);
 		smp_wmb(); /* publish stopped state before posting ACAP disable */
 		hws_enable_audio_capture(hws, ch, false);
 	}
 
+	return true;
+}
+
+void hws_audio_queue_work(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct workqueue_struct *wq;
+	struct hws_audio *a;
+
+	if (!hws || ch >= hws->cur_max_audio_ch)
+		return;
+
+	a = &hws->audio[ch];
+	wq = READ_ONCE(hws->audio_wq);
+	if (!wq) {
+		spin_lock(&a->pending_lock);
+		if (a->packet_state != HWS_AUDIO_PACKET_XRUN)
+			a->dropped_packets++;
+		a->packet_state = HWS_AUDIO_PACKET_XRUN;
+		a->xrun_reason = HWS_AUDIO_XRUN_WORKQUEUE_MISSING;
+		spin_unlock(&a->pending_lock);
+		WRITE_ONCE(a->cap_active, false);
+		smp_wmb(); /* publish stopped state before posting ACAP disable */
+		hws_enable_audio_capture(hws, ch, false);
+		hws_audio_log_telemetry(a, "xrun-irq", true);
+		return;
+	}
+
 	queue_work(wq, &a->deliver_work);
+}
+
+static void hws_audio_free_staging(struct hws_audio *a)
+{
+	void *staging;
+
+	if (!a)
+		return;
+
+	staging = xchg(&a->staging_buffer, NULL);
+	WRITE_ONCE(a->staging_size, 0);
+	kfree(staging);
 }
 
 int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
@@ -862,6 +1113,15 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch)
 	aud->channel_count      = 2;
 	aud->bits_per_sample    = 16;
 	aud->hw_packet_bytes    = pdev->audio_pkt_size;
+	if (ch < pdev->cur_max_audio_ch) {
+		if (!aud->hw_packet_bytes ||
+		    aud->hw_packet_bytes > HWS_AUDIO_PACKET_BYTES)
+			return -EINVAL;
+		aud->staging_buffer = kmalloc(aud->hw_packet_bytes, GFP_KERNEL);
+		if (!aud->staging_buffer)
+			return -ENOMEM;
+		aud->staging_size = aud->hw_packet_bytes;
+	}
 
 	/* ALSA linkage */
 	WRITE_ONCE(aud->pcm_substream, NULL);
@@ -903,6 +1163,7 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 	}
 
 	hws_audio_release_scratch(aud, false);
+	hws_audio_free_staging(aud);
 }
 
 static inline bool hws_check_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
@@ -1390,6 +1651,7 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 		WRITE_ONCE(a->pcm_substream, NULL);
 		hws_audio_reset_runtime_state(a);
 		hws_audio_release_scratch(a, false);
+		hws_audio_free_staging(a);
 	}
 
 	if (hws->snd_card) {

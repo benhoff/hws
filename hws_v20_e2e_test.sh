@@ -66,7 +66,7 @@ Normal execution:
   3. Reload the in-tree module in normal MSI-preferred mode and verify it.
   4. Discover HWS video and ALSA nodes through the selected PCI function.
   5. Capture complete MMAP frames after startup synchronization.
-  6. Verify USERPTR is rejected, stress CPU copies, and repeat STREAMON/OFF.
+  6. Verify packed YUYV, reject USERPTR, stress copies, and repeat STREAMON/OFF.
   7. Capture all live video inputs concurrently with embedded audio.
   8. Optionally reload with forced INTx and inject W1C coalescing.
   9. Reload in normal MSI-preferred mode and prove capture recovers.
@@ -805,6 +805,29 @@ test_memory_model() {
 	fi
 }
 
+test_packed_yuyv() {
+	local logfile="$OUTPUT_DIR/packed-yuyv.log"
+	local bytesperline sizeimage
+
+	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
+		--try-fmt-video=width=720,height=576,pixelformat=YUYV,bytesperline=4096,sizeimage=4194304 \
+		>"$logfile" 2>&1; then
+		fail "packed YUYV TRY_FMT probe failed"
+		return
+	fi
+	bytesperline=$(awk -F: '/Bytes per Line/ {
+		gsub(/[[:space:]]/, "", $2); print $2; exit
+	}' "$logfile")
+	sizeimage=$(awk -F: '/Size Image/ {
+		gsub(/[[:space:]]/, "", $2); print $2; exit
+	}' "$logfile")
+	if [[ "$bytesperline" == 1440 && "$sizeimage" == 829440 ]]; then
+		pass "padded TRY_FMT request was normalized to packed 720x576 YUYV"
+	else
+		fail "TRY_FMT returned bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected 1440/829440"
+	fi
+}
+
 start_cpu_stress() {
 	local workers=$CPU_WORKERS
 	local available worker
@@ -1253,10 +1276,11 @@ main() {
 	test_startup_and_normal_capture
 	finish_clean_phase normal-capture "startup and normal capture"
 
-	step "Verify the guarded path exposes MMAP-only VB2 capture"
+	step "Verify packed YUYV and MMAP-only VB2 capture"
 	phase_begin
+	test_packed_yuyv
 	test_memory_model
-	finish_clean_phase memory-model "memory-model rejection"
+	finish_clean_phase memory-model "packed format and memory-model checks"
 
 	step "Exercise copy deadlines under CPU contention"
 	phase_begin

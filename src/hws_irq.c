@@ -14,11 +14,11 @@
 #include "hws.h"
 #include "hws_audio.h"
 
-#define MAX_INT_LOOPS 100
 /* Characterized minimum reuse was 7,950 us at 1080p60. */
 #define HWS_VIDEO_COPY_DEADLINE_NS (7500ULL * NSEC_PER_USEC)
 #define HWS_VIDEO_REUSE_MARGIN_NS  (500ULL * NSEC_PER_USEC)
-#define HWS_VIDEO_SYNC_EVENTS 2
+#define HWS_VIDEO_SYNC_EVENTS 8
+#define HWS_VIDEO_SYNC_RESTARTS_MAX 4
 
 struct hws_vdone_event {
 	u64 timestamp_ns;
@@ -27,9 +27,17 @@ struct hws_vdone_event {
 	u8 toggle;
 };
 
+struct hws_vdone_toggle_sample {
+	u8 before_ack;
+	u8 after_ack;
+	bool post_ack_stable;
+	bool status_reasserted;
+};
+
 enum hws_vdone_record_result {
 	HWS_VDONE_IGNORED,
 	HWS_VDONE_QUEUED,
+	HWS_VDONE_RESYNCED,
 	HWS_VDONE_OVERRUN,
 };
 
@@ -39,6 +47,8 @@ enum hws_vdone_ambiguity {
 	HWS_VDONE_AMBIG_DUPLICATE,
 	HWS_VDONE_AMBIG_TIMESTAMP,
 	HWS_VDONE_AMBIG_CADENCE,
+	HWS_VDONE_AMBIG_TOGGLE_UNSTABLE,
+	HWS_VDONE_AMBIG_STATUS_REASSERTED,
 };
 
 static u64 hws_video_phase_period_ns(const struct hws_video *v)
@@ -94,6 +104,10 @@ hws_vdone_ambiguity_name(enum hws_vdone_ambiguity ambiguity)
 		return "non-monotonic completion timestamp";
 	case HWS_VDONE_AMBIG_CADENCE:
 		return "completion cadence outside half-period bounds";
+	case HWS_VDONE_AMBIG_TOGGLE_UNSTABLE:
+		return "post-W1C toggle sample was unstable";
+	case HWS_VDONE_AMBIG_STATUS_REASSERTED:
+		return "VDONE reasserted during W1C acknowledgment";
 	case HWS_VDONE_AMBIG_NONE:
 	default:
 		return "none";
@@ -198,10 +212,12 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		}
 		v->phase_generation = event->generation;
 		v->sync_events++;
-		if (v->sync_events >= HWS_VIDEO_SYNC_EVENTS)
+		if (v->sync_events >= HWS_VIDEO_SYNC_EVENTS) {
 			v->half_phase = completed_half ?
 				HWS_VIDEO_PHASE_EXPECT_HALF0 :
 				HWS_VIDEO_PHASE_EXPECT_HALF1;
+			v->sync_restart_streak = 0;
+		}
 		skip_copy = true;
 		buf = NULL;
 	} else if ((!completed_half &&
@@ -345,10 +361,11 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		event.toggle = v->completion_toggle;
 		ret = -EOVERFLOW;
 		fail = true;
-	} else if (v->completion_state != HWS_VIDEO_COMPLETION_PENDING) {
-		spin_unlock_irqrestore(&v->irq_lock, flags);
-		return;
 	} else {
+		if (v->completion_state != HWS_VIDEO_COMPLETION_PENDING) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			return;
+		}
 		event.timestamp_ns = v->completion_timestamp_ns;
 		event.deadline_ns = v->completion_deadline_ns;
 		event.generation = v->completion_generation;
@@ -434,44 +451,68 @@ fail_queue:
 			div_u64(now_ns - event.timestamp_ns, NSEC_PER_USEC) : 0;
 
 		dev_err_ratelimited(&hws->pdev->dev,
-			"VDONE half-ring failure ch=%u generation=%llu toggle=%u phase=%u elapsed=%lluus ret=%d ambiguity=%u phase_errors=%u deadlines=%u mismatches=%u guards=%u\n",
-			ch, (unsigned long long)event.generation,
-			event.toggle, READ_ONCE(v->half_phase),
-			(unsigned long long)elapsed_us, ret,
-			READ_ONCE(v->w1c_ambiguities),
-			READ_ONCE(v->phase_errors),
-			READ_ONCE(v->deadline_misses),
-			READ_ONCE(v->copy_mismatches),
-			READ_ONCE(v->guard_errors));
+				    "VDONE half-ring failure ch=%u generation=%llu toggle=%u phase=%u elapsed=%lluus ret=%d ambiguity=%u resamples=%u sample_errors=%u phase_errors=%u deadlines=%u mismatches=%u guards=%u\n",
+				    ch, (unsigned long long)event.generation,
+				    event.toggle, READ_ONCE(v->half_phase),
+				    (unsigned long long)elapsed_us, ret,
+				    READ_ONCE(v->w1c_ambiguities),
+				    READ_ONCE(v->toggle_resamples),
+				    READ_ONCE(v->toggle_sample_errors),
+				    READ_ONCE(v->phase_errors),
+				    READ_ONCE(v->deadline_misses),
+				    READ_ONCE(v->copy_mismatches),
+				    READ_ONCE(v->guard_errors));
 	}
 	hws_video_fail_queue(v,
-		"ambiguous VDONE phase, generation, copy, guard, or deadline");
+			     "ambiguous VDONE phase, generation, copy, guard, or deadline");
 }
 
-static void hws_irq_ack_status(struct hws_pcie_dev *pdx, u32 int_state)
+static void hws_video_vdone_work(struct work_struct *work)
+{
+	struct hws_video *v = container_of(work, struct hws_video, vdone_work);
+
+	hws_video_handle_vdone(v);
+}
+
+void hws_irq_init_video_work(struct hws_video *vid)
+{
+	INIT_WORK(&vid->vdone_work, hws_video_vdone_work);
+}
+
+static u32 hws_irq_ack_status(struct hws_pcie_dev *pdx, u32 int_state)
 {
 	if (!int_state || !pdx || !pdx->bar0_base)
-		return;
+		return 0;
 
 	writel(int_state, pdx->bar0_base + HWS_REG_INT_STATUS);
-	(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+	return readl(pdx->bar0_base + HWS_REG_INT_STATUS);
 }
 
 static void hws_irq_queue_vdone_work(struct hws_pcie_dev *pdx,
 				     unsigned int ch)
 {
-	unsigned long flags;
+	struct workqueue_struct *wq;
+	struct hws_video *v;
 
 	if (!pdx || ch >= MAX_VID_CHANNELS)
 		return;
 
-	spin_lock_irqsave(&pdx->irq_thread_lock, flags);
-	pdx->irq_pending_vdone[ch] = true;
-	spin_unlock_irqrestore(&pdx->irq_thread_lock, flags);
+	v = &pdx->video[ch];
+	wq = READ_ONCE(pdx->video_wq);
+	if (WARN_ON_ONCE(!wq)) {
+		WRITE_ONCE(v->stop_requested, true);
+		WRITE_ONCE(v->cap_active, false);
+		hws_enable_video_capture(pdx, ch, false);
+		return;
+	}
+
+	/* One work item per channel prevents one channel's copy from blocking another. */
+	queue_work(wq, &v->vdone_work);
 }
 
 static enum hws_vdone_record_result
-hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
+hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
+		     const struct hws_vdone_toggle_sample *sample,
 		     u64 timestamp_ns)
 {
 	struct hws_video *v;
@@ -480,10 +521,14 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 	enum hws_vdone_record_result result;
 	u64 generation = 0;
 	u64 previous_ns = 0;
+	u64 interval_us = 0;
+	u8 sync_attempt = 0;
+	u8 toggle;
 
-	if (!pdx || ch >= MAX_VID_CHANNELS)
+	if (!pdx || ch >= MAX_VID_CHANNELS || !sample)
 		return HWS_VDONE_IGNORED;
 
+	toggle = sample->after_ack;
 	v = &pdx->video[ch];
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (!READ_ONCE(v->cap_active) || READ_ONCE(v->stop_requested)) {
@@ -497,6 +542,10 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 
 		if (v->completion_state != HWS_VIDEO_COMPLETION_IDLE)
 			ambiguity = HWS_VDONE_AMBIG_INFLIGHT;
+		else if (sample->status_reasserted)
+			ambiguity = HWS_VDONE_AMBIG_STATUS_REASSERTED;
+		else if (!sample->post_ack_stable)
+			ambiguity = HWS_VDONE_AMBIG_TOGGLE_UNSTABLE;
 		else if (v->half_seen && timestamp_ns <= previous_ns)
 			ambiguity = HWS_VDONE_AMBIG_TIMESTAMP;
 		else if (v->half_seen &&
@@ -511,13 +560,41 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 		v->completion_deadline_ns = hws_video_copy_deadline_ns(v);
 		v->completion_generation = generation;
 		v->completion_toggle = toggle;
-		if (ambiguity != HWS_VDONE_AMBIG_NONE) {
+		if ((ambiguity == HWS_VDONE_AMBIG_DUPLICATE ||
+		     ambiguity == HWS_VDONE_AMBIG_CADENCE) &&
+		    v->half_phase == HWS_VIDEO_PHASE_SYNC && !v->active &&
+		    !v->frame_generation && !v->frame_half0_valid &&
+		    !v->frame_timestamp_ns &&
+		    v->sync_restart_streak < HWS_VIDEO_SYNC_RESTARTS_MAX) {
+			/*
+			 * Some rapid enables expose a stale first boundary while the
+			 * native ring settles.  No VB2 memory has been touched in SYNC,
+			 * so discard the acquisition sequence and require a complete new
+			 * run of alternating events.  This escape is deliberately bounded
+			 * and is unavailable once frame assembly begins.
+			 */
+			v->sync_events = 0;
+			v->sync_restart_streak++;
+			sync_attempt = v->sync_restart_streak;
+			v->sync_restarts++;
+			v->phase_generation = 0;
+			hws_irq_reset_completion_locked(v);
+			WRITE_ONCE(v->last_buf_half_toggle, toggle);
+			WRITE_ONCE(v->half_seen, true);
+			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
+			result = HWS_VDONE_RESYNCED;
+		} else if (ambiguity != HWS_VDONE_AMBIG_NONE) {
 			hws_irq_mark_failure_locked(v, -EOVERFLOW);
 			v->w1c_ambiguities++;
+			if (ambiguity == HWS_VDONE_AMBIG_TOGGLE_UNSTABLE ||
+			    ambiguity == HWS_VDONE_AMBIG_STATUS_REASSERTED)
+				v->toggle_sample_errors++;
 			WRITE_ONCE(v->stop_requested, true);
 			WRITE_ONCE(v->cap_active, false);
 			result = HWS_VDONE_OVERRUN;
 		} else {
+			if (sample->before_ack != sample->after_ack)
+				v->toggle_resamples++;
 			v->completion_state = HWS_VIDEO_COMPLETION_PENDING;
 			WRITE_ONCE(v->last_buf_half_toggle, toggle);
 			WRITE_ONCE(v->half_seen, true);
@@ -526,71 +603,88 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 		}
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
+	if (timestamp_ns > previous_ns)
+		interval_us = div_u64(timestamp_ns - previous_ns,
+				      NSEC_PER_USEC);
 
-	if (result == HWS_VDONE_OVERRUN) {
-		u64 interval_us = timestamp_ns > previous_ns ?
-			div_u64(timestamp_ns - previous_ns, NSEC_PER_USEC) : 0;
-
+	if (result == HWS_VDONE_RESYNCED) {
+		dev_info_ratelimited(&pdx->pdev->dev,
+				     "VDONE startup resync ch=%u generation=%llu toggle=%u interval=%lluus reason=%s attempt=%u/%u\n",
+				     ch, (unsigned long long)generation, toggle,
+				     (unsigned long long)interval_us,
+				     hws_vdone_ambiguity_name(ambiguity),
+				     sync_attempt,
+				     HWS_VIDEO_SYNC_RESTARTS_MAX);
+	} else if (result == HWS_VDONE_OVERRUN) {
 		hws_enable_video_capture(pdx, ch, false);
 		dev_err_ratelimited(&pdx->pdev->dev,
-				    "VDONE ambiguity ch=%u generation=%llu toggle=%u interval=%lluus: %s\n",
+				    "VDONE ambiguity ch=%u generation=%llu toggle=%u pre_ack=%u post_stable=%u reasserted=%u interval=%lluus: %s\n",
 				    ch, (unsigned long long)generation, toggle,
+				    sample->before_ack, sample->post_ack_stable,
+				    sample->status_reasserted,
 				    (unsigned long long)interval_us,
 				    hws_vdone_ambiguity_name(ambiguity));
 	}
-	if (result != HWS_VDONE_IGNORED)
-		hws_irq_queue_vdone_work(pdx, ch);
-
 	return result;
 }
 
-static bool hws_irq_take_vdone(struct hws_pcie_dev *pdx, unsigned int *ch)
+static void
+hws_irq_sample_video_before_ack(struct hws_pcie_dev *pdx, u32 int_state,
+				struct hws_vdone_toggle_sample samples[])
 {
-	unsigned long flags;
-	unsigned int i;
+	unsigned int ch;
 
-	if (!pdx || !ch)
-		return false;
-
-	spin_lock_irqsave(&pdx->irq_thread_lock, flags);
-	for (i = 0; i < pdx->cur_max_video_ch && i < MAX_VID_CHANNELS; i++) {
-		if (pdx->irq_pending_vdone[i]) {
-			pdx->irq_pending_vdone[i] = false;
-			*ch = i;
-			spin_unlock_irqrestore(&pdx->irq_thread_lock, flags);
-			return true;
-		}
+	for (ch = 0; ch < pdx->cur_max_video_ch; ch++) {
+		if (!(int_state & HWS_INT_VDONE_BIT(ch)))
+			continue;
+		samples[ch].before_ack = readl(pdx->bar0_base +
+					       HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+		samples[ch].after_ack = samples[ch].before_ack;
 	}
-	spin_unlock_irqrestore(&pdx->irq_thread_lock, flags);
-	return false;
 }
 
-static bool hws_irq_queue_video(struct hws_pcie_dev *pdx, u32 int_state,
-				u64 timestamp_ns)
+static u32
+hws_irq_record_video(struct hws_pcie_dev *pdx, u32 int_state,
+		     u32 status_after_ack,
+		     struct hws_vdone_toggle_sample samples[], u64 timestamp_ns)
 {
-	bool wake_thread = false;
+	u32 work_mask = 0;
 	unsigned int ch;
 
 	for (ch = 0; ch < pdx->cur_max_video_ch; ++ch) {
 		u32 vbit = HWS_INT_VDONE_BIT(ch);
 		enum hws_vdone_record_result result;
-		u8 toggle;
+		u8 first, second;
 
 		if (!(int_state & vbit))
 			continue;
 
 		if (READ_ONCE(pdx->video[ch].cap_active) &&
 		    !READ_ONCE(pdx->video[ch].stop_requested)) {
-			toggle = readl_relaxed(pdx->bar0_base +
-					       HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-			result = hws_irq_record_vdone(pdx, ch, toggle,
+			first = readl(pdx->bar0_base +
+				      HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+			second = readl(pdx->bar0_base +
+				       HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+			samples[ch].after_ack = second;
+			samples[ch].post_ack_stable = first == second;
+			samples[ch].status_reasserted = status_after_ack & vbit;
+			result = hws_irq_record_vdone(pdx, ch, &samples[ch],
 						      timestamp_ns);
-			if (result != HWS_VDONE_IGNORED)
-				wake_thread = true;
-			if (result == HWS_VDONE_QUEUED)
+			if (result == HWS_VDONE_QUEUED ||
+			    result == HWS_VDONE_OVERRUN)
+				work_mask |= BIT(ch);
+			if (result == HWS_VDONE_QUEUED &&
+			    samples[ch].before_ack != samples[ch].after_ack)
+				dev_info_ratelimited(&pdx->pdev->dev,
+						     "VDONE toggle resampled ch=%u pre_ack=%u post_ack=%u total=%u\n",
+						     ch, samples[ch].before_ack,
+						     samples[ch].after_ack,
+						     READ_ONCE(pdx->video[ch].toggle_resamples));
+			else if (result == HWS_VDONE_QUEUED)
 				dev_dbg(&pdx->pdev->dev,
-					"irq: VDONE ch=%u identity queued toggle=%u\n",
-					ch, toggle);
+					"irq: VDONE ch=%u queued pre_ack=%u post_ack=%u\n",
+					ch, samples[ch].before_ack,
+					samples[ch].after_ack);
 		} else {
 			dev_dbg(&pdx->pdev->dev,
 				"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
@@ -600,12 +694,23 @@ static bool hws_irq_queue_video(struct hws_pcie_dev *pdx, u32 int_state,
 		}
 	}
 
-	return wake_thread;
+	return work_mask;
 }
 
-static void hws_irq_handle_audio(struct hws_pcie_dev *pdx, u32 int_state,
-				 u64 timestamp_ns)
+static void hws_irq_queue_video_work(struct hws_pcie_dev *pdx, u32 work_mask)
 {
+	unsigned int ch;
+
+	for (ch = 0; ch < pdx->cur_max_video_ch; ch++) {
+		if (work_mask & BIT(ch))
+			hws_irq_queue_vdone_work(pdx, ch);
+	}
+}
+
+static u32 hws_irq_record_audio(struct hws_pcie_dev *pdx, u32 int_state,
+				u64 timestamp_ns)
+{
+	u32 work_mask = 0;
 	unsigned int ch;
 
 	for (ch = 0; ch < pdx->cur_max_audio_ch; ++ch) {
@@ -630,16 +735,33 @@ static void hws_irq_handle_audio(struct hws_pcie_dev *pdx, u32 int_state,
 		 */
 		cur_toggle = readl_relaxed(pdx->bar0_base +
 					   HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-		hws_audio_queue_interrupt(pdx, ch, cur_toggle, timestamp_ns);
+		if (hws_audio_record_interrupt(pdx, ch, cur_toggle,
+					       timestamp_ns))
+			work_mask |= BIT(ch);
+	}
+
+	return work_mask;
+}
+
+static void hws_irq_queue_audio_work(struct hws_pcie_dev *pdx, u32 work_mask)
+{
+	unsigned int ch;
+
+	for (ch = 0; ch < pdx->cur_max_audio_ch; ch++) {
+		if (work_mask & BIT(ch))
+			hws_audio_queue_work(pdx, ch);
 	}
 }
 
 irqreturn_t hws_irq_handler(int irq, void *info)
 {
 	struct hws_pcie_dev *pdx = info;
+	struct hws_vdone_toggle_sample video_samples[MAX_VID_CHANNELS] = { };
 	u64 timestamp_ns;
+	u32 status_after_ack;
 	u32 int_state;
-	bool wake_thread;
+	u32 audio_work;
+	u32 video_work;
 
 	(void)irq;
 
@@ -661,36 +783,14 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	timestamp_ns = ktime_get_mono_fast_ns();
 	dev_dbg(&pdx->pdev->dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
 
-	wake_thread = hws_irq_queue_video(pdx, int_state, timestamp_ns);
-	hws_irq_handle_audio(pdx, int_state, timestamp_ns);
-	hws_irq_ack_status(pdx, int_state);
+	hws_irq_sample_video_before_ack(pdx, int_state, video_samples);
+	audio_work = hws_irq_record_audio(pdx, int_state, timestamp_ns);
+	status_after_ack = hws_irq_ack_status(pdx, int_state);
+	video_work = hws_irq_record_video(pdx, int_state, status_after_ack,
+					  video_samples, timestamp_ns);
+	/* No DMA-backed copy may start until the sticky causes are acknowledged. */
+	hws_irq_queue_audio_work(pdx, audio_work);
+	hws_irq_queue_video_work(pdx, video_work);
 
-	return wake_thread ? IRQ_WAKE_THREAD : IRQ_HANDLED;
-}
-
-irqreturn_t hws_irq_thread(int irq, void *info)
-{
-	struct hws_pcie_dev *pdx = info;
-	unsigned int ch;
-	unsigned int count = 0;
-	bool handled = false;
-
-	(void)irq;
-
-	if (!pdx || !pdx->bar0_base)
-		return IRQ_NONE;
-
-	while (hws_irq_take_vdone(pdx, &ch)) {
-		handled = true;
-		if (READ_ONCE(pdx->suspended))
-			continue;
-
-		hws_video_handle_vdone(&pdx->video[ch]);
-		count++;
-		if (count == MAX_INT_LOOPS)
-			dev_warn_ratelimited(&pdx->pdev->dev,
-					     "threaded IRQ processing many VDONE events\n");
-	}
-
-	return handled ? IRQ_HANDLED : IRQ_NONE;
+	return IRQ_HANDLED;
 }

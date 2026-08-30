@@ -6,6 +6,6 @@
 #include "hws.h"
 
 irqreturn_t hws_irq_handler(int irq, void *info);
-irqreturn_t hws_irq_thread(int irq, void *info);
+void hws_irq_init_video_work(struct hws_video *vid);
 
 #endif /* HWS_INTERRUPT_H */

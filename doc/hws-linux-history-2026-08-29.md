@@ -223,8 +223,8 @@ are in `doc/dma-safety-findings.md` on the dangerous diagnostic branch.
 On 2026-08-29, the production successor work on
 `audio-upstream-v20-dma-safety` replaced the v19 live-base/two-slot video path
 with a permanent private native half-ring per channel. The implementation is
-source-complete for this architectural step and passes software checks, but no
-v20 module has yet been loaded or exercised on the capture hardware.
+source-complete for this architectural step, passes software checks, and has
+now received partial channel-3/1080p60 hardware validation as detailed below.
 The fixed-ring architectural step is preserved as commit `f265440`.
 
 The implemented invariants are:
@@ -242,18 +242,27 @@ The implemented invariants are:
   before VCAP is enabled. The programming helper rejects any live retargeting.
 - Video DMA always targets the permanent ring. VB2 buffers are CPU-mapped MMAP
   buffers and their addresses are never written to the video DMA registers.
-- The hard IRQ records toggle, monotonic timestamp, and a nonzero generation.
-  A pending/copying event, duplicate toggle, non-monotonic timestamp, or event
-  interval outside two-thirds through three-halves of the expected native-half
-  period is classified as W1C completion ambiguity and stops capture.
-- The first two boundaries after every start or recovery are synchronization
-  events and are never copied. Steady-state processing explicitly expects half
-  0 and half 1 in order and requires consecutive event and frame generations.
-- The threaded handler treats `toggle ^ 1` as the completed half, checks the
-  live toggle before, during, and after each copy, compares the destination
-  with the stable source, and assembles half 0 and half 1 into one VB2 buffer.
-  It detaches that buffer only after a final state, generation, and deadline
-  check under the IRQ lock.
+- The hard IRQ samples the video toggle before acknowledging W1C, acknowledges
+  and reads back interrupt status, then requires two matching post-ACK toggle
+  reads. The stable post-ACK value supplies the completion identity. A
+  reasserted VDONE bit, unstable post-ACK sample, pending/copying event,
+  duplicate toggle, non-monotonic timestamp, or event interval outside
+  two-thirds through three-halves of the expected native-half period is
+  classified as ambiguity and stops capture.
+- The first eight clean boundaries after every start or recovery are
+  synchronization events and are never copied. During that empty acquisition
+  phase only, a duplicate or out-of-cadence boundary restarts synchronization;
+  four consecutive restarts are allowed before the queue fails closed. Once
+  synchronization completes, every ambiguity remains fatal. Steady-state
+  processing explicitly expects half 0 and half 1 in order and requires
+  consecutive event and frame generations.
+- After W1C acknowledgment and stable identity selection, the hard handler
+  records each channel's completion and queues an independent high-priority
+  unbound worker per channel. Each worker treats `toggle ^ 1` as the completed
+  half, checks the live toggle before, during, and after each copy, compares
+  the destination with the stable source, and assembles half 0 and half 1 into
+  one VB2 buffer. It detaches that buffer only after a final state, generation,
+  and deadline check under the IRQ lock.
 - The characterized IRQ-to-verified-copy limit is 7,500 us with 500 us reserved
   before nominal source reuse. Faster modes automatically receive a tighter
   deadline based on their half period.
@@ -261,11 +270,44 @@ The implemented invariants are:
   frame. A pending copy, duplicate toggle, half-order mismatch, destination
   mapping/size error, or guard failure stops capture and fails the queue
   instead of delivering an ambiguous buffer.
-- STREAMOFF synchronizes the threaded IRQ, retains the permanent arena until
-  teardown, and checks the active extent guard after the existing DMA-idle
-  barrier. A persistent `dma_needs_idle` bit ensures an error path cannot avoid
-  that proof by clearing `cap_active` early. Guard corruption is sticky and
-  prevents a later STREAMON from reusing the channel arena.
+- STREAMOFF disables VCAP, synchronizes the hard IRQ, drains the channel worker,
+  retains the permanent arena until teardown, and checks the active extent
+  guard after the existing DMA-idle barrier. Remove and device-wide shutdown
+  drain every channel worker before unregistering queues or freeing the shared
+  workqueue. A persistent `dma_needs_idle` bit ensures an error path cannot
+  avoid that proof by clearing `cap_active` early. Guard corruption is sticky
+  and prevents a later STREAMON from reusing the channel arena.
+
+The first complete v20 E2E run on channel 3 at 1080p60 passed normal capture,
+packed-format negotiation, MMAP-only enforcement, rapid STREAMON/OFF, forced
+INTx ambiguity injection, recovery, and the complete audio staging telemetry
+check. CPU-stressed and concurrent video each failed closed after a correctly
+timed VDONE sampled the previous toggle before W1C. Both incidents had zero
+deadline misses, copy mismatches, and guard errors.
+
+After stable post-W1C toggle selection was added, the 2026-08-29 21:59 E2E run
+passed CPU-stressed capture and concurrent channel-3 video/audio capture. Its
+only ordinary-path failure was rapid STREAMON/OFF iteration 8: generation 6
+reported a stable duplicate toggle at an otherwise correct 8,662-us cadence,
+about 50 ms into acquisition. No source resample, unstable toggle, deadline
+miss, copy mismatch, or guard error occurred. The extended eight-event,
+bounded startup resynchronization above addresses that acquisition-only case
+and awaited an E2E rerun. Forced-INTx coalescing still failed closed with
+`EIO`, and the module restored MSI capture successfully afterward. Evidence is
+in `/tmp/hws-v20-e2e-20260829-215902` on the validation host.
+
+The 2026-08-29 22:04 rerun passed all 20 checks with zero failures or skips.
+It exercised normal 120-frame capture, packed-format and MMAP-only enforcement,
+240 frames under eight CPU workers, 40 rapid STREAMON/OFF cycles, concurrent
+channel-3 video and embedded audio with a live HDMI tone, forced-INTx W1C
+coalescing with userspace `EIO`, and restoration to MSI with a successful
+30-frame recovery capture. No ordinary-path kernel safety signature appeared.
+The exact module had SHA-256
+`7f601d78cceda9e071840aaf4ad42eafee71926e85cea5d526f8a4cf73f0e231`
+and srcversion `89120688711938057BDF4E0`; evidence is in
+`/tmp/hws-v20-e2e-20260829-220426`. No startup-resync message occurred, so the
+eight-event quiet acquisition window was exercised but the bounded recovery
+branch was not forced in this run.
 
 The module builds against Arch kernel `7.1.9-arch1-2`, `git diff --check` is
 clean, and Linux `checkpatch.pl` reports zero errors and zero warnings for the
@@ -286,8 +328,10 @@ is still outstanding. Until it passes, v20 is not submission-ready.
 | Remove/unbind | Partial | Minimal open-FD case only; active streaming case remains unproved |
 | Colorimetry | Passed for measured mode | Measurements support the metadata correction |
 | Native half-ring diagnostic | Passed for characterized scope | Strong channel 3/1080p60 diagnostic evidence; not generalized |
-| v20 fixed half-ring implementation | Software checks passed | Module build, whitespace, and checkpatch pass; hardware execution is pending |
-| v20 ambiguity/deadline gate | Software checks passed | Explicit sync, cadence, generation, copy verification, deadline, and fail-closed state are implemented; production hardware execution is pending |
+| v20 fixed half-ring implementation | Targeted hardware pass | The exact module passed normal, CPU-stressed, 40-cycle rapid STREAMON/OFF, concurrent A/V, forced ambiguity, and recovery checks on channel 3 at 1080p60 |
+| v20 ambiguity/deadline gate | Targeted hardware pass | Stable post-W1C sampling and the eight-event startup window passed; forced-INTx ambiguity failed closed and recovered. The bounded startup-resync branch was not independently forced |
+| v20 audio staging gate | Hardware passed for channel 3 | Concurrent run reported 237 IRQs, one primed packet, 236 delivered packets, zero drops/errors, and 157 us maximum work latency |
+| v20 packed YUYV layout | Negotiation test passed | A deliberately padded 720x576 request normalized to `bytesperline=1440`, `sizeimage=829440`; queue, buffer, ring, and STREAMON paths reject inconsistent internal state |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
 | v20 submission readiness | Blocked | Full hardware validation remains |
 
@@ -342,19 +386,27 @@ channel, with CPU assembly into queued VB2 buffers:
    pushed dangerous branch. Its experimental driver was not merged.
 2. Completed: `audio-upstream-v19` remains the immutable reference, and
    `audio-upstream-v20-dma-safety` was created from its exact tip.
-3. Implemented, awaiting hardware proof: the successor branch has the guarded
-   fixed native half-ring and CPU two-half assembly.
+3. Implemented and hardware-proved for the targeted channel-3/1080p60 matrix:
+   the successor branch has the guarded fixed native half-ring, CPU two-half
+   assembly, and extended startup synchronization. The bounded resync branch
+   and broader channel/mode matrix remain to be forced.
 4. Implemented, awaiting hardware proof: explicit W1C ambiguity, phase,
    generation, copy-deadline, copy verification, and fail-closed handling.
-5. Validate every supported channel and mode, concurrent audio/video,
+5. Implemented, awaiting hardware proof: stable per-channel audio packet
+   staging, cadence priming, monotonic completion generations, and post-copy
+   toggle/generation/deadline validation before ALSA publication.
+6. Implemented, awaiting hardware proof: the YUYV API and DMA assembly layout
+   are strictly packed, with padded stride requests normalized away and
+   fail-closed invariant checks before buffer use or capture start.
+7. Validate every supported channel and mode, concurrent audio/video,
    STREAMOFF, suspend/resume, active-stream unbind/remove, delayed copies, DMA
    idle, and allocation guards.
-6. Port by patch subject and order to a fresh Linux branch based on current
+8. Port by patch subject and order to a fresh Linux branch based on current
    media-next. Generate the next revision, build each boundary, run checkpatch,
    apply the mailbox in isolation, and perform a send-email dry-run.
-7. Confirm upstream status of the device-information and colorimetry patches
+9. Confirm upstream status of the device-information and colorimetry patches
    before sending or duplicating them.
-8. Inventory untracked test artifacts before cleanup; retain reproducers with
+10. Inventory untracked test artifacts before cleanup; retain reproducers with
    the exact branch, commit, mode, channel, and expected result documented.
 
 ## History API operational note

@@ -96,6 +96,8 @@ static int hws_program_video_ring_locked(struct hws_video *vid)
 	bool wrote = false;
 
 	lockdep_assert_held(&vid->irq_lock);
+	if (!hws_yuyv_layout_valid(&vid->pix))
+		return -EINVAL;
 
 	dma = hws_video_ring_dma(hws, ch);
 	extent = hws_video_dma_extent(vid->pix.sizeimage);
@@ -206,10 +208,11 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
 		goto out_unlock;
 
-	/* Stop DMA and drain threaded completion before taking its buffer. */
+	/* Stop DMA and drain this channel's completion before taking its buffer. */
 	hws_enable_video_capture(hws, v->channel_index, false);
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
+	hws_video_drain_channel_work(v);
 	ret = hws_try_wait_dma_idle(hws, tag ? tag : "no-signal",
 				    v->channel_index);
 	if (ret || READ_ONCE(hws->pci_lost)) {
@@ -351,6 +354,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	mutex_init(&vid->state_lock);
 	spin_lock_init(&vid->irq_lock);
 	INIT_LIST_HEAD(&vid->capture_queue);
+	hws_irq_init_video_work(vid);
 	atomic_set(&vid->sequence_number, 0);
 	vid->active = NULL;
 	vid->completion_timestamp_ns = 0;
@@ -361,6 +365,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->completion_toggle = 0;
 	vid->half_phase = HWS_VIDEO_PHASE_SYNC;
 	vid->sync_events = 0;
+	vid->sync_restart_streak = 0;
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
@@ -371,6 +376,9 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->error_count = 0;
 	vid->completion_overruns = 0;
 	vid->w1c_ambiguities = 0;
+	vid->toggle_resamples = 0;
+	vid->toggle_sample_errors = 0;
+	vid->sync_restarts = 0;
 	vid->phase_errors = 0;
 	vid->deadline_misses = 0;
 	vid->copy_mismatches = 0;
@@ -383,8 +391,9 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->pix.width = 1920;
 	vid->pix.height = 1080;
 	vid->pix.fourcc = V4L2_PIX_FMT_YUYV;
-	vid->pix.bytesperline = ALIGN(vid->pix.width * 2, 64);
-	vid->pix.sizeimage = vid->pix.bytesperline * vid->pix.height;
+	vid->pix.bytesperline = hws_yuyv_packed_stride(vid->pix.width);
+	vid->pix.sizeimage = (u32)hws_yuyv_packed_size(vid->pix.width,
+							vid->pix.height);
 	vid->pix.field = V4L2_FIELD_NONE;
 	vid->pix.colorspace = V4L2_COLORSPACE_REC709;
 	vid->pix.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -428,6 +437,23 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	return 0;
 }
 
+void hws_video_drain_channel_work(struct hws_video *vid)
+{
+	if (vid)
+		flush_work(&vid->vdone_work);
+}
+
+void hws_video_drain_work(struct hws_pcie_dev *hws)
+{
+	unsigned int ch;
+
+	if (!hws)
+		return;
+
+	for (ch = 0; ch < hws->cur_max_video_ch && ch < MAX_VID_CHANNELS; ch++)
+		hws_video_drain_channel_work(&hws->video[ch]);
+}
+
 static void hws_video_reset_completion_locked(struct hws_video *vid)
 {
 	lockdep_assert_held(&vid->irq_lock);
@@ -447,6 +473,7 @@ static void hws_video_reset_stream_phase_locked(struct hws_video *vid)
 	vid->next_completion_generation = 0;
 	vid->half_phase = HWS_VIDEO_PHASE_SYNC;
 	vid->sync_events = 0;
+	vid->sync_restart_streak = 0;
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
@@ -534,9 +561,9 @@ void hws_video_fail_queue(struct hws_video *vid, const char *reason)
 	hws_enable_video_capture(hws, vid->channel_index, false);
 
 	/*
-	 * This can run in the threaded IRQ handler, where waiting on this IRQ
-	 * would deadlock. Leave every DMA-owned buffer attached to the queue;
-	 * the sleepable STREAMOFF path returns it only after proving DMA idle.
+	 * This runs in the channel's completion worker. Leave every DMA-owned
+	 * buffer attached to the queue; STREAMOFF returns it only after the hard
+	 * IRQ and this worker have drained and DMA idle has been proved.
 	 */
 	vb2_queue_error(&vid->buffer_queue);
 
@@ -569,6 +596,7 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	/* 3) Ensure the IRQ handler finished any in-flight completions */
 	if (vid->parent && vid->parent->irq >= 0)
 		synchronize_irq(vid->parent->irq);
+	hws_video_drain_channel_work(vid);
 	ret = 0;
 	if (needs_idle)
 		ret = hws_wait_dma_idle(pdev, "video cleanup", ch);
@@ -719,9 +747,12 @@ static void hws_seed_dma_windows(struct hws_pcie_dev *hws)
 			 * is enabled.
 			 */
 			{
-				u32 half_bytes = hws_video_native_split(
-					vid->pix.sizeimage ? vid->pix.sizeimage :
-					MAX_VIDEO_SCALER_SIZE);
+				u32 half_bytes;
+				u32 ring_size;
+
+				ring_size = vid->pix.sizeimage ?
+					vid->pix.sizeimage : MAX_VIDEO_SCALER_SIZE;
+				half_bytes = hws_video_native_split(ring_size);
 
 				writel_relaxed(half_bytes / 16,
 					       hws->bar0_base + CVBS_IN_BUF_BASE2 +
@@ -1044,6 +1075,7 @@ static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
 
 	if (v->parent && v->parent->irq >= 0)
 		synchronize_irq(v->parent->irq);
+	hws_video_drain_channel_work(v);
 	ret = hws_try_wait_dma_idle(pdx, "video mode change", ch);
 	if (ret || READ_ONCE(pdx->pci_lost)) {
 		vb2_queue_error(&v->buffer_queue);
@@ -1210,14 +1242,13 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
 			      bool interlaced)
 {
-	/* HWS captures packed YUYV only; stride is 16 bpp aligned to 64 bytes. */
-	u32 lines = h;		/* full frame lines for sizeimage */
-	u32 bytesperline = ALIGN(w * 2, 64);
+	/* HWS exposes only tightly packed, 16-bpp YUYV frames. */
+	u32 bytesperline = hws_yuyv_packed_stride(w);
 	u32 sizeimage, half0;
 
 	/* publish into pix, since we now carry these in-state */
 	v->pix.bytesperline = bytesperline;
-	sizeimage = bytesperline * lines;
+	sizeimage = (u32)hws_yuyv_packed_size(w, h);
 
 	half0 = hws_video_native_split(sizeimage);
 
@@ -1236,6 +1267,9 @@ static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 {
 	struct hws_video *vid = q->drv_priv;
 
+	if (!hws_yuyv_layout_valid(&vid->pix))
+		return -EINVAL;
+
 	if (*nplanes) {
 		if (sizes[0] < vid->pix.sizeimage)
 			return -EINVAL;
@@ -1252,6 +1286,8 @@ static int hws_buffer_prepare(struct vb2_buffer *vb)
 	struct hws_video *vid = vb->vb2_queue->drv_priv;
 	size_t need = vid->pix.sizeimage;
 
+	if (!hws_yuyv_layout_valid(&vid->pix))
+		return -EINVAL;
 	if (vb2_plane_size(vb, 0) < need)
 		return -EINVAL;
 	if (!vb2_plane_vaddr(vb, 0))
@@ -1296,6 +1332,10 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	dev_dbg(&hws->pdev->dev, "start_streaming: ch=%u count=%u\n",
 		v->channel_index, count);
 
+	if (!hws_yuyv_layout_valid(&v->pix)) {
+		ret = -EINVAL;
+		goto fail_return_buffers;
+	}
 	ret = hws_check_card_status(hws);
 	if (ret)
 		goto fail_return_buffers;
@@ -1359,6 +1399,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		hws_enable_video_capture(hws, v->channel_index, false);
 		if (hws->irq >= 0)
 			synchronize_irq(hws->irq);
+		hws_video_drain_channel_work(v);
 		idle_ret = hws_wait_dma_idle(hws, "video STREAMON failure",
 					     v->channel_index);
 		if (idle_ret)
@@ -1402,6 +1443,7 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	unsigned int tracked = 0;
 	unsigned int seq = 0;
 	unsigned int ambiguity_count;
+	unsigned int sync_restart_count;
 	unsigned int deadline_count;
 	unsigned int phase_error_count;
 	enum hws_video_half_phase half_phase;
@@ -1423,16 +1465,17 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	half_phase = v->half_phase;
 	phase_generation = v->phase_generation;
 	ambiguity_count = v->w1c_ambiguities;
+	sync_restart_count = v->sync_restarts;
 	phase_error_count = v->phase_errors;
 	deadline_count = v->deadline_misses;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	dev_dbg(&hws->pdev->dev,
-		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u phase=%u generation=%llu ambiguity=%u phase_errors=%u deadlines=%u\n",
+		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u phase=%u generation=%llu ambiguity=%u sync_restarts=%u phase_errors=%u deadlines=%u\n",
 		action, phase, v->channel_index, streaming, cap_active,
 		stop_requested, active, queued, tracked, seq, half_phase,
 		(unsigned long long)phase_generation, ambiguity_count,
-		phase_error_count, deadline_count);
+		sync_restart_count, phase_error_count, deadline_count);
 }
 
 static void hws_stop_streaming(struct vb2_queue *q)
@@ -1459,9 +1502,10 @@ static void hws_stop_streaming(struct vb2_queue *q)
 
 	hws_enable_video_capture(v->parent, v->channel_index, false);
 
-	/* The threaded handler may be copying a completed ring half. */
+	/* The channel worker may be copying a completed ring half. */
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
+	hws_video_drain_channel_work(v);
 	ret = 0;
 	if (needs_idle)
 		ret = hws_wait_dma_idle(hws, "video STREAMOFF",
@@ -1636,6 +1680,7 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 
 	if (!dev)
 		return;
+	hws_video_drain_work(dev);
 
 	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
