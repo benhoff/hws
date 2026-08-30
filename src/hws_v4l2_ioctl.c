@@ -503,24 +503,22 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	struct hws_pcie_dev *pdev = vid ? vid->parent : NULL;
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 	u32 req_w = pix->width, req_h = pix->height;
-	u32 w, h, bpl;
+	u32 w, h, bpl, split;
 	u64 size;
 	size_t max_frame = pdev ? pdev->max_hw_video_buf_sz : MAX_MM_VIDEO_SIZE;
 
 	/* Only YUYV */
 	pix->pixelformat = V4L2_PIX_FMT_YUYV;
 
-	/* Defaults then clamp */
-	w = (req_w ? req_w : 640);
-	h = (req_h ? req_h : 480);
-	if (w > MAX_VIDEO_HW_W)
-		w = MAX_VIDEO_HW_W;
-	if (h > MAX_VIDEO_HW_H)
-		h = MAX_VIDEO_HW_H;
-	if (!w)
-		w = 640; /* hard fallback in case macros are odd */
-	if (!h)
-		h = 480;
+	/*
+	 * Only expose bounded progressive scaler geometry. YUYV stores
+	 * one chroma pair per two pixels, so an odd width is not representable.
+	 */
+	w = clamp_t(u32, req_w ? req_w : MIN_VIDEO_HW_W,
+		    MIN_VIDEO_HW_W, MAX_VIDEO_HW_W);
+	w = ALIGN(w, 2);
+	h = clamp_t(u32, req_h ? req_h : MIN_VIDEO_HW_H,
+		    MIN_VIDEO_HW_H, MAX_VIDEO_HW_H);
 
 	/* Field policy */
 	pix->field = V4L2_FIELD_NONE;
@@ -529,6 +527,9 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	bpl = hws_yuyv_packed_stride(w);
 	size = hws_yuyv_packed_size(w, h);
 	if (size > U32_MAX || size > max_frame)
+		return -ERANGE;
+	split = hws_video_native_split((u32)size);
+	if (!split || split >= size)
 		return -ERANGE;
 
 	pix->width        = w;

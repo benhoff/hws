@@ -807,7 +807,9 @@ test_memory_model() {
 
 test_packed_yuyv() {
 	local logfile="$OUTPUT_DIR/packed-yuyv.log"
-	local bytesperline sizeimage
+	local tiny_log="$OUTPUT_DIR/tiny-yuyv.log"
+	local odd_log="$OUTPUT_DIR/odd-yuyv.log"
+	local bytesperline sizeimage dimensions
 
 	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
 		--try-fmt-video=width=720,height=576,pixelformat=YUYV,bytesperline=4096,sizeimage=4194304 \
@@ -825,6 +827,50 @@ test_packed_yuyv() {
 		pass "padded TRY_FMT request was normalized to packed 720x576 YUYV"
 	else
 		fail "TRY_FMT returned bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected 1440/829440"
+	fi
+
+	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
+		--try-fmt-video=width=1,height=1,pixelformat=YUYV \
+		>"$tiny_log" 2>&1; then
+		fail "tiny YUYV TRY_FMT probe failed"
+	else
+		dimensions=$(awk -F: '/Width\/Height/ {
+			gsub(/[[:space:]]/, "", $2); print $2; exit
+		}' "$tiny_log")
+		bytesperline=$(awk -F: '/Bytes per Line/ {
+			gsub(/[[:space:]]/, "", $2); print $2; exit
+		}' "$tiny_log")
+		sizeimage=$(awk -F: '/Size Image/ {
+			gsub(/[[:space:]]/, "", $2); print $2; exit
+		}' "$tiny_log")
+		if [[ "$dimensions" == 640/480 && "$bytesperline" == 1280 &&
+		      "$sizeimage" == 614400 ]]; then
+			pass "tiny TRY_FMT request was raised to streamable 640x480 packed YUYV"
+		else
+			fail "tiny TRY_FMT returned ${dimensions:-missing} bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected 640x480/1280/614400"
+		fi
+	fi
+
+	if ! timeout 5s v4l2-ctl -d "$PRIMARY_DEVICE" \
+		--try-fmt-video=width=641,height=481,pixelformat=YUYV \
+		>"$odd_log" 2>&1; then
+		fail "odd-width YUYV TRY_FMT probe failed"
+	else
+		dimensions=$(awk -F: '/Width\/Height/ {
+			gsub(/[[:space:]]/, "", $2); print $2; exit
+		}' "$odd_log")
+		bytesperline=$(awk -F: '/Bytes per Line/ {
+			gsub(/[[:space:]]/, "", $2); print $2; exit
+		}' "$odd_log")
+		sizeimage=$(awk -F: '/Size Image/ {
+			gsub(/[[:space:]]/, "", $2); print $2; exit
+		}' "$odd_log")
+		if [[ "$dimensions" == 642/481 && "$bytesperline" == 1284 &&
+		      "$sizeimage" == 617604 ]]; then
+			pass "odd-width TRY_FMT request was normalized to an even packed layout"
+		else
+			fail "odd-width TRY_FMT returned ${dimensions:-missing} bpl=${bytesperline:-missing} size=${sizeimage:-missing}; expected 642x481/1284/617604"
+		fi
 	fi
 }
 

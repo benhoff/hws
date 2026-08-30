@@ -73,23 +73,30 @@ static inline u64 hws_yuyv_packed_size(u32 width, u32 height)
 	return (u64)hws_yuyv_packed_stride(width) * height;
 }
 
+static inline u32 hws_video_native_split(u32 frame_size)
+{
+	return round_down(frame_size / 2, (u32)SZ_2K);
+}
+
 static inline bool hws_yuyv_layout_valid(const struct hws_pix_state *pix)
 {
 	u64 stride, size;
+	u32 split;
 
-	if (!pix || !pix->width || !pix->height ||
-	    pix->fourcc != V4L2_PIX_FMT_YUYV)
+	if (!pix || pix->fourcc != V4L2_PIX_FMT_YUYV ||
+	    pix->width < MIN_VIDEO_HW_W || pix->width > MAX_VIDEO_HW_W ||
+	    pix->height < MIN_VIDEO_HW_H || pix->height > MAX_VIDEO_HW_H ||
+	    !IS_ALIGNED(pix->width, 2) || pix->interlaced ||
+	    pix->field != V4L2_FIELD_NONE)
 		return false;
 
 	stride = (u64)pix->width * 2;
 	size = stride * pix->height;
+	split = size <= U32_MAX ? hws_video_native_split((u32)size) : 0;
 	return stride <= U32_MAX && size <= U32_MAX &&
-		pix->bytesperline == stride && pix->sizeimage == size;
-}
-
-static inline u32 hws_video_native_split(u32 frame_size)
-{
-	return round_down(frame_size / 2, (u32)SZ_2K);
+		size <= MAX_VIDEO_SCALER_SIZE && split && split < size &&
+		pix->bytesperline == stride && pix->sizeimage == size &&
+		pix->half_size == split;
 }
 
 #define	UNSET	(-1U)

@@ -668,6 +668,29 @@ change. Every retained table entry must eventually be exercised or removed;
 interlaced input remains deliberately unsupported and should return
 `-ERANGE` rather than changing the capture layout.
 
+### 2026-08-30 format-negotiation remediation
+
+The current working tree now implements the correction for finding 6 above.
+It passes build and static script checks but has not yet run on hardware, so its
+status is **implemented, hardware validation pending**.
+
+- `TRY_FMT` clamps progressive YUYV requests to 640x480 through 1920x1080 and
+  rounds odd widths up to the next complete two-pixel YUYV chroma pair.
+- `bytesperline` is always exactly `width * 2`, and `sizeimage` is always
+  exactly `bytesperline * height`; requested padding is not retained.
+- The shared queue/start invariant now rejects out-of-range, odd-width,
+  interlaced, padded, oversize, zero-split, and split-mismatched layouts.
+  Consequently, a format accepted into driver state cannot later fail merely
+  because the native 2 KiB-aligned half-ring split is zero.
+- The E2E harness now checks the existing padded 720x576 request, a 1x1 request
+  normalized to packed 640x480, and a 641x481 request normalized to packed
+  642x481.
+
+The 640x480 lower bound is deliberately conservative: it matches the smallest
+retained supported DV geometry and is safely above the native split boundary.
+Smaller scaler output should not be exposed unless hardware evidence defines
+and validates its real lower limit.
+
 ### Required evidence after correction
 
 The next hardware gate must stop video and audio independently while other
