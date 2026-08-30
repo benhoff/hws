@@ -276,10 +276,9 @@ require_commands() {
 	local -a commands=(modinfo sha256sum realpath v4l2-ctl timeout)
 
 	if ((RUN)); then
-		commands+=(insmod modprobe python3 rmmod udevadm fuser journalctl)
+		commands+=(insmod modprobe python3 rmmod setpci udevadm fuser journalctl)
 		((SKIP_AUDIO)) || commands+=(arecord)
 		[[ -n "$AUDIO_SOURCE_PCM" ]] && commands+=(speaker-test)
-		((FAULT_INJECTION)) && commands+=(setpci)
 	fi
 	for command in "${commands[@]}"; do
 		command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
@@ -520,6 +519,20 @@ verify_irq_mode() {
 	fi
 }
 
+verify_pcie_requester_ordering() {
+	local control value
+
+	control=$(setpci -s "$BDF" CAP_EXP+8.w 2>/dev/null) ||
+		die "could not read PCIe Device Control for $BDF"
+	[[ "$control" =~ ^[[:xdigit:]]{4}$ ]] ||
+		die "unexpected PCIe Device Control value for $BDF: $control"
+	value=$((16#$control))
+	if ((value & 0x0810)); then
+		die "unsafe PCIe requester attributes remain enabled on $BDF (Device Control 0x$control)"
+	fi
+	log "PCIe requester ordering verified: Relaxed Ordering off, No Snoop off"
+}
+
 load_test_module() {
 	local audio_parameter=$TEST_AUDIO_PARAMETER
 	local force_intx=${1:-N}
@@ -541,6 +554,7 @@ load_test_module() {
 	wait_for_nodes || die "no HWS video nodes appeared for $BDF after module load"
 	verify_loaded_module
 	verify_irq_mode "$force_intx"
+	verify_pcie_requester_ordering
 }
 
 stop_children() {
@@ -1719,11 +1733,12 @@ main() {
 	if ((SKIP_MODULE_RELOAD)); then
 		verify_loaded_module
 		verify_irq_mode N
+		verify_pcie_requester_ordering
 		wait_for_nodes || die "no HWS video nodes exist for the already-loaded module"
-		pass "already-loaded module srcversion matches the test module"
+		pass "already-loaded module and PCIe requester ordering match the test contract"
 	else
 		load_test_module N
-		pass "loaded the in-tree module and matched srcversion"
+		pass "loaded the in-tree module, matched srcversion, and verified PCIe ordering"
 	fi
 	finish_clean_phase module-load "module load"
 

@@ -263,7 +263,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->sync_restarts = 0;
 	vid->phase_errors = 0;
 	vid->deadline_misses = 0;
-	vid->copy_mismatches = 0;
 	vid->guard_errors = 0;
 
 	vid->queued_count = 0;
@@ -677,34 +676,26 @@ static void hws_configure_irq_fabric(struct hws_pcie_dev *hws)
 	(void)readl(hws->bar0_base + PCIEBR_EN_REG_BASE);
 }
 
-void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
+void hws_init_video_sys(struct hws_pcie_dev *hws)
 {
-	int i;
+	unsigned long flags;
 
-	if (hws->start_run && !enable)
-		return;
-
-	/* 1) reset the decoder mode register to 0 */
+	/* Keep every producer disabled while restoring the DMA windows. */
 	writel(0x00000000, hws->bar0_base + HWS_REG_DEC_MODE);
+	spin_lock_irqsave(&hws->capture_lock, flags);
+	writel(0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	writel(0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	(void)readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	spin_unlock_irqrestore(&hws->capture_lock, flags);
 	hws_seed_dma_windows(hws);
 	hws_audio_seed_channels(hws);
 
-	/* 3) on a full reset, clear all per-channel status and indices */
-	if (!enable) {
-		for (i = 0; i < hws->max_channels; i++) {
-			/* helpers to arm/disable capture engines */
-			hws_enable_video_capture(hws, i, false);
-			hws_enable_audio_capture(hws, i, false);
-		}
-	}
-
-	/* 4) Start run: set bit31, wait a bit, then program low 24 bits. */
+	/* Start the core only after all interrupt-facing resources exist. */
 	writel(0x80000000, hws->bar0_base + HWS_REG_DEC_MODE);
 	writel(0x80FFFFFF, hws->bar0_base + HWS_REG_DEC_MODE);
 	writel(0x13, hws->bar0_base + HWS_REG_DEC_MODE);
 	hws_ack_all_irqs(hws);
 	hws_configure_irq_fabric(hws);
-	/* 6) record that we're now running */
 	hws->start_run = true;
 }
 
@@ -1427,10 +1418,13 @@ int hws_video_register(struct hws_pcie_dev *dev)
 {
 	int i, ret;
 
+	/* Keep the embedded V4L2 parent alive until its final open is closed. */
+	hws_get_device(dev);
 	ret = v4l2_device_register(&dev->pdev->dev, &dev->v4l2_device);
 	if (ret) {
 		dev_err(&dev->pdev->dev, "v4l2_device_register failed: %d\n",
 			ret);
+		hws_put_device(dev);
 		return ret;
 	}
 	dev->v4l2_ref_held = true;

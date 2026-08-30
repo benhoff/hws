@@ -25,9 +25,10 @@ architecture:
   targeted channel-3/1080p60 E2E matrix passed. At commit `fe6aabc`, the audio
   DMA boundary, interlaced-format, DV-timings API, and native-format findings
   below are code-resolved, with targeted hardware evidence where noted. The
-  working tree after `fe6aabc` also resolves the per-stream/global-idle
-  coupling in code, with hardware validation pending. The over-broad hardware
-  scope and the additional ordering, lifecycle, and coverage findings below
+  commit `e848e0e` also resolves the per-stream/global-idle coupling in code,
+  with hardware validation pending. The working tree after `e848e0e` resolves
+  the PCIe ordering and lifecycle-sequencing findings in code. The over-broad
+  hardware scope and the remaining API, telemetry, and coverage findings below
   still prevent submission.
 
 The August findings therefore require a production successor to v19. They are
@@ -340,10 +341,12 @@ be resolved before broader testing alone could make v20 submission-ready.
 | v20 audio staging gate | Hardware passed for channel 3 | The final concurrent run reported 237 IRQs, one primed packet, 236 delivered packets, zero drops/errors, and 127 us maximum work latency |
 | v20 audio W1C and DMA bounds | Targeted hardware pass; exact ack-window branches unforced | Channel 3 normal capture delivered 236 packets without a drop and observed no write beyond the 8 KiB ring. A 50 ms forced-INTx gate produced a duplicate-toggle XRUN, one dropped packet, userspace overrun, and an intact trailing guard. Ordered post-W1C ambiguity reasons remain implemented but need a deterministic acknowledge-window injector |
 | v20 independent per-stream stop | Code implemented; hardware pending | Ordinary video STREAMOFF and ALSA teardown disable only their channel, synchronize/drain channel work, return client-owned buffers, and leave the permanent arena quarantined. Later reuse performs a non-fatal global-idle observation and guard verification; failure blocks only that channel's reuse. The E2E harness now stops video while audio remains live and vice versa, but that matrix has not yet run on hardware |
+| v20 PCIe completion ordering | Code implemented; hardware pending | The working tree after `e848e0e` clears and verifies both Relaxed Ordering and No Snoop at probe and resume, uses ordered completion/toggle MMIO reads, and removes the non-authoritative full-half `memcmp()`. The E2E loader now verifies the PCIe Device Control bits after every reload |
+| v20 lifecycle sequencing | Code implemented; hardware pending | Probe keeps bus mastering, producers, and IRQ gates off until permanent arenas, workers, masks, and the handler exist. Suspend aborts on audio or DMA-quiesce failure instead of entering D3. Remove performs coordinated card-wide quiescence before interface unregister, and ALSA destruction is deferred behind a shared parent reference rather than waiting for open files |
 | v20 DV/source-loss behavior | Targeted hardware pass; transition matrix pending | Hardware returned all 14 modes, bounded capabilities, preserved configured/detected independence, reported stable PCI `bus_info`, and rejected no-signal QUERY and STREAMON with `ENOLINK`. Mid-stream unplug/replug and deliberate mode changes remain untested |
 | v20 packed YUYV layout | Hardware compliance pass for native channel-3 mode | Commit `fe6aabc` normalizes every request to configured native progressive geometry with exact packed stride and size. `v4l2-compliance` passed 49/49 and streamed native 1920x1080 YUYV; the unrelated power-present control warning was fixed afterward and needs a rerun |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
-| v20 submission readiness | Blocked | Of the six original blockers, only device scope remains unresolved in code. Per-stream/global-idle coupling is implemented but not yet hardware-validated; audio bounds, progressive-only interlaced policy, DV-timings semantics, and native packed format are resolved for the characterized 8888:8504/channel-3 scope. Additional ordering, lifecycle, timestamp/sequence, and cross-device validation findings remain |
+| v20 submission readiness | Blocked | Of the six original blockers, only device scope remains unresolved in code. Per-stream/global-idle coupling, PCIe ordering, and lifecycle sequencing are implemented but not yet hardware-validated; audio bounds, progressive-only interlaced policy, DV-timings semantics, and native packed format are resolved for the characterized 8888:8504/channel-3 scope. Timestamp/sequence, telemetry, and cross-device validation findings remain |
 
 ## 2026-08-29 v20 code-value submission assessment
 
@@ -491,10 +494,11 @@ cover the following code-level problems.
 
 ### Additional code issues
 
-- PCIe Relaxed Ordering is enabled unconditionally even though the correctness
+- PCIe Relaxed Ordering was enabled unconditionally even though the correctness
   design depends on DMA data being visible before completion toggle/IRQ
-  observation. It should remain disabled unless the endpoint's ordering
-  contract is documented and proved for these transactions.
+  observation. The working tree after `e848e0e` now clears and verifies both
+  Relaxed Ordering and No Snoop at probe and resume; hardware validation is
+  pending.
 - A live SD/HD geometry change recalculates dimensions and buffer size without
   updating the cached colorimetry state.
 - The synthetic no-signal YUYV frame fills every byte with `0x10`, including U
@@ -537,6 +541,18 @@ deliberately outside the assessment.
    and completion registers used as ordering points should use ordered MMIO
    access.
 
+   **Resolution status (2026-08-30): implemented in the working tree after
+   `e848e0e`, hardware validation pending.** Probe and resume now clear and
+   read back both `PCI_EXP_DEVCTL_RELAX_EN` and
+   `PCI_EXP_DEVCTL_NOSNOOP_EN`; failure to establish that conservative
+   requester contract aborts initialization. Every VDONE/ADONE status and
+   toggle read used as a DMA-completion ordering point now uses ordered
+   `readl()`. The video path retains the pre-copy and post-copy toggle/deadline
+   checks but removes the full-half `memcmp()`, which could detect only a narrow
+   concurrent-write race and could not prove that a later endpoint write would
+   not arrive. The E2E loader now reads PCIe Device Control after every module
+   reload and refuses to continue if either unsafe requester attribute is set.
+
 2. **Post-W1C ambiguity is handled for video but not for audio.** The IRQ
    handler reads `INT_STATUS` again after acknowledging the W1C bits, but only
    the video path receives that post-ack state. `hws_irq_record_audio()` sees
@@ -561,6 +577,12 @@ deliberately outside the assessment.
    channels 0 through 3. The value appears inherited from the vendor driver,
    so it is not proof of a live bug, but every remaining bit needs a documented
    source and disposition before the mask can be considered safe upstream.
+
+   **Resolution status (2026-08-30): implemented in the working tree after
+   `e848e0e`, hardware validation pending.** The inherited bits 0 through 17
+   mask has been removed. The driver now constructs its gate from exactly one
+   VDONE bit per configured video channel and one ADONE bit per configured
+   audio channel, matching the handler's explicit demultiplexing scope.
 
 #### Video API and signal-state correctness
 
@@ -643,11 +665,28 @@ deliberately outside the assessment.
     quiescent until all DMA targets, workers, locks, and IRQ handling are ready,
     then be enabled once in an explicit final step.
 
+    **Resolution status (2026-08-30): implemented in the working tree after
+    `e848e0e`, hardware validation pending.** Probe clears PCI bus mastering,
+    masks the source gate, disables the core IRQ output, bridge, VCAP, ACAP,
+    and decoder core, and clears pending status before discovery. It allocates
+    all guarded arenas and workers and installs the IRQ handler before the one
+    deterministic core initialization. Bus mastering is enabled only after the
+    idle core and IRQ output have been configured, and the decoded source gate
+    is opened last.
+
 13. **Suspend hides quiesce failures.** The PM suspend path records video and
     audio stop errors but returns success unconditionally. The system can then
     enter a power transition even though queue ownership or DMA isolation was
     not established. A failed quiesce must abort suspend or transition through
     a proved device-wide isolation path.
+
+    **Resolution status (2026-08-30): implemented in the working tree after
+    `e848e0e`, hardware validation pending.** Device stop now returns its DMA
+    idle/isolation result, coordinated quiesce preserves both device-stop and
+    VB2 errors, and suspend returns the first audio or quiesce failure without
+    saving state, disabling the function, or entering D3. When the failure did
+    not mark DMA permanently unsafe, the idle core and retained arenas are
+    restored before the failed suspend returns.
 
 14. **Remove orders unregister before device-wide quiescence.** Video
     unregister initiates channel-by-channel streaming teardown before the
@@ -656,6 +695,14 @@ deliberately outside the assessment.
     should still first block new opens, perform one coordinated device-wide
     stop/isolation, drain all workers, and only then unregister interfaces and
     release DMA memory. That lifecycle reordering remains unresolved.
+
+    **Resolution status (2026-08-30): implemented in the working tree after
+    `e848e0e`, hardware validation pending.** Remove first blocks IRQ and
+    monitor hot paths, stops the monitor, disables all producers, synchronizes
+    the IRQ, drains every completion worker, proves global DMA idle or isolates
+    PCI DMA, and returns active VB2 buffers. ALSA and V4L2 interfaces are
+    disconnected only after that coordinated boundary; arenas and workers are
+    released afterward.
 
 15. **ALSA removal can wait indefinitely for open files.**
     `hws_audio_unregister()` disconnects and then calls the synchronous
@@ -666,6 +713,19 @@ deliberately outside the assessment.
     V4L2 late-close use-after-free was ruled out: VB2 video unregister releases
     the queue synchronously and the retained V4L2 parent reference protects the
     containing state during close.
+
+    **Resolution status (2026-08-30): implemented in the working tree after
+    `e848e0e`, hardware validation pending.** ALSA unregister disconnects the
+    card and uses `snd_card_free_when_closed()` instead of the synchronous
+    free. The parent driver allocation now has a shared `kref`: ALSA holds one
+    through `snd_card.private_free`, V4L2 holds one through its release callback,
+    and PCI devres holds the base reference. Disconnect replaces active ALSA
+    operations with shutdown operations. Because the shutdown release still
+    delegates final PCM cleanup to the original release path, the driver's
+    `.hw_free` and `.close` explicitly switch to software-only ownership cleanup
+    once removal has published the suspended/disconnected state. Removal can
+    therefore release PCI resources while only the software parent remains
+    until the final file close.
 
 #### Build quality, performance, and validation scope
 
@@ -684,6 +744,12 @@ deliberately outside the assessment.
     lands after both reads. It should be treated as diagnostic instrumentation
     unless a documented ordering contract makes it useful, and performance must
     be measured without weakening fail-closed behavior.
+
+    **Resolution status (2026-08-30): implemented in the working tree after
+    `e848e0e`, hardware validation pending.** The destination copy remains, but
+    the second full source read and `copy_mismatches` accounting are removed.
+    An ordered post-copy toggle observation plus the existing generation,
+    phase, deadline, and guard checks remain the fail-closed acceptance gate.
 
 18. **The successful hardware matrix is still narrow.** The 20/20 E2E pass
     proves the 8888:8504 card's channel-3 1080p60 path, including concurrent
@@ -997,10 +1063,13 @@ prompt `EIO`/source-change notification, STREAMOFF cleanup, same-mode replug,
 changed-mode reconfiguration, and restart; verify EOF timestamps and
 dropped-frame sequence numbers; force the bounded startup-resync branch; and
 cover suspend/resume plus active-stream unbind/remove with open video and ALSA
-file descriptors. Multi-channel load and ordering tests must be run with Relaxed
-Ordering disabled unless an endpoint contract proves it safe. Passing the
-existing channel-3 matrix remains a required regression test, not a substitute
-for these cases.
+file descriptors. Multi-channel load and ordering tests must verify after every
+probe and resume that PCIe Device Control has Relaxed Ordering and No Snoop
+clear. The active-handle unbind case must demonstrate that the unbind returns
+promptly, existing ALSA operations fail as disconnected, the module remains
+pinned until final close, and no callback reaches released PCI resources.
+Passing the existing channel-3 matrix remains a required regression test, not
+a substitute for these cases.
 
 ## Submission and review status
 
@@ -1081,22 +1150,28 @@ channel, with CPU assembly into queued VB2 buffers:
    ADONE resampling fails ambiguous completion closed, and the page-rounded
    audio DMA capacity recorded an 8192-byte extent behind an intact trailing
    guard. Deterministic forcing of each narrow post-ack branch remains pending.
-9. Implemented in the working tree after `fe6aabc`, hardware pending:
+9. Implemented in `e848e0e`, hardware pending:
    independent per-stream stop no longer waits forcibly for device-global DMA
    idle, returns client buffers before releasing stream ownership, and
    quarantines permanent arenas until non-fatal idle proof and guard checking
    permit reuse. Run both new independent-stop directions and post-idle reuse.
-10. Resolve the remaining code-value blockers above, beginning with PCI device
-   scope, PCIe completion ordering, and lifecycle teardown.
-11. Validate every retained channel and mode, independent and concurrent
+10. Implemented in the working tree after `e848e0e`, hardware pending: probe,
+   suspend, remove, and open-ALSA-handle teardown are sequenced around an
+   explicit card-wide quiescence boundary and shared parent lifetime. PCIe
+   Relaxed Ordering and No Snoop are disabled and verified, ordered completion
+   reads are used, only decoded IRQ sources are unmasked, and the redundant
+   full-half comparison is removed.
+11. Resolve the remaining code-value blockers, beginning with PCI device scope,
+   EOF timestamp/sequence semantics, and production telemetry cleanup.
+12. Validate every retained channel and mode, independent and concurrent
    audio/video stop, suspend/resume, active-stream unbind/remove, delayed
    copies, DMA isolation, allocation guards, and the public DV-timings API.
-12. Port by patch subject and order to a fresh Linux branch based on current
+13. Port by patch subject and order to a fresh Linux branch based on current
    media-next. Generate the next revision, build each boundary, run checkpatch,
    apply the mailbox in isolation, and perform a send-email dry-run.
-13. Confirm upstream status of the device-information and colorimetry patches
+14. Confirm upstream status of the device-information and colorimetry patches
    before sending or duplicating them.
-14. Inventory untracked test artifacts before cleanup; retain reproducers with
+15. Inventory untracked test artifacts before cleanup; retain reproducers with
    the exact branch, commit, mode, channel, and expected result documented.
 
 ## History API operational note

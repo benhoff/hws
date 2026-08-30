@@ -12,6 +12,7 @@
 #include <linux/spinlock.h>
 #include <linux/sizes.h>
 #include <linux/atomic.h>
+#include <linux/kref.h>
 #include <linux/workqueue.h>
 
 #include <sound/pcm.h>
@@ -204,7 +205,6 @@ struct hws_video {
 	u32 sync_restarts;
 	u32 phase_errors;
 	u32 deadline_misses;
-	u32 copy_mismatches;
 	u32 guard_errors;
 
 	bool window_valid;
@@ -366,6 +366,7 @@ struct hws_pcie_dev {
 
 	/* Error flags */
 	int pci_lost;
+	struct kref lifetime_ref;
 };
 
 static inline bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
@@ -399,5 +400,7 @@ int hws_audio_scratch_verify(struct hws_pcie_dev *hws, unsigned int ch,
 			     size_t *observed_extent);
 int hws_try_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 int hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
+void hws_get_device(struct hws_pcie_dev *hws);
+void hws_put_device(struct hws_pcie_dev *hws);
 
 #endif
