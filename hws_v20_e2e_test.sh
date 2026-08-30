@@ -67,7 +67,8 @@ Normal execution:
   4. Discover HWS video and ALSA nodes through the selected PCI function.
   5. Capture complete MMAP frames after startup synchronization.
   6. Verify packed YUYV, reject USERPTR, stress copies, and repeat STREAMON/OFF.
-  7. Capture all live video inputs concurrently with embedded audio.
+  7. Capture concurrently and stop video/audio independently while the other
+     engine remains active.
   8. Optionally reload with forced INTx and inject video/audio W1C coalescing.
   9. Reload in normal MSI-preferred mode and prove capture recovers.
 
@@ -1107,9 +1108,17 @@ run_audio_capture() {
 	local pcm=$1
 	local logfile=$2
 
-	timeout --signal=TERM --kill-after=2s "$((AUDIO_SECONDS + 8))s" \
+	run_audio_capture_seconds "$pcm" "$AUDIO_SECONDS" "$logfile"
+}
+
+run_audio_capture_seconds() {
+	local pcm=$1
+	local seconds=$2
+	local logfile=$3
+
+	timeout --signal=TERM --kill-after=2s "$((seconds + 8))s" \
 		arecord -q --fatal-errors -D "$pcm" -t raw -f S16_LE -r 48000 \
-		-c 2 -d "$AUDIO_SECONDS" /dev/null >"$logfile" 2>&1
+		-c 2 -d "$seconds" /dev/null >"$logfile" 2>&1
 }
 
 audio_source_card_number() {
@@ -1314,8 +1323,145 @@ test_concurrent_capture() {
 		if ((bounds_count >= audio_started)); then
 			pass "post-idle DMA bounds remained guarded for $audio_started audio capture(s)"
 		else
-			fail "only $bounds_count/$audio_started audio capture(s) produced clean DMA bounds evidence"
+			log "DMA-bound verification deferred for $audio_started quarantined audio arena(s)"
 		fi
+	fi
+}
+
+test_independent_stops() {
+	local audio_channel audio_delta audio_pcm audio_pid audio_rc
+	local independent_frames independent_seconds node pcm video_pid video_rc
+	local audio_survived=0
+	local video_survived=0
+
+	if ((SKIP_AUDIO)); then
+		skip "independent video/audio stop disabled by --skip-audio"
+		return
+	fi
+
+	discover_audio_pcms
+	audio_pcm=
+	for pcm in "${AUDIO_PCMS[@]}"; do
+		if audio_pcm_matches_live_video "$pcm"; then
+			audio_pcm=$pcm
+			break
+		fi
+	done
+	if [[ -z "$audio_pcm" ]]; then
+		skip "no embedded-audio PCM corresponds to a live video input for independent stop"
+		return
+	fi
+	if [[ -n "$AUDIO_SOURCE_PCM" ]]; then
+		if ! start_audio_source; then
+			stop_audio_source
+			fail "could not establish HDMI audio for independent stop"
+			return
+		fi
+	else
+		log "Independent-stop audio source is externally managed"
+	fi
+
+	audio_channel=${audio_pcm##*,}
+	independent_seconds=$((AUDIO_SECONDS < 4 ? 4 : AUDIO_SECONDS))
+	independent_frames=$((FRAMES < 180 ? 180 : FRAMES))
+	node=$PRIMARY_DEVICE
+
+	# Clear any video quarantine left by the rapid-stop phase while all
+	# engines are idle. This changes no geometry when the live mode is stable.
+	if ! set_live_timings "$node" "$OUTPUT_DIR/independent-prime-video.log"; then
+		stop_audio_source
+		fail "could not reclaim the video arena before independent-stop testing"
+		return
+	fi
+
+	# Stop video while audio remains live.
+	timeout --signal=TERM --kill-after=2s "$((independent_seconds + 8))s" \
+		arecord -q --fatal-errors -D "$audio_pcm" -t raw -f S16_LE \
+		-r 48000 -c 2 -d "$independent_seconds" /dev/null \
+		>"$OUTPUT_DIR/independent-video-stop-audio.log" 2>&1 &
+	audio_pid=$!
+	CHILD_PIDS+=("$audio_pid")
+	sleep 0.5
+	timeout --signal=TERM --kill-after=2s 15s v4l2-ctl --silent \
+		-d "$node" --set-dv-bt-timings=query --stream-mmap=4 \
+		--stream-poll --stream-count=100000 --stream-to=/dev/null \
+		>"$OUTPUT_DIR/independent-video-stop-video.log" 2>&1 &
+	video_pid=$!
+	CHILD_PIDS+=("$video_pid")
+	sleep 1
+	if kill -0 "$audio_pid" 2>/dev/null; then
+		audio_survived=1
+	fi
+	kill -TERM "$video_pid" 2>/dev/null || true
+	set +e
+	wait "$video_pid"
+	video_rc=$?
+	wait "$audio_pid"
+	audio_rc=$?
+	set -e
+	CHILD_PIDS=()
+	if ((audio_survived && audio_rc == 0 && video_rc != 0)); then
+		pass "video STREAMOFF left channel-$audio_channel audio running to completion"
+	else
+		fail "video STREAMOFF did not preserve audio (video rc=$video_rc audio rc=$audio_rc survived=$audio_survived)"
+	fi
+
+	# Reclaim video while the card is idle, then stop audio while video remains
+	# live. Audio reclaims its prior quarantine during the sleepable prepare.
+	if ! set_live_timings "$node" "$OUTPUT_DIR/independent-reclaim-video.log"; then
+		stop_audio_source
+		fail "video arena could not be reclaimed after independent STREAMOFF"
+		return
+	fi
+	timeout --signal=TERM --kill-after=2s 38s \
+		arecord -q --fatal-errors -D "$audio_pcm" -t raw -f S16_LE \
+		-r 48000 -c 2 -d 30 /dev/null \
+		>"$OUTPUT_DIR/independent-audio-stop-audio.log" 2>&1 &
+	audio_pid=$!
+	CHILD_PIDS+=("$audio_pid")
+	sleep 0.5
+	run_video_capture "$node" "$independent_frames" \
+		"$OUTPUT_DIR/independent-audio-stop-video.log" &
+	video_pid=$!
+	CHILD_PIDS+=("$video_pid")
+	sleep 1
+	kill -TERM "$audio_pid" 2>/dev/null || true
+	set +e
+	wait "$audio_pid"
+	audio_rc=$?
+	if kill -0 "$video_pid" 2>/dev/null; then
+		video_survived=1
+	fi
+	wait "$video_pid"
+	video_rc=$?
+	set -e
+	CHILD_PIDS=()
+	if ((video_survived && video_rc == 0 && audio_rc != 0)); then
+		pass "audio stop left video running through $independent_frames frames"
+	else
+		fail "audio stop did not preserve video (audio rc=$audio_rc video rc=$video_rc survived=$video_survived)"
+	fi
+
+	# Both engines are idle: prove each quarantined arena can be verified and
+	# reused without a device-global failure.
+	if run_audio_capture_seconds "$audio_pcm" 1 \
+		"$OUTPUT_DIR/independent-audio-recovery.log" &&
+		run_video_capture "$node" 30 \
+			"$OUTPUT_DIR/independent-video-recovery.log"; then
+		pass "quarantined audio and video arenas were reclaimed after global idle"
+	else
+		fail "a quarantined arena could not be reclaimed after global idle"
+	fi
+
+	stop_audio_source
+	audio_delta=$(phase_log_delta independent-stop)
+	if grep -Eq "audio DMA bounds ch=$audio_channel .*guard=ok" \
+		"$audio_delta" &&
+		! grep -Eq 'channel DMA did not become idle; stopping all streams|disabled PCI bus mastering' \
+			"$audio_delta"; then
+		pass "independent stops retained guard evidence without global DMA isolation"
+	else
+		fail "independent-stop quarantine/reclaim evidence was incomplete (see $audio_delta)"
 	fi
 }
 
@@ -1323,6 +1469,7 @@ test_fault_injection() {
 	local audio_channel audio_delta audio_pcm audio_pid audio_rc
 	local original_command primary_channel rc delta
 	local capture_pid pcm
+	local audio_recovery=0
 
 	if ((!FAULT_INJECTION)); then
 		skip "W1C/INTx coalescing injection not requested"
@@ -1437,12 +1584,17 @@ test_fault_injection() {
 	audio_rc=$?
 	set -e
 	CHILD_PIDS=()
+	if ((audio_rc != 124)) &&
+		run_audio_capture_seconds "$audio_pcm" 1 \
+			"$OUTPUT_DIR/fault-audio-recovery.log"; then
+		audio_recovery=1
+	fi
 	stop_audio_source
 	audio_delta=$(phase_log_delta audio-fault-injection)
 	if grep -EinE 'BUG:|WARNING:|Oops:|KASAN:|KFENCE:|general protection fault|kernel panic|use-after-free' \
 		"$audio_delta" >"$audio_delta.failures"; then
 		fail "audio fault injection caused a kernel fault (see $audio_delta.failures)"
-	elif ((audio_rc != 124)) &&
+	elif ((audio_rc != 124 && audio_recovery)) &&
 		grep -Eq 'audio telemetry event=xrun .*reason=(w1c-[^ ]+|duplicate-toggle|cadence)' \
 			"$audio_delta" &&
 		grep -Eq "audio DMA bounds ch=$audio_channel .*guard=ok" \
@@ -1602,10 +1754,11 @@ main() {
 	test_rapid_stream_cycles
 	finish_clean_phase rapid-stream "rapid STREAMON/OFF"
 
-	step "Capture live channels and embedded audio concurrently"
+	step "Capture concurrently and stop video/audio independently"
 	phase_begin
 	test_concurrent_capture
-	finish_clean_phase concurrent "concurrent video/audio capture"
+	test_independent_stops
+	finish_clean_phase concurrent "concurrent and independent video/audio capture"
 
 	if ((FAULT_INJECTION)); then
 		step "Reload with forced INTx, inject W1C coalescing, and require fail-closed handling"

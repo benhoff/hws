@@ -536,6 +536,94 @@ static void hws_audio_drain_channel_work(struct hws_audio *a)
 	hws_audio_clear_pending(a);
 }
 
+static int
+hws_audio_reclaim_scratch_locked(struct hws_audio *a, bool dma_idle,
+				 const char *owner)
+{
+	struct hws_pcie_dev *hws;
+	unsigned long flags;
+	size_t observed = 0;
+	unsigned int ch;
+	int ret;
+
+	lockdep_assert_held(&a->scratch_state_lock);
+	if (!READ_ONCE(a->dma_armed))
+		return READ_ONCE(a->scratch_corrupt) ? -EUCLEAN : 0;
+	if (READ_ONCE(a->cap_active) || READ_ONCE(a->stream_running))
+		return -EBUSY;
+
+	hws = a->parent;
+	if (!hws)
+		return -ENODEV;
+	ch = a->channel_index;
+	dma_idle = dma_idle || READ_ONCE(hws->dma_quiesced);
+	if (!dma_idle) {
+		ret = hws_try_wait_dma_idle(hws, owner, ch);
+		if (ret) {
+			dev_dbg(&hws->pdev->dev,
+				"%s ch=%u: audio DMA arena remains quarantined: %d\n",
+				owner, ch, ret);
+			return ret == -ETIMEDOUT ? -EBUSY : ret;
+		}
+	}
+
+	ret = hws_audio_scratch_verify(hws, ch, &observed);
+	if (observed > READ_ONCE(a->observed_dma_extent))
+		WRITE_ONCE(a->observed_dma_extent, observed);
+	/* DMA is idle even when guard verification finds corruption. */
+	WRITE_ONCE(a->dma_armed, false);
+	if (ret) {
+		spin_lock_irqsave(&a->pending_lock, flags);
+		a->xrun_reason = HWS_AUDIO_XRUN_DMA_GUARD;
+		hws_audio_count_failure_locked(a, a->xrun_reason);
+		spin_unlock_irqrestore(&a->pending_lock, flags);
+		WRITE_ONCE(a->scratch_corrupt, true);
+		dev_crit(&hws->pdev->dev,
+			 "audio DMA guard corruption ch=%u ring=%zu observed=%zu capacity=%zu ret=%d\n",
+			 ch, 2 * (size_t)MAX_DMA_AUDIO_PK_SIZE, observed,
+			 hws_audio_dma_capacity(), ret);
+		return ret;
+	}
+
+	dev_info(&hws->pdev->dev,
+		 "audio DMA bounds ch=%u ring=%zu observed=%zu capacity=%zu guard=ok\n",
+		 ch, 2 * (size_t)MAX_DMA_AUDIO_PK_SIZE, observed,
+		 hws_audio_dma_capacity());
+	return 0;
+}
+
+static int hws_audio_prepare_scratch(struct hws_audio *a, const char *owner)
+{
+	struct hws_pcie_dev *hws;
+	unsigned int ch;
+	int ret;
+
+	if (!a || !a->parent)
+		return -EINVAL;
+
+	mutex_lock(&a->scratch_state_lock);
+	if (!READ_ONCE(a->scratch_acquired)) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	if (READ_ONCE(a->scratch_corrupt)) {
+		ret = -EUCLEAN;
+		goto out_unlock;
+	}
+
+	hws = a->parent;
+	ch = a->channel_index;
+	ret = hws_audio_reclaim_scratch_locked(a, false, owner);
+	if (!ret)
+		ret = hws_audio_scratch_prepare(hws, ch);
+	if (ret == -EOVERFLOW)
+		WRITE_ONCE(a->scratch_corrupt, true);
+
+out_unlock:
+	mutex_unlock(&a->scratch_state_lock);
+	return ret;
+}
+
 static int hws_audio_acquire_scratch(struct hws_audio *a)
 {
 	struct hws_pcie_dev *hws;
@@ -551,8 +639,15 @@ static int hws_audio_acquire_scratch(struct hws_audio *a)
 		return -EUCLEAN;
 	}
 	if (READ_ONCE(a->scratch_acquired)) {
+		ret = hws_audio_reclaim_scratch_locked(a, false,
+						       "audio hw_params");
+		if (!ret)
+			ret = hws_audio_scratch_prepare(a->parent,
+							a->channel_index);
+		if (ret == -EOVERFLOW)
+			WRITE_ONCE(a->scratch_corrupt, true);
 		mutex_unlock(&a->scratch_state_lock);
-		return 0;
+		return ret;
 	}
 
 	hws = a->parent;
@@ -562,11 +657,13 @@ static int hws_audio_acquire_scratch(struct hws_audio *a)
 		mutex_unlock(&a->scratch_state_lock);
 		return ret;
 	}
-	ret = hws_audio_scratch_prepare(hws, ch);
+	ret = hws_audio_reclaim_scratch_locked(a, false, "audio hw_params");
+	if (!ret)
+		ret = hws_audio_scratch_prepare(hws, ch);
 	if (ret) {
 		if (ret == -EOVERFLOW)
 			WRITE_ONCE(a->scratch_corrupt, true);
-		hws_release_channel_scratch(hws, ch, true);
+		hws_release_channel_scratch(hws, ch);
 		mutex_unlock(&a->scratch_state_lock);
 		return ret;
 	}
@@ -580,68 +677,35 @@ static int hws_audio_acquire_scratch(struct hws_audio *a)
 static void hws_audio_release_scratch(struct hws_audio *a, bool dma_idle)
 {
 	struct hws_pcie_dev *hws;
-	unsigned long flags;
-	size_t observed = 0;
 	unsigned int ch;
-	bool armed;
-	int ret;
+	bool acquired;
+	bool quarantined;
 
 	if (!a)
 		return;
 
 	mutex_lock(&a->scratch_state_lock);
-	if (!a->scratch_acquired) {
+	hws = a->parent;
+	acquired = READ_ONCE(a->scratch_acquired);
+	dma_idle = dma_idle || (hws && READ_ONCE(hws->dma_quiesced));
+	if (!acquired && !(dma_idle && READ_ONCE(a->dma_armed))) {
 		mutex_unlock(&a->scratch_state_lock);
 		return;
 	}
 
-	armed = READ_ONCE(a->dma_armed);
-	hws = a->parent;
 	ch = a->channel_index;
-	if (armed && !dma_idle) {
-		ret = -ENODEV;
-		if (hws)
-			ret = hws_wait_dma_idle(hws, "audio scratch release", ch);
-		if (ret) {
-			if (hws)
-				dev_crit(&hws->pdev->dev,
-					 "audio ch=%u retained DMA scratch: %d\n",
-					 ch, ret);
-			mutex_unlock(&a->scratch_state_lock);
-			return;
-		}
-	}
-	if (armed) {
-		ret = hws ? hws_audio_scratch_verify(hws, ch, &observed) :
-			      -ENODEV;
-		if (observed > READ_ONCE(a->observed_dma_extent))
-			WRITE_ONCE(a->observed_dma_extent, observed);
-		if (ret) {
-			spin_lock_irqsave(&a->pending_lock, flags);
-			a->xrun_reason = HWS_AUDIO_XRUN_DMA_GUARD;
-			hws_audio_count_failure_locked(a, a->xrun_reason);
-			spin_unlock_irqrestore(&a->pending_lock, flags);
-			WRITE_ONCE(a->scratch_corrupt, true);
-			if (hws)
-				dev_crit(&hws->pdev->dev,
-					 "audio DMA guard corruption ch=%u ring=%zu observed=%zu capacity=%zu ret=%d\n",
-					 ch,
-					 2 * (size_t)MAX_DMA_AUDIO_PK_SIZE,
-					 observed, hws_audio_dma_capacity(), ret);
-		} else if (hws) {
-			dev_info(&hws->pdev->dev,
-				 "audio DMA bounds ch=%u ring=%zu observed=%zu capacity=%zu guard=ok\n",
-				 ch, 2 * (size_t)MAX_DMA_AUDIO_PK_SIZE,
-				 observed, hws_audio_dma_capacity());
-		}
-	}
-
+	if (dma_idle && READ_ONCE(a->dma_armed))
+		hws_audio_reclaim_scratch_locked(a, true,
+						 "audio global teardown");
 	WRITE_ONCE(a->scratch_acquired, false);
-	WRITE_ONCE(a->dma_armed, false);
+	quarantined = READ_ONCE(a->dma_armed);
 	mutex_unlock(&a->scratch_state_lock);
 
-	if (hws)
-		hws_release_channel_scratch(hws, ch, true);
+	if (hws && acquired)
+		hws_release_channel_scratch(hws, ch);
+	if (hws && quarantined)
+		dev_dbg(&hws->pdev->dev,
+			"audio stop ch=%u quarantined DMA arena\n", ch);
 }
 
 static bool hws_audio_deliver_packet(struct hws_audio *a, const void *src,
@@ -1316,6 +1380,11 @@ static int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 		return 0;
 	}
 
+	/* ALSA prepare must reclaim a quarantined arena before a fresh START. */
+	if (READ_ONCE(a->dma_armed))
+		return -EBUSY;
+	if (READ_ONCE(a->scratch_corrupt))
+		return -EUCLEAN;
 	if (!READ_ONCE(a->scratch_acquired))
 		return -ENOMEM;
 
@@ -1495,9 +1564,7 @@ static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
 
-	hws_stop_audio_capture(a->parent, a->channel_index);
-	hws_audio_drain_channel_work(a);
-	hws_audio_reset_runtime_state(a);
+	hws_audio_quiesce_capture(a->parent, a->channel_index, true);
 	hws_audio_release_scratch(a, false);
 	WRITE_ONCE(a->pcm_substream, NULL);
 	return 0;
@@ -1537,9 +1604,7 @@ static int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
 
-	hws_stop_audio_capture(a->parent, a->channel_index);
-	hws_audio_drain_channel_work(a);
-	hws_audio_reset_runtime_state(a);
+	hws_audio_quiesce_capture(a->parent, a->channel_index, true);
 	hws_audio_release_scratch(a, false);
 	return 0;
 }
@@ -1550,6 +1615,11 @@ static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	struct snd_pcm_runtime *rt = substream->runtime;
 	unsigned long flags;
 	size_t frame_bytes;
+	int ret;
+
+	ret = hws_audio_prepare_scratch(a, "audio prepare");
+	if (ret)
+		return ret;
 
 	frame_bytes = snd_pcm_format_physical_width(rt->format) / 8;
 	frame_bytes *= rt->channels;
@@ -1584,10 +1654,8 @@ static int hws_pcie_audio_trigger(struct snd_pcm_substream *substream, int cmd)
 		hws_stop_audio_capture(hws, ch);
 		return 0;
 	case SNDRV_PCM_TRIGGER_RESUME:
-	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		return hws_start_audio_capture(hws, ch);
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		hws_stop_audio_capture(hws, ch);
 		return 0;
 	default:
@@ -1799,12 +1867,27 @@ void hws_audio_pm_resume(struct hws_pcie_dev *hws)
 
 	for (ch = 0; ch < hws->cur_max_audio_ch && ch < MAX_VID_CHANNELS; ch++) {
 		struct hws_audio *a = &hws->audio[ch];
+		int ret = 0;
 
 		WRITE_ONCE(a->stream_running, false);
 		WRITE_ONCE(a->cap_active, false);
 		WRITE_ONCE(a->stop_requested, true);
 		hws_audio_reset_counters(a);
 		hws_audio_clear_pending(a);
+
+		/* Suspend established device-global idle before entering D3. */
+		mutex_lock(&a->scratch_state_lock);
+		if (READ_ONCE(a->dma_armed))
+			ret = hws_audio_reclaim_scratch_locked(a, true, "audio PM resume");
+		if (!ret && READ_ONCE(a->scratch_acquired))
+			ret = hws_audio_scratch_prepare(hws, ch);
+		if (ret == -EOVERFLOW)
+			WRITE_ONCE(a->scratch_corrupt, true);
+		mutex_unlock(&a->scratch_state_lock);
+		if (ret)
+			dev_err(&hws->pdev->dev,
+				"audio PM resume scratch validation failed ch=%u: %d\n",
+				ch, ret);
 	}
 	hws_audio_ack_all(hws);
 }
