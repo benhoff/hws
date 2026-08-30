@@ -264,10 +264,17 @@ static int main_ks_thread_handle(void *data)
 
 	set_freezable();
 
-	while (!kthread_should_stop()) {
+	for (;;) {
+		/*
+		 * Freezable kthreads must combine the freezer and stop checks.  A
+		 * direct try_to_freeze() can remain refrigerated after
+		 * kthread_stop() asks the task to exit.
+		 */
+		if (kthread_freezable_should_stop(NULL))
+			break;
+
 		/* If we're suspending, don't touch hardware; just sleep/freeze. */
 		if (READ_ONCE(pdx->suspended)) {
-			try_to_freeze();
 			schedule_timeout_interruptible(msecs_to_jiffies(1000));
 			continue;
 		}
@@ -276,8 +283,6 @@ static int main_ks_thread_handle(void *data)
 		if (!READ_ONCE(pdx->suspended))
 			check_video_format(pdx);
 		mutex_unlock(&pdx->monitor_lock);
-
-		try_to_freeze(); /* cooperate with freezer each loop */
 
 		/* Sleep 1s or until signaled to wake/stop */
 		schedule_timeout_interruptible(msecs_to_jiffies(1000));
@@ -1728,7 +1733,12 @@ static void hws_shutdown(struct pci_dev *pdev)
 		return;
 
 	dev_info(&pdev->dev, "lifecycle:pci_shutdown begin\n");
-	vret = hws_quiesce_for_transition(hws, "pci_shutdown", true);
+	/*
+	 * Hibernation shutdown/reboot reaches device_shutdown() while freezable
+	 * kthreads remain frozen.  The suspended flag and monitor_lock barrier
+	 * keep this thread away from hardware; do not wait for it to exit here.
+	 */
+	vret = hws_quiesce_for_transition(hws, "pci_shutdown", false);
 
 	step_ns = ktime_get_mono_fast_ns();
 	pci_clear_master(pdev);
