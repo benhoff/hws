@@ -7,7 +7,7 @@
 
 int hws_audio_register(struct hws_pcie_dev *dev);
 void hws_audio_unregister(struct hws_pcie_dev *hws);
-void hws_audio_seed_channels(struct hws_pcie_dev *hws);
+int hws_audio_seed_channels(struct hws_pcie_dev *hws);
 bool hws_audio_record_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
 				u8 cur_toggle, u64 irq_ns,
 				enum hws_audio_xrun_reason ambiguity);
@@ -22,6 +22,6 @@ int hws_audio_init_channel(struct hws_pcie_dev *pdev, int ch);
 void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch,
 			       bool device_removal);
 int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws);
-void hws_audio_pm_resume(struct hws_pcie_dev *hws);
+int hws_audio_pm_resume(struct hws_pcie_dev *hws);
 
 #endif /* HWS_AUDIO_PIPELINE_H */
