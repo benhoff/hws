@@ -1216,23 +1216,6 @@ static int hws_poll_dma_idle(struct hws_pcie_dev *hws,
 	return 0;
 }
 
-static int hws_check_busy(struct hws_pcie_dev *pdx)
-{
-	u32 val = 0;
-	int ret;
-
-	ret = hws_poll_dma_idle(pdx, HWS_BUSY_POLL_TIMEOUT_US, &val);
-	if (ret) {
-		if (ret == -ENODEV)
-			return ret;
-		dev_err(&pdx->pdev->dev,
-			"SYS_STATUS busy bit never cleared (0x%08x)\n", val);
-		return ret;
-	}
-
-	return 0;
-}
-
 static void hws_fail_active_video_queues(struct hws_pcie_dev *hws)
 {
 	unsigned int ch;
@@ -1407,11 +1390,9 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 
 	/* Tell the DSP to stop */
 	writel(0x10, hws->bar0_base + HWS_REG_DEC_MODE);
-
-	if (hws_check_busy(hws))
-		dev_warn(&hws->pdev->dev, "DSP busy timeout on stop\n");
 	/* Disable video capture engine in the DSP */
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 }
 
 /* Publish stop so ISR/BH will not touch ALSA/VB2 anymore. */
@@ -1452,6 +1433,10 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 	writel(0x0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
+
+	/* Stop the shared DSP before taking the final DMA-idle observation. */
+	if (!READ_ONCE(hws->pci_lost))
+		hws_stop_dsp(hws);
 
 	/* No new hard IRQ can queue work after the published stop. */
 	if (hws->irq >= 0)
@@ -1502,10 +1487,6 @@ static int hws_stop_device(struct hws_pcie_dev *hws)
 	if (ret)
 		dev_crit(&hws->pdev->dev,
 			 "device stop could not establish DMA idle: %d\n", ret);
-
-	/* 1) Stop the on-board DSP */
-	if (!READ_ONCE(hws->pci_lost))
-		hws_stop_dsp(hws);
 
 out:
 	hws->start_run = false;
@@ -1647,8 +1628,9 @@ static int hws_pm_suspend(struct device *dev)
 	}
 
 	step_ns = ktime_get_mono_fast_ns();
-	pci_save_state(pdev);
+	/* Save BME clear so PCI resume_noirq cannot reopen DMA prematurely. */
 	pci_clear_master(pdev);
+	pci_save_state(pdev);
 	pci_disable_device(pdev);
 	pci_set_power_state(pdev, PCI_D3hot);
 	dev_dbg(dev, "lifecycle:pm_suspend:pci-d3hot (%lluus)\n",
@@ -1716,7 +1698,31 @@ err_disable_device:
 	return ret;
 }
 
-static SIMPLE_DEV_PM_OPS(hws_pm_ops, hws_pm_suspend, hws_pm_resume);
+static int hws_pm_resume_noirq(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct hws_pcie_dev *hws = pci_get_drvdata(pdev);
+
+	/*
+	 * PCI core has restored D0 and config space, but system IRQs are still
+	 * disabled. Reassert both generic DMA isolation and the device-local IRQ
+	 * quarantine before resume_device_irqs() can expose this function.
+	 */
+	pci_clear_master(pdev);
+	if (hws && hws->bar0_base) {
+		hws_irq_mask_gate(hws);
+		hws_irq_clear_pending(hws);
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops hws_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(hws_pm_suspend, hws_pm_resume)
+	.resume_noirq = hws_pm_resume_noirq,
+	.thaw_noirq = hws_pm_resume_noirq,
+	.restore_noirq = hws_pm_resume_noirq,
+};
 # define HWS_PM_OPS (&hws_pm_ops)
 #else
 # define HWS_PM_OPS NULL
