@@ -340,13 +340,15 @@ be resolved before broader testing alone could make v20 submission-ready.
 | v20 ambiguity/deadline gate | Targeted hardware pass | Stable post-W1C sampling and the eight-event startup window passed; forced-INTx ambiguity failed closed and recovered. The bounded startup-resync branch was not independently forced |
 | v20 audio staging gate | Hardware passed for channel 3 | The final concurrent run reported 237 IRQs, one primed packet, 236 delivered packets, zero drops/errors, and 127 us maximum work latency |
 | v20 audio W1C and DMA bounds | Targeted hardware pass; exact ack-window branches unforced | Channel 3 normal capture delivered 236 packets without a drop and observed no write beyond the 8 KiB ring. A 50 ms forced-INTx gate produced a duplicate-toggle XRUN, one dropped packet, userspace overrun, and an intact trailing guard. Ordered post-W1C ambiguity reasons remain implemented but need a deterministic acknowledge-window injector |
-| v20 independent per-stream stop | Code implemented; hardware pending | Ordinary video STREAMOFF and ALSA teardown disable only their channel, synchronize/drain channel work, return client-owned buffers, and leave the permanent arena quarantined. Later reuse performs a non-fatal global-idle observation and guard verification; failure blocks only that channel's reuse. The E2E harness now stops video while audio remains live and vice versa, but that matrix has not yet run on hardware |
-| v20 PCIe completion ordering | Code implemented; hardware pending | The working tree after `e848e0e` clears and verifies both Relaxed Ordering and No Snoop at probe and resume, uses ordered completion/toggle MMIO reads, and removes the non-authoritative full-half `memcmp()`. The E2E loader now verifies the PCIe Device Control bits after every reload |
-| v20 lifecycle sequencing | Code implemented; hardware pending | Probe keeps bus mastering, producers, and IRQ gates off until permanent arenas, workers, masks, and the handler exist. Suspend aborts on audio or DMA-quiesce failure instead of entering D3. Remove performs coordinated card-wide quiescence before interface unregister, and ALSA destruction is deferred behind a shared parent reference rather than waiting for open files |
+| v20 independent per-stream stop | Targeted hardware pass; full regression failed elsewhere | Video STREAMOFF left channel-3 audio running, audio stop left video running for 180 frames, both quarantined arenas were later reclaimed, and neither direction escalated to global DMA isolation. The same full run nevertheless failed on an earlier spontaneous VDONE duplicate-toggle event |
+| v20 PCIe completion ordering | Probe/reload hardware pass; resume pending | Normal MSI and forced-INTx reloads verified Relaxed Ordering and No Snoop clear, and normal capture plus CPU stress passed with ordered completion reads. Suspend/resume verification remains pending |
+| v20 lifecycle sequencing | Ordinary reload/remove hardware pass; focused lifecycle pending | Repeated normal/forced-INTx unloads completed coordinated removal in approximately 2.1..2.5 ms. Suspend failure propagation and active-handle video/ALSA removal still need focused tests |
+| v20 EOF timestamps and sequence | Targeted hardware pass | On the exact in-tree module (`srcversion` `505CD68CDAF64B48D5734ED`), channel 3 at native 1080p60 delivered monotonic EOF timestamps 0.63..0.89 ms old at DQBUF with 16.62..16.72 ms cadence. Holding all three VB2 buffers for 250.174 ms advanced sequence 14 to 30; the 16-frame sequence delta matched the 266.673 ms EOF delta and exposed 15 dropped hardware frames |
 | v20 DV/source-loss behavior | Targeted hardware pass; transition matrix pending | Hardware returned all 14 modes, bounded capabilities, preserved configured/detected independence, reported stable PCI `bus_info`, and rejected no-signal QUERY and STREAMON with `ENOLINK`. Mid-stream unplug/replug and deliberate mode changes remain untested |
 | v20 packed YUYV layout | Hardware compliance pass for native channel-3 mode | Commit `fe6aabc` normalizes every request to configured native progressive geometry with exact packed stride and size. `v4l2-compliance` passed 49/49 and streamed native 1920x1080 YUYV; the unrelated power-present control warning was fixed afterward and needs a rerun |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
-| v20 submission readiness | Blocked | Of the six original blockers, only device scope remains unresolved in code. Per-stream/global-idle coupling, PCIe ordering, and lifecycle sequencing are implemented but not yet hardware-validated; audio bounds, progressive-only interlaced policy, DV-timings semantics, and native packed format are resolved for the characterized 8888:8504/channel-3 scope. Timestamp/sequence, telemetry, and cross-device validation findings remain |
+| v20 latest full E2E regression | Failed, 29 passed / 3 failed | The current source passed load/order verification, normal and stressed capture, format/DV checks, rapid STREAMON/OFF, both independent stop directions, arena reclamation, and recovery. Concurrent capture then encountered an unforced VDONE duplicate-toggle at an 8,682 us interval; forced INTx encountered another at 8,613 us before deliberate gating, so fault injection could not start |
+| v20 submission readiness | Blocked | Of the six original blockers, device scope remains unresolved in code. EOF timestamp/sequence semantics, audio bounds, progressive-only interlaced policy, DV-timings semantics, native packed format, and independent stop behavior have targeted proof for the characterized 8888:8504/channel-3 scope. The spontaneous VDONE duplicate-toggle failure is now an immediate blocker. Production telemetry, focused lifecycle testing, and cross-device validation also remain |
 
 ## 2026-08-29 v20 code-value submission assessment
 
@@ -628,12 +630,35 @@ deliberately outside the assessment.
    frame early and is neither a frame-start nor frame-end timestamp. For EOF
    semantics, publication should use the second-half completion timestamp.
 
+   **Resolution status (2026-08-30): implemented and targeted hardware-
+   validated in the working tree after `4468e93`.** A delivered buffer now receives
+   the ordered VDONE timestamp belonging to its verified second-half event,
+   after both halves pass generation, phase, toggle, deadline, and guard checks.
+   The VB2 queue explicitly advertises monotonic EOF timestamp semantics. The
+   obsolete first-half timestamp cache has been removed. With the exact
+   in-tree module loaded, `hws_video_metadata_test.c` measured 12 normal
+   channel-3/1080p60 EOF timestamps only 0.63..0.89 ms old at DQBUF, compared
+   with approximately 9.34 ms from the deliberately observed stale module,
+   and measured the expected 16.62..16.72 ms full-frame cadence.
+
 9. **Sequence numbering excludes dropped complete frames.** The sequence
    counter advances only when a queued VB2 buffer is delivered. If no buffer is
    available when the first half arrives, a complete hardware frame is skipped
    without advancing the counter. V4L2 sequence numbers must expose dropped or
    repeated frames, so the driver needs a hardware-frame completion counter
    independent of userspace buffer availability.
+
+   **Resolution status (2026-08-30): implemented and targeted hardware-
+   validated in the working tree after `4468e93`.** Once startup synchronization has
+   established the native half order, every verified second-half completion
+   consumes exactly one sequence value. A delivered buffer receives that value;
+   a frame skipped because no VB2 buffer was available still consumes it, so a
+   later delivered buffer exposes the loss as a sequence gap. Phase-learning
+   events are intentionally not counted because they cannot yet identify a
+   trustworthy complete frame. The focused metadata test held every VB2 buffer
+   for 250.174 ms: the next delivery advanced sequence 14 to 30, exposing 15
+   skipped frames, while its 266.673 ms EOF timestamp delta agreed with exactly
+   16 hardware frame periods.
 
 10. **No-signal output is neither color-correct nor cadence-correct.** The
     monitor produces at most one synthetic frame per approximately one-second
@@ -1060,8 +1085,9 @@ accepted progressive mode. It must explicitly
 reject or validate interlaced input; test no-link, unsupported-refresh, and
 source-change DV-timings behavior, including an actual mid-stream unplug,
 prompt `EIO`/source-change notification, STREAMOFF cleanup, same-mode replug,
-changed-mode reconfiguration, and restart; verify EOF timestamps and
-dropped-frame sequence numbers; force the bounded startup-resync branch; and
+changed-mode reconfiguration, and restart; repeat the targeted EOF timestamp
+and dropped-frame sequence proof on retained channels and modes; force the
+bounded startup-resync branch; and
 cover suspend/resume plus active-stream unbind/remove with open video and ALSA
 file descriptors. Multi-channel load and ordering tests must verify after every
 probe and resume that PCIe Device Control has Relaxed Ordering and No Snoop
@@ -1161,8 +1187,10 @@ channel, with CPU assembly into queued VB2 buffers:
    Relaxed Ordering and No Snoop are disabled and verified, ordered completion
    reads are used, only decoded IRQ sources are unmasked, and the redundant
    full-half comparison is removed.
-11. Resolve the remaining code-value blockers, beginning with PCI device scope,
-   EOF timestamp/sequence semantics, and production telemetry cleanup.
+11. Targeted hardware-proved in the working tree after `4468e93`: EOF
+   timestamps come from verified second-half completion, and hardware-frame
+   sequences advance through VB2 starvation. Resolve the remaining code-value
+   blockers, beginning with PCI device scope and production telemetry cleanup.
 12. Validate every retained channel and mode, independent and concurrent
    audio/video stop, suspend/resume, active-stream unbind/remove, delayed
    copies, DMA isolation, allocation guards, and the public DV-timings API.

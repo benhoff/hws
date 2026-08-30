@@ -251,7 +251,6 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
-	vid->frame_timestamp_ns = 0;
 
 	/* DMA watchdog removed; retain counters for diagnostics */
 	vid->timeout_count = 0;
@@ -360,7 +359,6 @@ static void hws_video_reset_stream_phase_locked(struct hws_video *vid)
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
-	vid->frame_timestamp_ns = 0;
 	WRITE_ONCE(vid->last_buf_half_toggle, 0);
 	WRITE_ONCE(vid->half_seen, false);
 	WRITE_ONCE(vid->last_vdone_timestamp_ns, 0);
@@ -1479,7 +1477,8 @@ int hws_video_register(struct hws_pcie_dev *dev)
 		q->buf_struct_size = sizeof(struct hwsvideo_buffer);
 		q->ops = &hwspcie_video_qops;
 		q->mem_ops = &vb2_dma_contig_memops;
-		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+		q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC |
+				     V4L2_BUF_FLAG_TSTAMP_SRC_EOF;
 		q->lock = &ch->state_lock;
 		q->min_queued_buffers = 1;
 		q->dev = &dev->pdev->dev;
