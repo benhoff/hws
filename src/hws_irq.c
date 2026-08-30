@@ -16,10 +16,8 @@
 #define MAX_INT_LOOPS 100
 
 struct hws_vdone_event {
-	struct hwsvideo_buffer *buf;
-	u64 cookie;
 	u64 timestamp_ns;
-	int slot;
+	u64 generation;
 	u8 toggle;
 };
 
@@ -34,98 +32,123 @@ static void hws_irq_reset_completion_locked(struct hws_video *v)
 	lockdep_assert_held(&v->irq_lock);
 
 	v->completion_state = HWS_VIDEO_COMPLETION_IDLE;
-	v->completion_buf = NULL;
-	v->completion_cookie = 0;
 	v->completion_timestamp_ns = 0;
-	v->completion_slot = HWS_VIDEO_DIRECT_SLOT;
+	v->completion_generation = 0;
 	v->completion_toggle = 0;
 }
 
-static int hws_arm_next(struct hws_pcie_dev *hws, u32 ch)
+static struct hwsvideo_buffer *
+hws_irq_take_queued_buffer_locked(struct hws_video *v)
 {
-	struct hws_video *v = &hws->video[ch];
-	unsigned long flags;
 	struct hwsvideo_buffer *buf;
-	int ret;
 
-	dev_dbg(&hws->pdev->dev,
-		"arm_next(ch=%u): stop=%d cap=%d queued=%u\n",
-		ch, READ_ONCE(v->stop_requested), READ_ONCE(v->cap_active),
-		READ_ONCE(v->queued_count));
-
-	if (READ_ONCE(hws->suspended)) {
-		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): suspended\n", ch);
-		return -EBUSY;
-	}
-
-	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active)) {
-		dev_dbg(&hws->pdev->dev,
-			"arm_next(ch=%u): stop=%d cap=%d -> cancel\n", ch,
-			v->stop_requested, v->cap_active);
-		return -ECANCELED;
-	}
-
-	spin_lock_irqsave(&v->irq_lock, flags);
-	if (v->active) {
-		buf = v->active;
-		spin_unlock_irqrestore(&v->irq_lock, flags);
-		dev_dbg(&hws->pdev->dev,
-			"arm_next(ch=%u): active buffer already armed %p\n",
-			ch, buf);
-		return 0;
-	}
-	if (v->next_prepared) {
-		buf = v->next_prepared;
-		v->active = buf;
-		v->next_prepared = NULL;
-		spin_unlock_irqrestore(&v->irq_lock, flags);
-		dev_dbg(&hws->pdev->dev,
-			"arm_next(ch=%u): promoted prepared buffer %p\n",
-			ch, buf);
-		return 0;
-	}
-	if (list_empty(&v->capture_queue)) {
-		hws_enable_video_capture(hws, ch, false);
-		spin_unlock_irqrestore(&v->irq_lock, flags);
-		dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): queue empty\n", ch);
-		return -EAGAIN;
-	}
+	lockdep_assert_held(&v->irq_lock);
+	if (list_empty(&v->capture_queue))
+		return NULL;
 
 	buf = list_first_entry(&v->capture_queue, struct hwsvideo_buffer, list);
-	list_del_init(&buf->list);	/* keep buffer safe for later cleanup */
+	list_del_init(&buf->list);
 	if (v->queued_count)
 		v->queued_count--;
-	v->active = buf;
+	return buf;
+}
 
-	/* Publish descriptor(s) before MMIO capture updates. */
-	wmb();
+static int hws_video_copy_completed_half(struct hws_video *v,
+					 const struct hws_vdone_event *event,
+					 struct hwsvideo_buffer **done)
+{
+	struct hws_pcie_dev *hws = v->parent;
+	unsigned int ch = v->channel_index;
+	struct hwsvideo_buffer *buf;
+	struct vb2_v4l2_buffer *vb2v;
+	unsigned long flags;
+	void *ring;
+	void *dst;
+	size_t offset;
+	size_t length;
+	u8 completed_half = event->toggle ^ 1;
+	u8 live_toggle;
 
-	/* Avoid MMIO during suspend */
-	if (READ_ONCE(hws->suspended)) {
-		dev_dbg(&hws->pdev->dev,
-			"arm_next(ch=%u): suspended after pick\n", ch);
-		list_add(&buf->list, &v->capture_queue);
-		v->queued_count++;
-		v->active = NULL;
+	*done = NULL;
+	ring = hws_video_ring_cpu(hws, ch);
+	if (!ring || !v->ring_split || v->ring_split >= v->pix.sizeimage ||
+	    v->ring_extent < v->pix.sizeimage)
+		return -ENODEV;
+
+	live_toggle = readl_relaxed(hws->bar0_base +
+				    HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	if (live_toggle != event->toggle)
+		return -EOVERFLOW;
+
+	/* Half 0 starts a frame; half 1 may finish only that same buffer. */
+	spin_lock_irqsave(&v->irq_lock, flags);
+	if (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
+	    v->completion_generation != event->generation) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
-		return -EBUSY;
+		return -EOVERFLOW;
 	}
+	if (!completed_half) {
+		if (v->active || v->frame_half0_valid) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			return -EOVERFLOW;
+		}
+		buf = hws_irq_take_queued_buffer_locked(v);
+		if (!buf) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			return 0;
+		}
+		v->active = buf;
+		v->frame_half0_valid = false;
+		v->frame_timestamp_ns = event->timestamp_ns;
+	} else {
+		if (!v->active || !v->frame_half0_valid) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			return 0;
+		}
+		buf = v->active;
+	}
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 
-	/* Program the baseline DMA window; use arena bounce if needed. */
-	ret = hws_program_dma_for_buffer(hws, ch, buf);
-	if (ret) {
-		v->active = NULL;
-		list_add(&buf->list, &v->capture_queue);
-		v->queued_count++;
-		WRITE_ONCE(v->stop_requested, true);
-		hws_enable_video_capture(hws, ch, false);
+	vb2v = &buf->vb;
+	if (vb2_plane_size(&vb2v->vb2_buf, 0) < v->pix.sizeimage)
+		return -EMSGSIZE;
+	dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
+	if (!dst)
+		return -EFAULT;
+	offset = completed_half ? v->ring_split : 0;
+	length = completed_half ? v->pix.sizeimage - v->ring_split :
+				  v->ring_split;
+
+	dma_rmb();
+	memcpy((u8 *)dst + offset, (u8 *)ring + offset, length);
+	dma_rmb();
+	live_toggle = readl_relaxed(hws->bar0_base +
+				    HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	if (live_toggle != event->toggle ||
+	    !hws_video_ring_guards_ok(hws, ch, v->ring_extent))
+		return -EOVERFLOW;
+
+	spin_lock_irqsave(&v->irq_lock, flags);
+	if (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
+	    v->completion_generation != event->generation ||
+	    v->active != buf) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
-		return ret;
+		return -EOVERFLOW;
 	}
-
-	dev_dbg(&hws->pdev->dev, "arm_next(ch=%u): programmed buffer %p\n", ch,
-		buf);
-	(void)hws_prime_next_locked(v);
+	if (!completed_half) {
+		v->frame_half0_valid = true;
+	} else {
+		if (!v->frame_half0_valid) {
+			spin_unlock_irqrestore(&v->irq_lock, flags);
+			return -EOVERFLOW;
+		}
+		/*
+		 * Keep the assembled buffer attached until the caller rechecks the
+		 * event state. A hard IRQ can report an overrun while this copy is
+		 * running, in which case STREAMOFF must still be able to return it.
+		 */
+		*done = buf;
+	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 	return 0;
 }
@@ -135,15 +158,11 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
 	struct hws_vdone_event event = { };
-	struct hwsvideo_buffer *promoted_active = NULL;
+	struct hwsvideo_buffer *done = NULL;
 	unsigned long flags;
-	enum vb2_buffer_state buffer_state = VB2_BUF_STATE_DONE;
 	bool abort = false;
 	bool fail = false;
-	bool promoted = false;
-	int prepare_ret;
-	int prime_ret = 0;
-	int ret;
+	int ret = 0;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state == HWS_VIDEO_COMPLETION_OVERRUN) {
@@ -151,55 +170,28 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	} else if (v->completion_state != HWS_VIDEO_COMPLETION_PENDING) {
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		return;
-	}
-	if (!fail) {
-		event.buf = v->completion_buf;
-		event.cookie = v->completion_cookie;
+	} else {
 		event.timestamp_ns = v->completion_timestamp_ns;
-		event.slot = v->completion_slot;
+		event.generation = v->completion_generation;
 		event.toggle = v->completion_toggle;
-
-		if (!event.buf || !event.cookie || v->active != event.buf ||
-		    event.buf->dma_cookie != event.cookie ||
-		    event.buf->slot != event.slot) {
-			v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
-			v->completion_overruns++;
-			v->error_count++;
-			fail = true;
-		} else {
-			v->completion_state = HWS_VIDEO_COMPLETION_COPYING;
-		}
+		v->completion_state = HWS_VIDEO_COMPLETION_COPYING;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	if (fail)
 		goto fail_queue;
-
-	/* STREAMOFF owns the buffers once it has published the stop flags. */
 	if (READ_ONCE(hws->suspended) || READ_ONCE(v->stop_requested) ||
 	    !READ_ONCE(v->cap_active)) {
 		spin_lock_irqsave(&v->irq_lock, flags);
 		if (v->completion_state == HWS_VIDEO_COMPLETION_COPYING &&
-		    v->completion_buf == event.buf &&
-		    v->completion_cookie == event.cookie)
+		    v->completion_generation == event.generation)
 			hws_irq_reset_completion_locked(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		return;
 	}
 
-	prepare_ret = hws_video_prepare_done_buffer(v, event.buf,
-						    event.timestamp_ns);
-	if (prepare_ret) {
-		dev_warn_ratelimited(&hws->pdev->dev,
-				     "bh_video(ch=%u): failed to prepare completed buffer ret=%d\n",
-				     ch, prepare_ret);
-		buffer_state = VB2_BUF_STATE_ERROR;
-	}
+	ret = hws_video_copy_completed_half(v, &event, &done);
 
-	/*
-	 * Keep the completion in COPYING state until the bounce copy is done.
-	 * A second hard-IRQ edge changes it to OVERRUN and stops the engine.
-	 */
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state == HWS_VIDEO_COMPLETION_OVERRUN) {
 		fail = true;
@@ -208,27 +200,30 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		   !READ_ONCE(v->cap_active)) {
 		hws_irq_reset_completion_locked(v);
 		abort = true;
-	} else if (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
-		   v->completion_buf != event.buf ||
-		   v->completion_cookie != event.cookie ||
-		   v->active != event.buf ||
-		   event.buf->dma_cookie != event.cookie) {
+	} else if (ret ||
+		   v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
+		   v->completion_generation != event.generation) {
+		v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
+		v->completion_overruns++;
+		v->error_count++;
+		fail = true;
+	} else if (done &&
+		   (v->active != done || !v->frame_half0_valid)) {
 		v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
 		v->completion_overruns++;
 		v->error_count++;
 		fail = true;
 	} else {
-		if (v->next_prepared) {
-			v->active = v->next_prepared;
-			v->next_prepared = NULL;
-			promoted_active = v->active;
-			promoted = true;
-		} else {
+		if (done) {
 			v->active = NULL;
+			v->frame_half0_valid = false;
+			done->vb.vb2_buf.timestamp = v->frame_timestamp_ns;
+			vb2_set_plane_payload(&done->vb.vb2_buf, 0,
+					      v->pix.sizeimage);
+			done->vb.field = v->pix.field;
+			done->vb.sequence =
+				(u32)atomic_fetch_inc(&v->sequence_number);
 		}
-
-		if (promoted)
-			prime_ret = hws_prime_next_locked(v);
 		hws_irq_reset_completion_locked(v);
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -238,50 +233,21 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	if (fail)
 		goto fail_queue;
 
-	dev_dbg(&hws->pdev->dev,
-		"bh_video(ch=%u): complete buf=%p cookie=%llu slot=%d toggle=%u seq=%u\n",
-		ch, event.buf, (unsigned long long)event.cookie, event.slot,
-		event.toggle, event.buf->vb.sequence);
-	vb2_buffer_done(&event.buf->vb.vb2_buf, buffer_state);
-
-	if (prime_ret) {
-		dev_warn_ratelimited(&hws->pdev->dev,
-				     "bh_video(ch=%u): failed to pre-arm next buffer ret=%d\n",
-				     ch, prime_ret);
-		hws_video_fail_queue(v, "failed to pre-arm next buffer");
-		return;
-	}
-
-	if (READ_ONCE(hws->suspended))
-		return;
-
-	if (promoted) {
+	if (done) {
 		dev_dbg(&hws->pdev->dev,
-			"bh_video(ch=%u): promoted pre-armed buffer active=%p\n",
-			ch, promoted_active);
-		return;
+			"bh_video(ch=%u): assembled buf=%p generation=%llu toggle=%u seq=%u\n",
+			ch, done, (unsigned long long)event.generation,
+			event.toggle, done->vb.sequence);
+		vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	}
-
-	/* 2) Immediately arm the next queued buffer (if present) */
-	ret = hws_arm_next(hws, ch);
-	if (ret == -EAGAIN) {
-		dev_dbg(&hws->pdev->dev,
-			"bh_video(ch=%u): no queued buffer to arm\n", ch);
-		return;
-	}
-	if (ret) {
-		if (ret != -ECANCELED && ret != -EBUSY)
-			hws_video_fail_queue(v, "failed to arm next buffer");
-		return;
-	}
-	dev_dbg(&hws->pdev->dev,
-		"bh_video(ch=%u): armed next buffer, active=%p\n", ch,
-		v->active);
-	/* On success the engine now points at v->active's DMA address */
 	return;
 
 fail_queue:
-	hws_video_fail_queue(v, "VDONE completion overrun or identity mismatch");
+	dev_err_ratelimited(&hws->pdev->dev,
+			    "VDONE half-ring failure ch=%u generation=%llu toggle=%u ret=%d\n",
+			    ch, (unsigned long long)event.generation,
+			    event.toggle, ret);
+	hws_video_fail_queue(v, "VDONE half-ring phase, copy, or guard failure");
 }
 
 static void hws_irq_ack_status(struct hws_pcie_dev *pdx, u32 int_state)
@@ -322,10 +288,11 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 	if (!READ_ONCE(v->cap_active) || READ_ONCE(v->stop_requested)) {
 		result = HWS_VDONE_IGNORED;
 	} else if (v->completion_state != HWS_VIDEO_COMPLETION_IDLE ||
-		   !v->active || !v->active->dma_cookie) {
+		   (v->half_seen && toggle == v->last_buf_half_toggle)) {
 		/*
-		 * The two-slot pipeline can protect only one deferred copy. A
-		 * second edge means hardware may reuse the slot being copied.
+		 * A pending/copying event means the source half may already be
+		 * reused. A duplicate toggle means sticky W1C status hid an even
+		 * number of capture phases. Neither case has a trustworthy frame.
 		 */
 		v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
 		v->completion_overruns++;
@@ -334,10 +301,11 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 		WRITE_ONCE(v->cap_active, false);
 		result = HWS_VDONE_OVERRUN;
 	} else {
-		v->completion_buf = v->active;
-		v->completion_cookie = v->active->dma_cookie;
+		v->next_completion_generation++;
+		if (!v->next_completion_generation)
+			v->next_completion_generation++;
 		v->completion_timestamp_ns = timestamp_ns;
-		v->completion_slot = v->active->slot;
+		v->completion_generation = v->next_completion_generation;
 		v->completion_toggle = toggle;
 		v->completion_state = HWS_VIDEO_COMPLETION_PENDING;
 		WRITE_ONCE(v->last_buf_half_toggle, toggle);
@@ -349,7 +317,7 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch, u8 toggle,
 	if (result == HWS_VDONE_OVERRUN) {
 		hws_enable_video_capture(pdx, ch, false);
 		dev_err_ratelimited(&pdx->pdev->dev,
-				    "VDONE overrun ch=%u: deferred completion still owns a bounce slot\n",
+				    "VDONE overrun ch=%u: pending copy or duplicate half-ring toggle\n",
 				    ch);
 	}
 	if (result != HWS_VDONE_IGNORED)

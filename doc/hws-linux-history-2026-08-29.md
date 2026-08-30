@@ -1,4 +1,4 @@
-# HWS and Linux upstream history through v19
+# HWS and Linux upstream history through v19, with v20 DMA-safety progress
 
 Status date: 2026-08-29
 
@@ -20,9 +20,9 @@ architecture:
 - DMA wrote 2,048 bytes beyond the nominal 1920x1080 YUYV `sizeimage`, through
   the page-rounded extent.
 - The native half-ring was viable for channel 3 at 1920x1080p60, with a fixed
-  DMA base and CPU copies of proved-complete halves, but this has not yet been
-  integrated into the production driver or validated across all supported
-  channels and modes.
+  DMA base and CPU copies of proved-complete halves. That architecture is now
+  integrated on the `audio-upstream-v20-dma-safety` successor branch, but it
+  has not yet been hardware-validated across the supported channels and modes.
 
 The August findings therefore require a production successor to v19. They are
 not merely optional follow-on architecture work. The lifecycle, quiescing,
@@ -218,6 +218,47 @@ not validate the current v19 bounce path or establish the same behavior across
 other channels and modes. The complete preserved evidence and requirements
 are in `doc/dma-safety-findings.md` on the dangerous diagnostic branch.
 
+## v20 DMA-safety implementation status
+
+On 2026-08-29, the production successor work on
+`audio-upstream-v20-dma-safety` replaced the v19 live-base/two-slot video path
+with a permanent private native half-ring per channel. The implementation is
+source-complete for this architectural step and passes software checks, but no
+v20 module has yet been loaded or exercised on the capture hardware.
+
+The implemented invariants are:
+
+- Every active channel receives one coherent arena at probe. Its video layout
+  is a leading guard page, a `PAGE_ALIGN(MAX_VIDEO_SCALER_SIZE)` ring, and a
+  trailing guard page; any audio scratch follows that protected region in the
+  same remap page. The arena remains allocated until PCI teardown.
+- A stream uses `PAGE_ALIGN(sizeimage)` as its hardware-owned extent, so the
+  1920x1080 YUYV allocation includes the observed 2,048-byte DMA tail. Only
+  `sizeimage` bytes are copied to userspace. A guard page beginning at the
+  active extent is poisoned before capture and verified after each half copy
+  and at STREAMOFF.
+- The DMA base, remap entry, and native 2,048-byte-aligned split are programmed
+  before VCAP is enabled. The programming helper rejects any live retargeting.
+- Video DMA always targets the permanent ring. VB2 buffers are CPU-mapped MMAP
+  buffers and their addresses are never written to the video DMA registers.
+- The hard IRQ records toggle, timestamp, and generation only. The threaded
+  handler treats `toggle ^ 1` as the completed half, checks the live toggle
+  before and after each copy, assembles half 0 and half 1 into one VB2 buffer,
+  and detaches that buffer only after the event state is revalidated.
+- An orphan half 1 is dropped. A missing destination at half 0 drops the whole
+  frame. A pending copy, duplicate toggle, half-order mismatch, destination
+  mapping/size error, or guard failure stops capture and fails the queue
+  instead of delivering an ambiguous buffer.
+- STREAMOFF synchronizes the threaded IRQ, retains the permanent arena until
+  teardown, and checks the active extent guard after the existing DMA-idle
+  barrier.
+
+The module builds against Arch kernel `7.1.9-arch1-2`, `git diff --check` is
+clean, and Linux `checkpatch.pl` reports zero errors and zero warnings for the
+change. Still outstanding are the explicit 7,500 us copy-deadline gate,
+stronger W1C phase-ambiguity detection, and the complete hardware validation
+matrix. Until those pass, v20 is not submission-ready.
+
 ## Validation matrix
 
 | Area | Status | Evidence or gap |
@@ -230,8 +271,10 @@ are in `doc/dma-safety-findings.md` on the dangerous diagnostic branch.
 | STREAMOFF race | Passed for the targeted fix | 500 post-fix attempts with no ownership warning |
 | Remove/unbind | Partial | Minimal open-FD case only; active streaming case remains unproved |
 | Colorimetry | Passed for measured mode | Measurements support the metadata correction |
-| Native half-ring diagnostic | Promising, diagnostic-only | Strong channel 3/1080p60 evidence; not integrated or generalized |
+| Native half-ring diagnostic | Passed for characterized scope | Strong channel 3/1080p60 diagnostic evidence; not generalized |
+| v20 fixed half-ring implementation | Software checks passed | Module build, whitespace, and checkpatch pass; hardware execution is pending |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
+| v20 submission readiness | Blocked | Deadline/ambiguity gate and full hardware validation remain |
 
 ## Submission and review status
 
@@ -280,13 +323,12 @@ channel, with CPU assembly into queued VB2 buffers:
 
 ## Prioritized resume plan
 
-1. Preserve the five local diagnostic commits and their evidence by pushing or
-   backing up the dangerous branch. Do not merge its experimental driver into
-   production.
-2. Keep `audio-upstream-v19` immutable as the reference. Create a clearly
-   named production DMA-safety successor branch from its exact tip.
-3. Implement the guarded fixed native half-ring and CPU two-half assembly on
-   the successor branch.
+1. Completed: the five diagnostic commits and evidence are preserved on the
+   pushed dangerous branch. Its experimental driver was not merged.
+2. Completed: `audio-upstream-v19` remains the immutable reference, and
+   `audio-upstream-v20-dma-safety` was created from its exact tip.
+3. Implemented, awaiting hardware proof: the successor branch has the guarded
+   fixed native half-ring and CPU two-half assembly.
 4. Add explicit W1C ambiguity, phase, generation, copy-deadline, and fail-closed
    handling.
 5. Validate every supported channel and mode, concurrent audio/video,

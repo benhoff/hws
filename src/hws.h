@@ -56,12 +56,7 @@ struct hws_video;
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
-	u64 dma_cookie;
-	int slot;
 };
-
-#define HWS_VIDEO_DIRECT_SLOT (-1)
-#define HWS_VIDEO_BOUNCE_SLOTS 2
 
 enum hws_video_completion_state {
 	HWS_VIDEO_COMPLETION_IDLE,
@@ -78,15 +73,17 @@ struct hws_video {
 	struct vb2_queue buffer_queue;
 	bool queue_initialized;
 	struct list_head capture_queue;
+	/* VB2 buffer receiving the current ordered half pair. */
 	struct hwsvideo_buffer *active;
-	struct hwsvideo_buffer *next_prepared;
-	struct hwsvideo_buffer *completion_buf;
-	u64 completion_cookie;
 	u64 completion_timestamp_ns;
-	u64 next_dma_cookie;
-	int completion_slot;
+	u64 completion_generation;
+	u64 next_completion_generation;
 	enum hws_video_completion_state completion_state;
 	u8 completion_toggle;
+	bool frame_half0_valid;
+	u64 frame_timestamp_ns;
+	size_t ring_extent;
+	size_t ring_split;
 
 	/* Locking */
 	struct mutex state_lock;
@@ -131,7 +128,6 @@ struct hws_video {
 	u32 last_dma_page;
 	u32 last_pci_addr;
 	u32 last_half16;
-	u8 next_bounce_slot;
 
 	/* Misc counters */
 	int signal_loss_cnt;
@@ -283,6 +279,13 @@ static inline bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
 int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
 void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch,
 				 bool dma_idle);
+void *hws_video_ring_cpu(struct hws_pcie_dev *hws, unsigned int ch);
+dma_addr_t hws_video_ring_dma(struct hws_pcie_dev *hws, unsigned int ch);
+size_t hws_video_ring_capacity(void);
+int hws_video_ring_prepare(struct hws_pcie_dev *hws, unsigned int ch,
+			   size_t extent);
+bool hws_video_ring_guards_ok(struct hws_pcie_dev *hws, unsigned int ch,
+			      size_t extent);
 int hws_try_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 int hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 

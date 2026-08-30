@@ -16,6 +16,8 @@
 #include <linux/freezer.h>
 #include <linux/pci_regs.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
+#include <linux/string.h>
 
 #include <media/v4l2-ctrls.h>
 
@@ -30,6 +32,7 @@
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
 #define HWS_DMA_IDLE_GRACE_US 100000
+#define HWS_VIDEO_GUARD_POISON 0xa5
 
 static bool hws_enable_audio = true;
 module_param_named(enable_audio, hws_enable_audio, bool, 0444);
@@ -307,12 +310,112 @@ static void hws_destroy_audio_workqueue(struct hws_pcie_dev *hws)
 
 static size_t hws_video_scratch_bytes(void)
 {
-	return HWS_VIDEO_BOUNCE_SLOTS * ALIGN((size_t)MAX_VIDEO_SCALER_SIZE, 64);
+	return PAGE_SIZE + hws_video_ring_capacity() + PAGE_SIZE;
 }
 
 static size_t hws_audio_scratch_bytes(void)
 {
 	return ALIGN((size_t)MAX_AUDIO_CAP_SIZE, 64);
+}
+
+size_t hws_video_ring_capacity(void)
+{
+	return PAGE_ALIGN((size_t)MAX_VIDEO_SCALER_SIZE);
+}
+
+void *hws_video_ring_cpu(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_scratch_dma *arena;
+
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return NULL;
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes())
+		return NULL;
+	return (u8 *)arena->cpu + PAGE_SIZE;
+}
+
+dma_addr_t hws_video_ring_dma(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_scratch_dma *arena;
+
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return 0;
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes())
+		return 0;
+	return arena->dma + PAGE_SIZE;
+}
+
+static bool hws_video_fixed_guards_ok(struct hws_scratch_dma *arena)
+{
+	u8 *suffix;
+
+	if (!arena || !arena->cpu || arena->size < hws_video_scratch_bytes())
+		return false;
+	suffix = (u8 *)arena->cpu + PAGE_SIZE + hws_video_ring_capacity();
+	return !memchr_inv(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE) &&
+	       !memchr_inv(suffix, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+}
+
+int hws_video_ring_prepare(struct hws_pcie_dev *hws, unsigned int ch,
+			   size_t extent)
+{
+	struct hws_scratch_dma *arena;
+	u8 *ring;
+	int ret = 0;
+
+	if (!hws || ch >= hws->cur_max_video_ch || !PAGE_ALIGNED(extent) ||
+	    !extent || extent > hws_video_ring_capacity())
+		return -EINVAL;
+
+	mutex_lock(&hws->scratch_lock);
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes()) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	if (!hws_video_fixed_guards_ok(arena)) {
+		ret = -EOVERFLOW;
+		goto out_unlock;
+	}
+
+	ring = (u8 *)arena->cpu + PAGE_SIZE;
+	memset(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+	memset(ring + extent, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+	/* Publish guard initialization before VCAP can be enabled. */
+	dma_wmb();
+
+out_unlock:
+	mutex_unlock(&hws->scratch_lock);
+	return ret;
+}
+
+bool hws_video_ring_guards_ok(struct hws_pcie_dev *hws, unsigned int ch,
+			      size_t extent)
+{
+	struct hws_scratch_dma *arena;
+	u8 *ring;
+	bool ok;
+
+	if (!hws || ch >= hws->cur_max_video_ch || !PAGE_ALIGNED(extent) ||
+	    !extent || extent > hws_video_ring_capacity())
+		return false;
+
+	mutex_lock(&hws->scratch_lock);
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes()) {
+		ok = false;
+		goto out_unlock;
+	}
+	ring = (u8 *)arena->cpu + PAGE_SIZE;
+	dma_rmb();
+	ok = !memchr_inv(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE) &&
+	     !memchr_inv(ring + extent, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+
+out_unlock:
+	mutex_unlock(&hws->scratch_lock);
+	return ok;
 }
 
 static void hws_clear_scratch(struct hws_scratch_dma *scratch)
@@ -344,7 +447,6 @@ static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
 		hws->video[ch].last_dma_page = 0;
 		hws->video[ch].last_pci_addr = 0;
 		hws->video[ch].last_half16 = 0;
-		hws->video[ch].next_bounce_slot = 0;
 		spin_unlock_irqrestore(&hws->video[ch].irq_lock, flags);
 	}
 	hws->scratch_users[ch] = 0;
@@ -362,7 +464,7 @@ static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
 
 int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	size_t aud_off = hws_video_scratch_bytes();
+	size_t aud_off = ALIGN(hws_video_scratch_bytes(), 64);
 	size_t arena_need = aud_off;
 	bool has_audio;
 
@@ -375,10 +477,11 @@ int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 		arena_need = ALIGN(aud_off + hws_audio_scratch_bytes(), 64);
 
 	/*
-	 * One coherent per-channel arena backs both fallback video DMA and audio
-	 * DMA. The video bounce slots live first; the audio capture window starts
-	 * at aud_off. The whole arena must fit inside a single 512 MiB remap page
-	 * because video and audio share the channel remap slot.
+	 * One permanent coherent per-channel arena backs the guarded native video
+	 * half-ring and audio DMA. The video region is a leading guard page, the
+	 * maximum page-rounded ring, and a trailing guard page. Audio starts at
+	 * aud_off. The whole arena must fit inside one 512 MiB remap page because
+	 * video and audio share the channel remap slot.
 	 */
 	mutex_lock(&hws->scratch_lock);
 	if (hws->scratch_vid[ch].cpu) {
@@ -418,6 +521,7 @@ int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 		hws->scratch_vid[ch].cpu = cpu;
 		hws->scratch_vid[ch].size = arena_need;
 		hws->scratch_vid[ch].owned = true;
+		memset(cpu, HWS_VIDEO_GUARD_POISON, hws_video_scratch_bytes());
 
 		if (has_audio) {
 			hws->scratch_aud[ch].dma = dma + aud_off;
@@ -438,11 +542,9 @@ int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch,
 				 bool dma_idle)
 {
-	bool free_arena = false;
-	int ret = 0;
-
 	if (!hws || ch >= MAX_VID_CHANNELS)
 		return;
+	(void)dma_idle;
 
 	mutex_lock(&hws->scratch_lock);
 	if (!hws->scratch_users[ch]) {
@@ -451,31 +553,6 @@ void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch,
 	}
 
 	hws->scratch_users[ch]--;
-	free_arena = !hws->scratch_users[ch] && hws->scratch_vid[ch].cpu;
-	mutex_unlock(&hws->scratch_lock);
-
-	if (!free_arena)
-		return;
-
-	/*
-	 * The last stream user has disabled its channel, but a posted disable
-	 * does not prove that an older PCI DMA write has completed. Keep the
-	 * arena mapped until the caller supplies that proof or the shared busy
-	 * indication establishes it here.
-	 */
-	if (!dma_idle)
-		ret = hws_wait_dma_idle(hws, "scratch release", ch);
-	if (ret) {
-		dev_crit(&hws->pdev->dev,
-			 "retaining scratch arena ch=%u: DMA did not quiesce (%d)\n",
-			 ch, ret);
-		return;
-	}
-
-	mutex_lock(&hws->scratch_lock);
-	/* A new stream may have acquired the retained arena while we waited. */
-	if (!hws->scratch_users[ch] && hws->scratch_vid[ch].cpu)
-		hws_free_channel_scratch_locked(hws, ch);
 	mutex_unlock(&hws->scratch_lock);
 }
 
@@ -610,7 +687,7 @@ static void hws_put_device_action(void *data)
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 {
 	struct hws_pcie_dev *hws;
-	int i, ret, irq;
+	int i, ret, irq, scratch_ch;
 	unsigned long irqf = 0;
 	bool audio_registered = false;
 
@@ -690,6 +767,25 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		}
 	}
 
+	/*
+	 * Allocate every channel's guarded DMA arena before publishing ALSA or
+	 * V4L2 nodes. These mappings remain stable until PCI teardown; stream
+	 * users only take and drop references to them.
+	 */
+	for (scratch_ch = 0;
+	     scratch_ch < max_t(unsigned int, hws->cur_max_video_ch,
+				 hws->cur_max_audio_ch);
+	     scratch_ch++) {
+		ret = hws_alloc_channel_scratch(hws, scratch_ch);
+		if (ret) {
+			dev_err(&pdev->dev,
+				"permanent DMA arena allocation failed (ch=%d): %d\n",
+				scratch_ch, ret);
+			goto err_unwind_channels;
+		}
+		hws_release_channel_scratch(hws, scratch_ch, true);
+	}
+
 	if (hws->cur_max_audio_ch) {
 		hws->audio_wq = alloc_workqueue("hws-audio",
 						WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM,
@@ -703,7 +799,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_info(&pdev->dev, "audio capture disabled; video-only mode\n");
 	}
 
-	/* 6) Start-run sequence. Scratch DMA is allocated on stream start. */
+	/* 6) Start-run sequence with the permanent DMA arenas retained. */
 	hws_init_video_sys(hws, false);
 
 	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
