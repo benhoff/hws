@@ -912,6 +912,8 @@ static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 
 	/* The monitor can stop/restart a channel, so drain only after it exits. */
 	hws_video_drain_work(hws);
+	if (hws->audio_wq)
+		hws_audio_drain_work(hws);
 
 	if (hws->bar0_base)
 		hws_irq_clear_pending(hws);
@@ -1263,10 +1265,12 @@ static int hws_isolate_pci_dma(struct hws_pcie_dev *hws,
 		return -EIO;
 	}
 
-	if (!pci_wait_for_pending_transaction(hws->pdev))
-		dev_warn(&hws->pdev->dev,
+	if (!pci_wait_for_pending_transaction(hws->pdev)) {
+		dev_crit(&hws->pdev->dev,
 			 "%s ch=%d: PCI transaction-pending bit remained set after bus-master disable\n",
 			 owner, ch);
+		return -ETIMEDOUT;
+	}
 
 	dev_err(&hws->pdev->dev,
 		"%s ch=%d: disabled PCI bus mastering after stuck DMA busy indication\n",
@@ -1466,14 +1470,27 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 
 static int hws_stop_device(struct hws_pcie_dev *hws)
 {
-	u32 status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
+	u32 status;
 	u64 start_ns = ktime_get_mono_fast_ns();
-	bool live = status != 0xFFFFFFFF;
+	bool live;
 	int ret = 0;
 
+	/*
+	 * Publish and drain software ownership before probing device liveness.
+	 * The missing-function path must not leave ALSA/VB2 work touching MMIO.
+	 */
+	hws_publish_stop_flags(hws);
+	if (hws->irq >= 0)
+		synchronize_irq(hws->irq);
+	hws_video_drain_work(hws);
+	if (hws->audio_wq)
+		hws_audio_drain_work(hws);
+
+	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
+	live = status != U32_MAX;
 	dev_dbg(&hws->pdev->dev, "%s: status=0x%08x\n", __func__, status);
 	if (!live) {
-		hws->pci_lost = true;
+		WRITE_ONCE(hws->pci_lost, true);
 		ret = hws_isolate_pci_dma(hws, "device stop", -1);
 		if (!ret)
 			WRITE_ONCE(hws->dma_quiesced, true);
@@ -1481,8 +1498,7 @@ static int hws_stop_device(struct hws_pcie_dev *hws)
 	}
 	hws_log_lifecycle_snapshot(hws, "stop-device", "begin");
 
-	/* Make ISR/BH a no-op, then drain engines/IRQ. */
-	hws_publish_stop_flags(hws);
+	/* Software is stopped; now drain the live engines and IRQ state. */
 	ret = hws_drain_after_stop(hws);
 	if (ret)
 		dev_crit(&hws->pdev->dev,
@@ -1628,12 +1644,9 @@ static int hws_pm_suspend(struct device *dev)
 	}
 
 	step_ns = ktime_get_mono_fast_ns();
-	/* Save BME clear so PCI resume_noirq cannot reopen DMA prematurely. */
+	/* PCI core will save BME clear and perform the low-power transition. */
 	pci_clear_master(pdev);
-	pci_save_state(pdev);
-	pci_disable_device(pdev);
-	pci_set_power_state(pdev, PCI_D3hot);
-	dev_dbg(dev, "lifecycle:pm_suspend:pci-d3hot (%lluus)\n",
+	dev_dbg(dev, "lifecycle:pm_suspend:pci-quarantined (%lluus)\n",
 		hws_elapsed_us(step_ns));
 	dev_info(dev, "lifecycle:pm_suspend done ret=%d (%lluus)\n", vret,
 		 hws_elapsed_us(start_ns));
@@ -1650,21 +1663,15 @@ static int hws_pm_resume(struct device *dev)
 	u64 step_ns;
 
 	dev_info(dev, "lifecycle:pm_resume begin\n");
-	if (READ_ONCE(hws->dma_failed))
+	if (READ_ONCE(hws->dma_failed)) {
+		pci_clear_master(pdev);
 		return -EIO;
-
-	/* Back to D0 and re-enable the function */
-	step_ns = ktime_get_mono_fast_ns();
-	pci_set_power_state(pdev, PCI_D0);
-
-	ret = pci_enable_device(pdev);
-	if (ret) {
-		dev_err(dev, "pci_enable_device: %d\n", ret);
-		return ret;
 	}
-	pci_restore_state(pdev);
+
+	/* PCI core restored D0/config in noirq; retain quarantine until reinit. */
+	step_ns = ktime_get_mono_fast_ns();
 	pci_clear_master(pdev);
-	dev_dbg(dev, "lifecycle:pm_resume:pci-enable (%lluus)\n",
+	dev_dbg(dev, "lifecycle:pm_resume:pci-quarantined (%lluus)\n",
 		hws_elapsed_us(step_ns));
 
 	/* Restore the conservative requester-ordering contract lost across D3. */
@@ -1672,7 +1679,7 @@ static int hws_pm_resume(struct device *dev)
 	if (ret) {
 		dev_err(dev, "failed to enforce PCIe requester ordering: %d\n",
 			ret);
-		goto err_disable_device;
+		goto err_quarantine;
 	}
 
 	/* Reinitialize chip-side capabilities / registers */
@@ -1680,7 +1687,7 @@ static int hws_pm_resume(struct device *dev)
 	ret = read_chip_id(hws);
 	if (ret) {
 		dev_err(dev, "failed to restore chip identity: %d\n", ret);
-		goto err_disable_device;
+		goto err_quarantine;
 	}
 	/* Restore retained DMA windows while every producer and IRQ is masked. */
 	hws_restart_quiesced_core(hws);
@@ -1692,9 +1699,10 @@ static int hws_pm_resume(struct device *dev)
 
 	return 0;
 
-err_disable_device:
+err_quarantine:
 	pci_clear_master(pdev);
-	pci_disable_device(pdev);
+	if (hws->bar0_base)
+		hws_irq_mask_gate(hws);
 	return ret;
 }
 
