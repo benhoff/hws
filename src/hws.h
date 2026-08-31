@@ -209,6 +209,7 @@ struct hws_video {
 	u32 toggle_sample_errors;
 	u32 sync_restarts;
 	u32 duplicate_recoveries;
+	u32 cadence_recoveries;
 	u32 recovery_reports_pending;
 	u64 recovery_report_generation;
 	u64 recovery_report_interval_us;

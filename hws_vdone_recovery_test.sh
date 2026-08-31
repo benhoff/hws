@@ -15,10 +15,10 @@ usage() {
 Usage: $(basename "$0") --run [--device DEV] [--seconds N]
 
 Reload the exact in-tree HwsCapture module and require uninterrupted capture
-through at least one recoverable duplicate VDONE event.
+through at least one recoverable duplicate or changed-cadence VDONE event.
 
 The soak reports elapsed time, IRQ progress, and the number of recovered
-duplicate events every five seconds. A quiet capture is therefore visibly
+VDONE phase events every five seconds. A quiet capture is therefore visibly
 distinguishable from a stalled one.
 
 Run this as the desktop user, not through sudo. The script uses sudo only for
@@ -140,7 +140,7 @@ read_irq_total() {
 count_recoveries() {
 	sudo -n journalctl -k -b --since "@$started_epoch" --no-pager \
 		2>/dev/null |
-		awk '/VDONE duplicate recovered/ { count++ }
+		awk '/VDONE (duplicate|cadence) recovered/ { count++ }
 			END { print count + 0 }'
 }
 
@@ -192,6 +192,7 @@ if ! sudo -n journalctl -k -b --since "@$started_epoch" --no-pager \
 fi
 grep -E \
 	-e 'VDONE duplicate recovered' \
+	-e 'VDONE cadence recovered' \
 	-e 'VDONE phase resync' \
 	-e 'VDONE ambiguity' \
 	-e 'VDONE half-ring failure' \
@@ -220,10 +221,10 @@ if ((elapsed < minimum_elapsed)); then
 	exit 1
 fi
 
-if grep -q 'VDONE duplicate recovered' "$recovery_log"; then
-	echo "RESULT: PASS (duplicate VDONE recovered and capture continued)"
+if grep -Eq 'VDONE (duplicate|cadence) recovered' "$recovery_log"; then
+	echo "RESULT: PASS (VDONE phase disturbance recovered and capture continued)"
 	exit 0
 fi
 
-echo "RESULT: INCONCLUSIVE (capture survived, but no duplicate was observed)"
+echo "RESULT: INCONCLUSIVE (capture survived, but no recovery event was observed)"
 exit 2

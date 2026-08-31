@@ -262,6 +262,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->toggle_sample_errors = 0;
 	vid->sync_restarts = 0;
 	vid->duplicate_recoveries = 0;
+	vid->cadence_recoveries = 0;
 	vid->phase_errors = 0;
 	vid->deadline_misses = 0;
 	vid->guard_errors = 0;
@@ -1425,6 +1426,7 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	unsigned int ambiguity_count;
 	unsigned int sync_restart_count;
 	unsigned int duplicate_recovery_count;
+	unsigned int cadence_recovery_count;
 	unsigned int deadline_count;
 	unsigned int phase_error_count;
 	enum hws_video_half_phase half_phase;
@@ -1448,17 +1450,18 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	ambiguity_count = v->w1c_ambiguities;
 	sync_restart_count = v->sync_restarts;
 	duplicate_recovery_count = v->duplicate_recoveries;
+	cadence_recovery_count = v->cadence_recoveries;
 	phase_error_count = v->phase_errors;
 	deadline_count = v->deadline_misses;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	dev_dbg(&hws->pdev->dev,
-		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u phase=%u generation=%llu ambiguity=%u sync_restarts=%u duplicate_recoveries=%u phase_errors=%u deadlines=%u\n",
+		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u phase=%u generation=%llu ambiguity=%u sync_restarts=%u duplicate_recoveries=%u cadence_recoveries=%u phase_errors=%u deadlines=%u\n",
 		action, phase, v->channel_index, streaming, cap_active,
 		stop_requested, active, queued, tracked, seq, half_phase,
 		(unsigned long long)phase_generation, ambiguity_count,
-		sync_restart_count, duplicate_recovery_count, phase_error_count,
-		deadline_count);
+		sync_restart_count, duplicate_recovery_count,
+		cadence_recovery_count, phase_error_count, deadline_count);
 }
 
 static void hws_stop_streaming(struct vb2_queue *q)

@@ -400,6 +400,24 @@ implemented and targeted hardware-checked. Broader hardware validation remains
 outstanding, but the code-value assessment below identifies blockers that must
 be resolved before broader testing alone could make v20 submission-ready.
 
+**Channel-0 changed-cadence follow-up:** on 2026-08-31, concurrent desktop
+capture continued to produce channel-0 queue failures after the channel-1
+full-period recovery was added. Each failure was a stable changed-toggle VDONE
+outside the steady-state half-period window, usually at approximately 15.2
+through 15.9 ms; rapid restart could instead encounter the complementary
+approximately 1 ms boundary. The loaded module exactly matched the in-tree
+module and used MSI. The working tree now treats that steady-state cadence
+ambiguity like the baseline's discard-and-continue path without copying the
+questionable half: it recycles any partial VB2 buffer internally without
+completing it to userspace, leaves VCAP running, and enters the existing
+eight-boundary copy-disabled synchronization phase. This is important for
+DMABUF consumers because an error-completed partial buffer can otherwise be
+displayed if userspace ignores `V4L2_BUF_FLAG_ERROR`. Unstable or reasserted
+status, in-flight completion, copy-deadline and guard failures remain
+fail-closed. The focused recovery test now recognizes both
+`VDONE duplicate recovered` and `VDONE cadence recovered`; hardware validation
+of the new cadence path remains pending.
+
 ## Validation matrix
 
 | Area | Status | Evidence or gap |

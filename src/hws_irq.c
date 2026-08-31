@@ -546,15 +546,28 @@ static void hws_video_recovery_work(struct work_struct *work)
 	if (!reports)
 		return;
 
-	if (steady)
-		dev_warn_ratelimited(&hws->pdev->dev,
-				     "VDONE duplicate recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u attempt=%u/%u reports=%u\n",
-				     v->channel_index,
-				     (unsigned long long)generation, toggle,
-				     (unsigned long long)interval_us,
-				     dropped_partial, attempt,
-				     HWS_VIDEO_SYNC_RESTARTS_MAX, reports);
-	else
+	if (steady) {
+		if (reason == HWS_VDONE_AMBIG_DUPLICATE)
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "VDONE duplicate recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u attempt=%u/%u reports=%u\n",
+					     v->channel_index,
+					     (unsigned long long)generation,
+					     toggle,
+					     (unsigned long long)interval_us,
+					     dropped_partial, attempt,
+					     HWS_VIDEO_SYNC_RESTARTS_MAX,
+					     reports);
+		else
+			dev_warn_ratelimited(&hws->pdev->dev,
+					     "VDONE cadence recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u attempt=%u/%u reports=%u\n",
+					     v->channel_index,
+					     (unsigned long long)generation,
+					     toggle,
+					     (unsigned long long)interval_us,
+					     dropped_partial, attempt,
+					     HWS_VIDEO_SYNC_RESTARTS_MAX,
+					     reports);
+	} else {
 		dev_info_ratelimited(&hws->pdev->dev,
 				     "VDONE phase resync ch=%u generation=%llu toggle=%u interval=%lluus reason=%s attempt=%u/%u reports=%u\n",
 				     v->channel_index,
@@ -562,6 +575,7 @@ static void hws_video_recovery_work(struct work_struct *work)
 				     (unsigned long long)interval_us,
 				     hws_vdone_ambiguity_name(reason), attempt,
 				     HWS_VIDEO_SYNC_RESTARTS_MAX, reports);
+	}
 }
 
 void hws_irq_init_video_work(struct hws_video *vid)
@@ -646,7 +660,6 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     u64 timestamp_ns)
 {
 	struct hws_video *v;
-	struct hwsvideo_buffer *recovery_done = NULL;
 	unsigned long flags;
 	enum hws_vdone_ambiguity ambiguity = HWS_VDONE_AMBIG_NONE;
 	enum hws_vdone_record_result result;
@@ -656,6 +669,7 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	u8 sync_attempt = 0;
 	bool cadence_ambiguous = false;
 	bool duplicate_recoverable = false;
+	bool dropped_partial = false;
 	bool report_recovery = false;
 	u8 toggle;
 
@@ -744,25 +758,42 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 						       ambiguity, false, false);
 			report_recovery = true;
 			result = HWS_VDONE_RESYNCED;
-		} else if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE &&
-			   duplicate_recoverable &&
+		} else if (((ambiguity == HWS_VDONE_AMBIG_DUPLICATE &&
+			    duplicate_recoverable) ||
+			   ambiguity == HWS_VDONE_AMBIG_CADENCE) &&
 			   v->half_phase != HWS_VIDEO_PHASE_SYNC &&
 			   v->sync_restart_streak <
 					HWS_VIDEO_SYNC_RESTARTS_MAX) {
 			/*
-			 * The characterized endpoint can assert a clean same-toggle VDONE
-			 * at a normal half-period or lose one boundary and report again after
-			 * two half-periods. Baseline discarded its partial state in either
-			 * case. Preserve that safe behavior without delivering a mixed frame:
-			 * invalidate any partial VB2 buffer and reacquire eight alternating
-			 * boundaries. A repeated duplicate before that run completes remains
-			 * bounded by HWS_VIDEO_SYNC_RESTARTS_MAX.
+			 * The characterized endpoint can assert a clean same-toggle VDONE at
+			 * a normal half-period, lose one boundary and report the same toggle
+			 * after two half-periods, or expose a complementary changed-toggle
+			 * long/short cadence pair. Baseline discarded partial state and kept
+			 * streaming. Preserve that behavior without copying a questionable
+			 * half or delivering a mixed frame: invalidate any partial VB2 buffer
+			 * and reacquire eight alternating boundaries. Repeated disruption
+			 * before that run completes remains bounded by
+			 * HWS_VIDEO_SYNC_RESTARTS_MAX.
 			 */
 			v->sync_restart_streak++;
 			sync_attempt = v->sync_restart_streak;
 			v->sync_restarts++;
-			v->duplicate_recoveries++;
-			recovery_done = v->active;
+			if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE)
+				v->duplicate_recoveries++;
+			else
+				v->cadence_recoveries++;
+			dropped_partial = !!v->active;
+			if (v->active) {
+				/*
+				 * The VB2 buffer is still owned by the driver. Recycle it at
+				 * the head of the queued list instead of completing a
+				 * half-assembled image with V4L2_BUF_FLAG_ERROR. A later
+				 * ordered half pair overwrites both halves before userspace
+				 * can dequeue this buffer.
+				 */
+				list_add(&v->active->list, &v->capture_queue);
+				v->queued_count++;
+			}
 			v->active = NULL;
 			v->frame_generation = 0;
 			v->frame_half0_valid = false;
@@ -774,18 +805,10 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 			WRITE_ONCE(v->last_buf_half_toggle, toggle);
 			WRITE_ONCE(v->half_seen, true);
 			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
-			if (recovery_done) {
-				recovery_done->vb.vb2_buf.timestamp = timestamp_ns;
-				vb2_set_plane_payload(&recovery_done->vb.vb2_buf,
-						      0, 0);
-				recovery_done->vb.field = v->pix.field;
-				recovery_done->vb.sequence =
-					(u32)atomic_read(&v->sequence_number);
-			}
 			hws_vdone_note_recovery_locked(v, generation, interval_us,
 						       toggle, sync_attempt,
-						       ambiguity,
-						       !!recovery_done, true);
+						       ambiguity, dropped_partial,
+						       true);
 			report_recovery = true;
 			result = HWS_VDONE_RECOVERED;
 		} else if (ambiguity != HWS_VDONE_AMBIG_NONE) {
@@ -808,9 +831,6 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		}
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
-	if (recovery_done)
-		vb2_buffer_done(&recovery_done->vb.vb2_buf,
-				VB2_BUF_STATE_ERROR);
 	if (report_recovery)
 		hws_irq_queue_recovery_work(pdx, ch);
 
