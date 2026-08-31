@@ -18,7 +18,6 @@
 #define HWS_VIDEO_COPY_DEADLINE_NS (7500ULL * NSEC_PER_USEC)
 #define HWS_VIDEO_REUSE_MARGIN_NS  (500ULL * NSEC_PER_USEC)
 #define HWS_VIDEO_SYNC_EVENTS 8
-#define HWS_VIDEO_SYNC_RESTARTS_MAX 4
 
 struct hws_vdone_event {
 	u64 timestamp_ns;
@@ -46,6 +45,7 @@ enum hws_vdone_record_result {
 	HWS_VDONE_QUEUED,
 	HWS_VDONE_RESYNCED,
 	HWS_VDONE_RECOVERED,
+	HWS_VDONE_DEFERRED,
 	HWS_VDONE_OVERRUN,
 };
 
@@ -54,7 +54,6 @@ enum hws_vdone_ambiguity {
 	HWS_VDONE_AMBIG_INFLIGHT,
 	HWS_VDONE_AMBIG_DUPLICATE,
 	HWS_VDONE_AMBIG_TIMESTAMP,
-	HWS_VDONE_AMBIG_CADENCE,
 	HWS_VDONE_AMBIG_TOGGLE_UNSTABLE,
 	HWS_VDONE_AMBIG_STATUS_REASSERTED,
 };
@@ -86,47 +85,6 @@ static bool hws_video_deadline_expired(u64 deadline_ns, u64 irq_ns,
 	       now_ns - irq_ns >= deadline_ns;
 }
 
-static bool hws_video_cadence_ambiguous(const struct hws_video *v,
-					u64 previous_ns, u64 current_ns)
-{
-	u64 period_ns = hws_video_phase_period_ns(v);
-	u64 interval_ns;
-
-	if (!period_ns || !previous_ns || current_ns <= previous_ns)
-		return true;
-	interval_ns = current_ns - previous_ns;
-	/* Match the diagnostic's 2/3-to-3/2 cadence acceptance window. */
-	return interval_ns > period_ns + period_ns / 2 ||
-	       interval_ns + interval_ns / 2 < period_ns;
-}
-
-static bool hws_video_duplicate_recoverable(const struct hws_video *v,
-					    u64 previous_ns, u64 current_ns)
-{
-	u64 double_period_ns;
-	u64 interval_ns;
-	u64 period_ns;
-	u64 tolerance_ns;
-
-	period_ns = hws_video_phase_period_ns(v);
-	if (!period_ns || !previous_ns || current_ns <= previous_ns)
-		return false;
-	if (!hws_video_cadence_ambiguous(v, previous_ns, current_ns))
-		return true;
-
-	/*
-	 * A same-toggle report near two phase periods is the observed channel-1
-	 * lost-boundary signature. Ring ownership has returned to the sampled
-	 * half, but the intervening frame cannot be reconstructed. Drop any
-	 * partial destination and synchronize only on future stable identities.
-	 */
-	interval_ns = current_ns - previous_ns;
-	double_period_ns = period_ns * 2;
-	tolerance_ns = period_ns / 4;
-	return interval_ns >= double_period_ns - tolerance_ns &&
-	       interval_ns <= double_period_ns + tolerance_ns;
-}
-
 static const char *
 hws_vdone_ambiguity_name(enum hws_vdone_ambiguity ambiguity)
 {
@@ -137,8 +95,6 @@ hws_vdone_ambiguity_name(enum hws_vdone_ambiguity ambiguity)
 		return "duplicate toggle after W1C coalescing";
 	case HWS_VDONE_AMBIG_TIMESTAMP:
 		return "non-monotonic completion timestamp";
-	case HWS_VDONE_AMBIG_CADENCE:
-		return "completion cadence outside half-period bounds";
 	case HWS_VDONE_AMBIG_TOGGLE_UNSTABLE:
 		return "post-W1C toggle sample was unstable";
 	case HWS_VDONE_AMBIG_STATUS_REASSERTED:
@@ -159,6 +115,57 @@ static void hws_irq_reset_completion_locked(struct hws_video *v)
 	v->completion_generation = 0;
 	v->completion_toggle = 0;
 }
+
+static void hws_irq_clear_overlap_locked(struct hws_video *v)
+{
+	lockdep_assert_held(&v->irq_lock);
+
+	v->overlap_pending = false;
+	v->overlap_toggle = 0;
+	v->overlap_events_pending = 0;
+	v->overlap_timestamp_ns = 0;
+	v->overlap_generation = 0;
+}
+
+static bool hws_irq_recover_phase_locked(struct hws_video *v, u64 generation,
+					 u64 timestamp_ns, u8 toggle)
+{
+	bool dropped_partial = !!v->active;
+
+	lockdep_assert_held(&v->irq_lock);
+	if (v->active) {
+		/*
+		 * The buffer remains driver-owned. Put it first so a later verified
+		 * half pair overwrites both halves before userspace can dequeue it.
+		 */
+		list_add(&v->active->list, &v->capture_queue);
+		v->queued_count++;
+	}
+	v->active = NULL;
+	v->frame_generation = 0;
+	v->frame_half0_valid = false;
+	/* The next changed toggle completes the half named by this toggle. */
+	v->half_phase = toggle ? HWS_VIDEO_PHASE_EXPECT_HALF1 :
+				       HWS_VIDEO_PHASE_EXPECT_HALF0;
+	v->sync_events = 0;
+	v->phase_generation = generation;
+	hws_irq_reset_completion_locked(v);
+	WRITE_ONCE(v->last_buf_half_toggle, toggle);
+	WRITE_ONCE(v->half_seen, true);
+	WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
+	return dropped_partial;
+}
+
+static bool hws_video_copy_error_recoverable(int ret)
+{
+	return ret == -ETIME || ret == -EILSEQ || ret == -EOVERFLOW;
+}
+
+static void
+hws_vdone_note_recovery_locked(struct hws_video *v, u64 generation,
+			       u64 interval_us, u8 toggle, u8 attempt,
+			       enum hws_vdone_ambiguity reason,
+			       bool dropped_partial, bool steady, u32 reports);
 
 static void hws_irq_mark_failure_locked(struct hws_video *v, int ret)
 {
@@ -231,7 +238,7 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	if (live_toggle != event->toggle)
 		return -EOVERFLOW;
 
-	/* Establish steady-state cadence before accepting an assembly half. */
+	/* Establish steady-state phase before accepting an assembly half. */
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
 	    v->completion_generation != event->generation) {
@@ -246,15 +253,11 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		}
 		v->phase_generation = event->generation;
 		v->sync_events++;
-		/* Account verified full-frame boundaries skipped during recovery. */
-		if (v->sync_account_frames && completed_half)
-			completes_frame = true;
 		if (v->sync_events >= HWS_VIDEO_SYNC_EVENTS) {
 			v->half_phase = completed_half ?
 				HWS_VIDEO_PHASE_EXPECT_HALF0 :
 				HWS_VIDEO_PHASE_EXPECT_HALF1;
 			v->sync_restart_streak = 0;
-			v->sync_account_frames = false;
 		}
 		skip_copy = true;
 		buf = NULL;
@@ -383,10 +386,17 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hws_vdone_event event = { };
 	struct hwsvideo_buffer *done = NULL;
 	unsigned long flags;
+	u64 recovery_generation = 0;
+	u64 recovery_timestamp_ns = 0;
+	u64 recovery_interval_us = 0;
+	u32 recovery_reports = 0;
 	u32 frame_sequence = 0;
+	u8 recovery_toggle = 0;
 	bool abort = false;
 	bool fail = false;
 	bool frame_complete = false;
+	bool recovered = false;
+	bool dropped_partial = false;
 	int ret = 0;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -396,6 +406,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		event.generation = v->completion_generation;
 		event.toggle = v->completion_toggle;
 		ret = -EOVERFLOW;
+		hws_irq_clear_overlap_locked(v);
+		hws_irq_reset_completion_locked(v);
 		fail = true;
 	} else {
 		if (v->completion_state != HWS_VIDEO_COMPLETION_PENDING) {
@@ -406,18 +418,42 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		event.deadline_ns = v->completion_deadline_ns;
 		event.generation = v->completion_generation;
 		event.toggle = v->completion_toggle;
-		v->completion_state = HWS_VIDEO_COMPLETION_COPYING;
+		if (v->overlap_pending) {
+			recovery_generation = v->overlap_generation;
+			recovery_timestamp_ns = v->overlap_timestamp_ns;
+			recovery_toggle = v->overlap_toggle;
+			recovery_reports = max_t(u32, v->overlap_events_pending, 1);
+			dropped_partial =
+				hws_irq_recover_phase_locked(v, recovery_generation,
+							     recovery_timestamp_ns,
+							     recovery_toggle);
+			hws_irq_clear_overlap_locked(v);
+			v->overlap_recoveries += recovery_reports;
+			hws_vdone_note_recovery_locked(v, recovery_generation, 0,
+						       recovery_toggle, 0,
+						       HWS_VDONE_AMBIG_INFLIGHT,
+						       dropped_partial, true,
+						       recovery_reports);
+			recovered = true;
+		} else {
+			v->completion_state = HWS_VIDEO_COMPLETION_COPYING;
+		}
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	if (fail)
 		goto fail_queue;
+	if (recovered) {
+		schedule_work(&v->recovery_work);
+		return;
+	}
 	if (READ_ONCE(hws->suspended) || READ_ONCE(v->stop_requested) ||
 	    !READ_ONCE(v->cap_active)) {
 		spin_lock_irqsave(&v->irq_lock, flags);
 		if (v->completion_state == HWS_VIDEO_COMPLETION_COPYING &&
 		    v->completion_generation == event.generation)
 			hws_irq_reset_completion_locked(v);
+		hws_irq_clear_overlap_locked(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		return;
 	}
@@ -427,12 +463,35 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state == HWS_VIDEO_COMPLETION_OVERRUN) {
+		hws_irq_clear_overlap_locked(v);
+		hws_irq_reset_completion_locked(v);
 		fail = true;
 	} else if (READ_ONCE(hws->suspended) ||
 		   READ_ONCE(v->stop_requested) ||
 		   !READ_ONCE(v->cap_active)) {
 		hws_irq_reset_completion_locked(v);
+		hws_irq_clear_overlap_locked(v);
 		abort = true;
+	} else if (v->overlap_pending &&
+		   (!ret || hws_video_copy_error_recoverable(ret))) {
+		recovery_generation = v->overlap_generation;
+		recovery_timestamp_ns = v->overlap_timestamp_ns;
+		recovery_toggle = v->overlap_toggle;
+		recovery_reports = max_t(u32, v->overlap_events_pending, 1);
+		dropped_partial =
+			hws_irq_recover_phase_locked(v, recovery_generation,
+						     recovery_timestamp_ns,
+						     recovery_toggle);
+		hws_irq_clear_overlap_locked(v);
+		v->overlap_recoveries += recovery_reports;
+		hws_vdone_note_recovery_locked(v, recovery_generation, 0,
+					       recovery_toggle, 0,
+					       HWS_VDONE_AMBIG_INFLIGHT,
+					       dropped_partial, true,
+					       recovery_reports);
+		done = NULL;
+		frame_complete = false;
+		recovered = true;
 	} else {
 		if (!ret &&
 		    hws_video_deadline_expired(event.deadline_ns,
@@ -447,7 +506,37 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		    (v->active != done || !v->frame_half0_valid ||
 		     event.generation != v->frame_generation + 1))
 			ret = -EILSEQ;
-		if (ret) {
+		if (hws_video_copy_error_recoverable(ret)) {
+			recovery_timestamp_ns = ktime_get_mono_fast_ns();
+			recovery_generation = event.generation;
+			recovery_toggle = readl(hws->bar0_base +
+						     HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+			if (recovery_timestamp_ns >= event.timestamp_ns)
+				recovery_interval_us =
+					div_u64(recovery_timestamp_ns -
+						event.timestamp_ns,
+					NSEC_PER_USEC);
+			if (ret == -ETIME) {
+				v->deadline_misses++;
+				v->timeout_count++;
+			} else {
+				v->phase_errors++;
+			}
+			dropped_partial =
+				hws_irq_recover_phase_locked(v, recovery_generation,
+							     recovery_timestamp_ns,
+							     recovery_toggle);
+			v->overlap_recoveries++;
+			hws_vdone_note_recovery_locked(v, recovery_generation,
+						       recovery_interval_us,
+						       recovery_toggle, 0,
+						       HWS_VDONE_AMBIG_INFLIGHT,
+						       dropped_partial, true, 1);
+			done = NULL;
+			frame_complete = false;
+			recovered = true;
+		} else if (ret) {
+			hws_irq_clear_overlap_locked(v);
 			hws_irq_mark_failure_locked(v, ret);
 			fail = true;
 		} else if (frame_complete) {
@@ -464,7 +553,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 				done->vb.sequence = frame_sequence;
 			}
 		}
-		if (!fail)
+		if (!fail && !recovered)
 			hws_irq_reset_completion_locked(v);
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -473,6 +562,10 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		return;
 	if (fail)
 		goto fail_queue;
+	if (recovered) {
+		schedule_work(&v->recovery_work);
+		return;
+	}
 
 	if (done) {
 		dev_dbg(&hws->pdev->dev,
@@ -549,32 +642,27 @@ static void hws_video_recovery_work(struct work_struct *work)
 	if (steady) {
 		if (reason == HWS_VDONE_AMBIG_DUPLICATE)
 			dev_warn_ratelimited(&hws->pdev->dev,
-					     "VDONE duplicate recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u attempt=%u/%u reports=%u\n",
+					     "VDONE duplicate recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u streak=%u reports=%u\n",
 					     v->channel_index,
 					     (unsigned long long)generation,
 					     toggle,
 					     (unsigned long long)interval_us,
-					     dropped_partial, attempt,
-					     HWS_VIDEO_SYNC_RESTARTS_MAX,
-					     reports);
+					     dropped_partial, attempt, reports);
 		else
 			dev_warn_ratelimited(&hws->pdev->dev,
-					     "VDONE cadence recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u attempt=%u/%u reports=%u\n",
+					     "VDONE overlap recovered ch=%u generation=%llu toggle=%u elapsed=%lluus dropped_partial=%u reports=%u\n",
 					     v->channel_index,
 					     (unsigned long long)generation,
 					     toggle,
 					     (unsigned long long)interval_us,
-					     dropped_partial, attempt,
-					     HWS_VIDEO_SYNC_RESTARTS_MAX,
-					     reports);
+					     dropped_partial, reports);
 	} else {
 		dev_info_ratelimited(&hws->pdev->dev,
-				     "VDONE phase resync ch=%u generation=%llu toggle=%u interval=%lluus reason=%s attempt=%u/%u reports=%u\n",
+				     "VDONE phase resync ch=%u generation=%llu toggle=%u interval=%lluus reason=%s streak=%u reports=%u\n",
 				     v->channel_index,
 				     (unsigned long long)generation, toggle,
 				     (unsigned long long)interval_us,
-				     hws_vdone_ambiguity_name(reason), attempt,
-				     HWS_VIDEO_SYNC_RESTARTS_MAX, reports);
+				     hws_vdone_ambiguity_name(reason), attempt, reports);
 	}
 }
 
@@ -640,11 +728,11 @@ static void
 hws_vdone_note_recovery_locked(struct hws_video *v, u64 generation,
 			       u64 interval_us, u8 toggle, u8 attempt,
 			       enum hws_vdone_ambiguity reason,
-			       bool dropped_partial, bool steady)
+			       bool dropped_partial, bool steady, u32 reports)
 {
 	lockdep_assert_held(&v->irq_lock);
 
-	v->recovery_reports_pending++;
+	v->recovery_reports_pending += reports;
 	v->recovery_report_generation = generation;
 	v->recovery_report_interval_us = interval_us;
 	v->recovery_report_toggle = toggle;
@@ -667,8 +755,6 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	u64 previous_ns = 0;
 	u64 interval_us = 0;
 	u8 sync_attempt = 0;
-	bool cadence_ambiguous = false;
-	bool duplicate_recoverable = false;
 	bool dropped_partial = false;
 	bool report_recovery = false;
 	u8 toggle;
@@ -690,62 +776,58 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		if (timestamp_ns > previous_ns)
 			interval_us = div_u64(timestamp_ns - previous_ns,
 					      NSEC_PER_USEC);
-		cadence_ambiguous = v->half_seen &&
-			hws_video_cadence_ambiguous(v, previous_ns,
-						    timestamp_ns);
 
-		if (v->completion_state != HWS_VIDEO_COMPLETION_IDLE)
-			ambiguity = HWS_VDONE_AMBIG_INFLIGHT;
-		else if (sample->status_reasserted)
+		/* W1C uncertainty remains fatal even if an older copy is active. */
+		if (sample->status_reasserted)
 			ambiguity = HWS_VDONE_AMBIG_STATUS_REASSERTED;
 		else if (!sample->post_ack_stable)
 			ambiguity = HWS_VDONE_AMBIG_TOGGLE_UNSTABLE;
-		else if (v->half_seen && timestamp_ns <= previous_ns)
+		/*
+		 * ktime_get_mono_fast_ns() may return the same value for two
+		 * back-to-back IRQ entries. Equality preserves event ordering and
+		 * must not turn an otherwise recoverable overlap into a queue error.
+		 * A genuinely backward timestamp remains fail-closed.
+		 */
+		else if (v->half_seen && timestamp_ns < previous_ns)
 			ambiguity = HWS_VDONE_AMBIG_TIMESTAMP;
+		else if (v->completion_state != HWS_VIDEO_COMPLETION_IDLE)
+			ambiguity = HWS_VDONE_AMBIG_INFLIGHT;
 		else if (v->half_seen &&
 			 toggle == v->last_buf_half_toggle)
 			ambiguity = HWS_VDONE_AMBIG_DUPLICATE;
-		else if (cadence_ambiguous)
-			ambiguity = HWS_VDONE_AMBIG_CADENCE;
-		if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE)
-			duplicate_recoverable =
-				hws_video_duplicate_recoverable(v, previous_ns,
-								timestamp_ns);
 
-		v->completion_timestamp_ns = timestamp_ns;
-		v->completion_deadline_ns = hws_video_copy_deadline_ns(v);
-		v->completion_generation = generation;
-		v->completion_toggle = toggle;
-		if (ambiguity == HWS_VDONE_AMBIG_CADENCE &&
-		    v->half_phase == HWS_VIDEO_PHASE_SYNC && !v->active &&
-		    !v->frame_generation && !v->frame_half0_valid) {
+		if (ambiguity == HWS_VDONE_AMBIG_INFLIGHT) {
 			/*
-			 * Recovery can expose a complementary long/short VDONE pair.
-			 * No VB2 data is copied in SYNC, so accept a stable changed-toggle
-			 * identity and let the worker count it toward the required run of
-			 * eight alternating boundaries. Live-toggle, deadline, generation,
-			 * and guard verification remain active for every such event.
+			 * Baseline skipped an interrupt while its copy tasklet was busy.
+			 * Preserve the latest stable identity so the active worker can
+			 * recycle any partial destination after it leaves memcpy(). Never
+			 * mutate that worker's completion slot from hard-IRQ context.
 			 */
 			if (sample->before_ack != sample->after_ack)
 				v->toggle_resamples++;
-			v->completion_state = HWS_VIDEO_COMPLETION_PENDING;
+			v->overlap_pending = true;
+			v->overlap_toggle = toggle;
+			v->overlap_timestamp_ns = timestamp_ns;
+			v->overlap_generation = generation;
+			if (v->overlap_events_pending != U32_MAX)
+				v->overlap_events_pending++;
 			WRITE_ONCE(v->last_buf_half_toggle, toggle);
 			WRITE_ONCE(v->half_seen, true);
 			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
-			result = HWS_VDONE_QUEUED;
+			result = HWS_VDONE_DEFERRED;
 		} else if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE &&
-		    v->half_phase == HWS_VIDEO_PHASE_SYNC && !v->active &&
-		    !v->frame_generation && !v->frame_half0_valid &&
-		    v->sync_restart_streak < HWS_VIDEO_SYNC_RESTARTS_MAX) {
+			   v->half_phase == HWS_VIDEO_PHASE_SYNC && !v->active &&
+			   !v->frame_generation && !v->frame_half0_valid) {
 			/*
 			 * Some rapid enables expose a stale first boundary while the
 			 * native ring settles.  No VB2 memory has been touched in SYNC,
-			 * so discard the acquisition sequence and require a complete new
-			 * run of alternating events.  This escape is deliberately bounded
-			 * and is unavailable once frame assembly begins.
+			 * so discard the acquisition sequence and require a new run of
+			 * alternating events. Repeated clean duplicates can stall delivery,
+			 * but do not make any userspace buffer unsafe and are not fatal.
 			 */
 			v->sync_events = 0;
-			v->sync_restart_streak++;
+			if (v->sync_restart_streak != U8_MAX)
+				v->sync_restart_streak++;
 			sync_attempt = v->sync_restart_streak;
 			v->sync_restarts++;
 			v->phase_generation = 0;
@@ -755,64 +837,41 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
 			hws_vdone_note_recovery_locked(v, generation, interval_us,
 						       toggle, sync_attempt,
-						       ambiguity, false, false);
+						       ambiguity, false, false, 1);
 			report_recovery = true;
 			result = HWS_VDONE_RESYNCED;
-		} else if (((ambiguity == HWS_VDONE_AMBIG_DUPLICATE &&
-			    duplicate_recoverable) ||
-			   ambiguity == HWS_VDONE_AMBIG_CADENCE) &&
-			   v->half_phase != HWS_VIDEO_PHASE_SYNC &&
-			   v->sync_restart_streak <
-					HWS_VIDEO_SYNC_RESTARTS_MAX) {
+		} else if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE) {
 			/*
-			 * The characterized endpoint can assert a clean same-toggle VDONE at
-			 * a normal half-period, lose one boundary and report the same toggle
-			 * after two half-periods, or expose a complementary changed-toggle
-			 * long/short cadence pair. Baseline discarded partial state and kept
-			 * streaming. Preserve that behavior without copying a questionable
-			 * half or delivering a mixed frame: invalidate any partial VB2 buffer
-			 * and reacquire eight alternating boundaries. Repeated disruption
-			 * before that run completes remains bounded by
-			 * HWS_VIDEO_SYNC_RESTARTS_MAX.
+			 * A stable same-toggle report contains no new half identity. Baseline
+			 * discarded its partial state and waited for a changed toggle. Recycle
+			 * the driver-owned destination and do the same; an orphan half 1 is
+			 * discarded by the normal phase machine. Repeated clean duplicates
+			 * remain nonfatal because no questionable data reaches userspace.
 			 */
-			v->sync_restart_streak++;
+			if (v->sync_restart_streak != U8_MAX)
+				v->sync_restart_streak++;
 			sync_attempt = v->sync_restart_streak;
 			v->sync_restarts++;
-			if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE)
-				v->duplicate_recoveries++;
-			else
-				v->cadence_recoveries++;
-			dropped_partial = !!v->active;
-			if (v->active) {
-				/*
-				 * The VB2 buffer is still owned by the driver. Recycle it at
-				 * the head of the queued list instead of completing a
-				 * half-assembled image with V4L2_BUF_FLAG_ERROR. A later
-				 * ordered half pair overwrites both halves before userspace
-				 * can dequeue this buffer.
-				 */
-				list_add(&v->active->list, &v->capture_queue);
-				v->queued_count++;
-			}
-			v->active = NULL;
-			v->frame_generation = 0;
-			v->frame_half0_valid = false;
-			v->half_phase = HWS_VIDEO_PHASE_SYNC;
-			v->sync_events = 0;
-			v->sync_account_frames = true;
-			v->phase_generation = generation;
-			hws_irq_reset_completion_locked(v);
-			WRITE_ONCE(v->last_buf_half_toggle, toggle);
-			WRITE_ONCE(v->half_seen, true);
-			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
+			v->duplicate_recoveries++;
+			dropped_partial =
+				hws_irq_recover_phase_locked(v, generation,
+							     timestamp_ns, toggle);
 			hws_vdone_note_recovery_locked(v, generation, interval_us,
 						       toggle, sync_attempt,
 						       ambiguity, dropped_partial,
-						       true);
+						       true, 1);
 			report_recovery = true;
 			result = HWS_VDONE_RECOVERED;
 		} else if (ambiguity != HWS_VDONE_AMBIG_NONE) {
+			if (v->completion_state == HWS_VIDEO_COMPLETION_IDLE) {
+				v->completion_timestamp_ns = timestamp_ns;
+				v->completion_deadline_ns =
+					hws_video_copy_deadline_ns(v);
+				v->completion_generation = generation;
+				v->completion_toggle = toggle;
+			}
 			hws_irq_mark_failure_locked(v, -EOVERFLOW);
+			hws_irq_clear_overlap_locked(v);
 			v->w1c_ambiguities++;
 			if (ambiguity == HWS_VDONE_AMBIG_TOGGLE_UNSTABLE ||
 			    ambiguity == HWS_VDONE_AMBIG_STATUS_REASSERTED)
@@ -823,6 +882,12 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		} else {
 			if (sample->before_ack != sample->after_ack)
 				v->toggle_resamples++;
+			if (v->half_phase != HWS_VIDEO_PHASE_SYNC)
+				v->sync_restart_streak = 0;
+			v->completion_timestamp_ns = timestamp_ns;
+			v->completion_deadline_ns = hws_video_copy_deadline_ns(v);
+			v->completion_generation = generation;
+			v->completion_toggle = toggle;
 			v->completion_state = HWS_VIDEO_COMPLETION_PENDING;
 			WRITE_ONCE(v->last_buf_half_toggle, toggle);
 			WRITE_ONCE(v->half_seen, true);

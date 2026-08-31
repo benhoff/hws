@@ -15,7 +15,7 @@ usage() {
 Usage: $(basename "$0") --run [--device DEV] [--seconds N]
 
 Reload the exact in-tree HwsCapture module and require uninterrupted capture
-through at least one recoverable duplicate or changed-cadence VDONE event.
+through at least one recoverable duplicate or copy-overlap VDONE event.
 
 The soak reports elapsed time, IRQ progress, and the number of recovered
 VDONE phase events every five seconds. A quiet capture is therefore visibly
@@ -140,7 +140,7 @@ read_irq_total() {
 count_recoveries() {
 	sudo -n journalctl -k -b --since "@$started_epoch" --no-pager \
 		2>/dev/null |
-		awk '/VDONE (duplicate|cadence) recovered/ { count++ }
+		awk '/VDONE (duplicate|overlap) recovered/ { count++ }
 			END { print count + 0 }'
 }
 
@@ -192,7 +192,7 @@ if ! sudo -n journalctl -k -b --since "@$started_epoch" --no-pager \
 fi
 grep -E \
 	-e 'VDONE duplicate recovered' \
-	-e 'VDONE cadence recovered' \
+	-e 'VDONE overlap recovered' \
 	-e 'VDONE phase resync' \
 	-e 'VDONE ambiguity' \
 	-e 'VDONE half-ring failure' \
@@ -221,7 +221,7 @@ if ((elapsed < minimum_elapsed)); then
 	exit 1
 fi
 
-if grep -Eq 'VDONE (duplicate|cadence) recovered' "$recovery_log"; then
+if grep -Eq 'VDONE (duplicate|overlap) recovered' "$recovery_log"; then
 	echo "RESULT: PASS (VDONE phase disturbance recovered and capture continued)"
 	exit 0
 fi

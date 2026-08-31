@@ -406,17 +406,69 @@ full-period recovery was added. Each failure was a stable changed-toggle VDONE
 outside the steady-state half-period window, usually at approximately 15.2
 through 15.9 ms; rapid restart could instead encounter the complementary
 approximately 1 ms boundary. The loaded module exactly matched the in-tree
-module and used MSI. The working tree now treats that steady-state cadence
-ambiguity like the baseline's discard-and-continue path without copying the
-questionable half: it recycles any partial VB2 buffer internally without
-completing it to userspace, leaves VCAP running, and enters the existing
-eight-boundary copy-disabled synchronization phase. This is important for
-DMABUF consumers because an error-completed partial buffer can otherwise be
-displayed if userspace ignores `V4L2_BUF_FLAG_ERROR`. Unstable or reasserted
-status, in-flight completion, copy-deadline and guard failures remain
-fail-closed. The focused recovery test now recognizes both
-`VDONE duplicate recovered` and `VDONE cadence recovered`; hardware validation
-of the new cadence path remains pending.
+module and used MSI. The first working-tree iteration treated that steady-state
+cadence ambiguity like the baseline's discard-and-continue path without copying
+the questionable half: it recycled any partial VB2 buffer internally without
+completing it to userspace, left VCAP running, and entered the existing
+eight-boundary copy-disabled synchronization phase. This was important for
+DMABUF consumers because an error-completed partial buffer could otherwise be
+displayed if userspace ignored `V4L2_BUF_FLAG_ERROR`, but hardware testing of
+the exact module exposed 197 duplicate recoveries, 80 cadence recoveries, and
+141 additional synchronization restarts in roughly four minutes. Suppressing
+eight boundaries per disturbance was itself a visible freeze/jump regression.
+
+The revised path now mirrors baseline's short recovery while retaining v20's
+safety gates. It recycles any partial destination, ignores the questionable
+identity, derives the expected next completed half from the stable current
+toggle, and resumes on the next changed toggle. An orphan half 1 is discarded;
+only a new half 0 can begin an assembled frame. One complementary out-of-window
+cadence event is allowed after the reset, but it must still pass live-toggle,
+deadline, generation, and guard verification in the copy worker. Consecutive
+same-toggle disturbances remain bounded. Unstable or reasserted status,
+in-flight completion, copy-deadline and guard failures remain fail-closed. The
+focused recovery test recognizes both `VDONE duplicate recovered` and
+`VDONE cadence recovered`; hardware validation of this shorter recovery is
+pending.
+
+**Short-recovery hardware result and overlap follow-up:** the exact shorter-
+recovery module (`srcversion` `C0AB9183FC0E68579DBF739`) removed the old
+eight-boundary resynchronization storm and the visible result improved, but it
+was not healthy. In approximately six minutes it reported 456 duplicate
+recoveries, 530 cadence recoveries, and 20 primary ambiguities: 16 arrived while
+an older completion was pending or copying and four exhausted the consecutive-
+duplicate bound. Those incidents generated 35 queue-failure log entries and
+userspace still observed at least one glitch. There were no phase-resync, DMA-
+guard, deadline-counter, or source-change reports. Bursts of stable alternating
+toggles at approximately 3.3 through 3.7 ms demonstrated that elapsed cadence
+alone was rejecting usable hardware identities.
+
+The next working-tree iteration completes the relevant baseline behavior while
+retaining buffer-ownership safety. A stable changed toggle is accepted without
+an elapsed-cadence gate. A stable duplicate recycles any partial driver-owned
+destination and waits for the next changed identity without a fatal repeat
+limit. If another clean VDONE arrives while the per-channel worker is pending or
+copying, the hard handler records only the latest stable identity and does not
+overwrite the active completion slot. After leaving `memcpy()`, the worker
+recycles the affected destination and resets phase from that identity. Deadline,
+generation, or live-toggle copy loss follows the same internal discard path;
+no partial buffer is completed to userspace. Unstable post-W1C samples,
+reasserted status, non-monotonic timestamps, invalid destination/ring mappings,
+and DMA-guard corruption remain fatal. The focused soak now recognizes both
+`VDONE duplicate recovered` and `VDONE overlap recovered`; exact-module hardware
+validation is pending.
+
+**Overlap hardware result and equal-timestamp follow-up:** the exact overlap-
+recovery module (`srcversion` `1230EADE7616C2C17DCE86F`) was exercised from
+10:52:15 through 10:58:01 on August 31. It internally handled 526 duplicate
+events, 97 copy overlaps, and one startup phase resynchronization with no
+cadence or DMA-guard failures. One channel-1 event still failed the queue at
+10:56:24: it followed a recovered overlap but had the same fast monotonic-clock
+value as the previous event, so the strict `timestamp <= previous` test reported
+`interval=0us` as a non-monotonic completion. The stream restarted and no
+further fatal event appeared during that observation window. Equal fast-clock
+samples do not reverse event order and now continue into the existing
+duplicate/overlap classifier; only `timestamp < previous` remains a fatal clock
+regression.
 
 ## Validation matrix
 
@@ -443,7 +495,7 @@ of the new cadence path remains pending.
 | v20 packed YUYV layout | Hardware compliance pass for native channel-3 mode | Commit `fe6aabc` normalizes every request to configured native progressive geometry with exact packed stride and size. `v4l2-compliance` passed 49/49 and streamed native 1920x1080 YUYV; the unrelated power-present control warning was fixed afterward and needs a rerun |
 | v19 submission readiness | Blocked | Production video DMA architecture must change and be revalidated |
 | v20 latest full E2E regression | Failed, 29 passed / 3 failed | The current source passed load/order verification, normal and stressed capture, format/DV checks, rapid STREAMON/OFF, both independent stop directions, arena reclamation, and recovery. Concurrent capture then encountered an unforced VDONE duplicate-toggle at an 8,682 us interval; forced INTx encountered another at 8,613 us before deliberate gating, so fault injection could not start |
-| v20 submission readiness | Blocked pending recovery proof and scope cleanup | Of the six original blockers, device scope remains unresolved in code. EOF timestamp/sequence semantics, audio bounds, progressive-only interlaced policy, DV-timings semantics, native packed format, and independent stop behavior have targeted proof for the characterized 8888:8504/channel-3 scope. The working tree now recovers the characterized stable, normal-cadence duplicate VDONE per channel, but that path still needs the focused soak and full regression proof above. Production telemetry, focused lifecycle testing, and cross-device validation also remain |
+| v20 submission readiness | Blocked pending recovery proof and scope cleanup | Of the six original blockers, device scope remains unresolved in code. EOF timestamp/sequence semantics, audio bounds, progressive-only interlaced policy, DV-timings semantics, native packed format, and independent stop behavior have targeted proof for the characterized 8888:8504/channel-3 scope. The working tree now accepts stable changed identities independent of elapsed cadence and internally discards stable duplicate/copy-overlap partial frames, but that path still needs the focused soak and full regression proof above. Production telemetry, focused lifecycle testing, and cross-device validation also remain |
 
 ## 2026-08-29 v20 code-value submission assessment
 
