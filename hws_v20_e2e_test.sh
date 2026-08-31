@@ -89,7 +89,8 @@ Options:
   --enable-audio           Load the test module with enable_audio=Y
   --disable-audio          Load the test module with enable_audio=N
                            Default: preserve the currently loaded setting
-  --skip-audio             Do not exercise embedded audio PCMs
+  --skip-audio             Do not exercise embedded audio PCMs; when reloading,
+                           default to enable_audio=N unless --enable-audio is set
   --skip-cpu-stress        Do not run the CPU-contention phase
   --skip-module-reload     Test the already-loaded module; require srcversion match
   --allow-stale-module     Permit a module older than a driver source/header file
@@ -480,6 +481,21 @@ wait_for_nodes() {
 	return 1
 }
 
+report_module_load_failure() {
+	local delta evidence
+
+	delta=$(phase_log_delta module-load-failure)
+	evidence="$OUTPUT_DIR/module-load-errors.log"
+	grep -F -e "$MODULE_NAME" -e "$BDF" "$delta" >"$evidence" || true
+	if [[ -s "$evidence" ]]; then
+		log "Recent kernel messages for the failed probe (also in $evidence):"
+		tail -n 40 "$evidence" >&2
+	else
+		log "No matching kernel probe messages were captured; inspect $delta"
+		rm -f -- "$evidence"
+	fi
+}
+
 verify_loaded_module() {
 	local expected loaded
 
@@ -551,7 +567,10 @@ load_test_module() {
 		"force_intx=$force_intx"
 	CURRENT_FORCE_INTX=$force_intx
 	udevadm settle --timeout=10 || true
-	wait_for_nodes || die "no HWS video nodes appeared for $BDF after module load"
+	if ! wait_for_nodes; then
+		report_module_load_failure
+		die "no HWS video nodes appeared for $BDF after module load"
+	fi
 	verify_loaded_module
 	verify_irq_mode "$force_intx"
 	verify_pcie_requester_ordering
@@ -684,7 +703,7 @@ phase_log_delta() {
 kernel_delta_is_clean() {
 	local delta=$1
 	local universal='BUG:|WARNING:|Oops:|KASAN:|KFENCE:|general protection fault|kernel panic|use-after-free'
-	local hws_fatal='VDONE ambiguity|VDONE half-ring failure|video queue failed|DMA guard corruption|audio DMA guard corruption|ADONE ambiguity|retained DMA-owned|failed to restart guarded ring|threaded IRQ processing many VDONE events|audio ch[0-9]+ packet overrun|audio start refused|shared-window conflict'
+	local hws_fatal='VDONE ambiguity|VDONE half-ring failure|video queue failed|DMA guard corruption|audio DMA guard corruption|ADONE ambiguity|retained DMA-owned|retaining scratch arenas|failed to restart guarded ring|threaded IRQ processing many VDONE events|audio ch[0-9]+ packet overrun|audio start refused|shared-window conflict|interrupt causes remained pending|core IRQ causes remained pending|audio IRQ causes remained pending|failed to close the device IRQ gate|could not verify the device IRQ gate|cannot verify PCI bus-master disable|PCI bus-master bit remained set|PCI transaction-pending bit remained set|failed to quarantine PCI DMA'
 
 	if grep -EinE "$universal" "$delta" >"$delta.failures"; then
 		return 1
@@ -1725,6 +1744,10 @@ main() {
 	TEST_AUDIO_PARAMETER=$ORIGINAL_AUDIO_PARAMETER
 	if [[ "$AUDIO_PARAMETER_OVERRIDE" != auto ]]; then
 		TEST_AUDIO_PARAMETER=$AUDIO_PARAMETER_OVERRIDE
+	elif ((SKIP_AUDIO && !SKIP_MODULE_RELOAD)); then
+		# Avoid exposing unused ALSA nodes that a session manager can race open
+		# between the initial load and the recovery reload.
+		TEST_AUDIO_PARAMETER=N
 	fi
 	if [[ -n "$AUDIO_SOURCE_PCM" && "$TEST_AUDIO_PARAMETER" == N ]]; then
 		die "--audio-source-pcm requires audio capture; add --enable-audio"

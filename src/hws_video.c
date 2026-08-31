@@ -682,16 +682,33 @@ err_unlock_channel:
 
 static int hws_ack_all_irqs(struct hws_pcie_dev *hws)
 {
-	u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	u32 mask = 0;
+	u32 pending = 0;
+	unsigned int attempt;
+	unsigned int ch;
 
-	if (st == U32_MAX)
-		return -ENODEV;
-	if (st) {
-		writel(st, hws->bar0_base + HWS_REG_INT_STATUS);	/* W1C */
-		if (readl(hws->bar0_base + HWS_REG_INT_STATUS) == U32_MAX)
+	for (ch = 0; ch < hws->cur_max_video_ch; ch++)
+		mask |= HWS_INT_VDONE_BIT(ch);
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++)
+		mask |= HWS_INT_ADONE_BIT(ch);
+
+	for (attempt = 0; attempt <= HWS_IRQ_CLEAR_RETRIES; attempt++) {
+		u32 st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+
+		if (st == U32_MAX)
 			return -ENODEV;
+		pending = st & mask;
+		if (!pending)
+			return 0;
+		if (attempt == HWS_IRQ_CLEAR_RETRIES)
+			break;
+		writel(pending, hws->bar0_base + HWS_REG_INT_STATUS);	/* W1C */
 	}
-	return 0;
+
+	dev_err(&hws->pdev->dev,
+		"core IRQ causes remained pending after %u clears: 0x%08x\n",
+		HWS_IRQ_CLEAR_RETRIES, pending);
+	return -EBUSY;
 }
 
 static int hws_configure_irq_fabric(struct hws_pcie_dev *hws)

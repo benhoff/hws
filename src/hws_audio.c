@@ -1501,22 +1501,33 @@ static void hws_audio_disable_capture_and_ack(struct hws_pcie_dev *hws,
 static inline int hws_audio_ack_all(struct hws_pcie_dev *hws)
 {
 	u32 mask = 0;
-	u32 readback;
+	u32 pending = 0;
+	unsigned int attempt;
 
 	if (!hws || !hws->bar0_base)
 		return -ENODEV;
 
 	for (unsigned int ch = 0; ch < hws->cur_max_audio_ch; ch++)
 		mask |= HWS_INT_ADONE_BIT(ch);
-	if (mask) {
-		writel(mask, hws->bar0_base + HWS_REG_INT_ACK);
-		readback = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-		if (readback == U32_MAX) {
+	for (attempt = 0; attempt <= HWS_IRQ_CLEAR_RETRIES; attempt++) {
+		u32 status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+
+		if (status == U32_MAX) {
 			WRITE_ONCE(hws->pci_lost, true);
 			return -ENODEV;
 		}
+		pending = status & mask;
+		if (!pending)
+			return 0;
+		if (attempt == HWS_IRQ_CLEAR_RETRIES)
+			break;
+		writel(pending, hws->bar0_base + HWS_REG_INT_ACK);
 	}
-	return 0;
+
+	dev_err(&hws->pdev->dev,
+		"audio IRQ causes remained pending after %u clears: 0x%08x\n",
+		HWS_IRQ_CLEAR_RETRIES, pending);
+	return -EBUSY;
 }
 
 static void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)

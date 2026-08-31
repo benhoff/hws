@@ -82,6 +82,9 @@ static inline u32 hws_video_native_split(u32 frame_size)
 /* Hardware characterization shows a write tail beyond packed sizeimage. */
 #define HWS_VIDEO_DMA_TAIL_BYTES SZ_2K
 
+/* Lifecycle paths drain W1C causes while every producer is disabled. */
+#define HWS_IRQ_CLEAR_RETRIES 8U
+
 static inline bool hws_yuyv_layout_valid(const struct hws_pix_state *pix)
 {
 	u64 stride, size;
