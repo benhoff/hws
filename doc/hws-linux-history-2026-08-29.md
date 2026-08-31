@@ -367,6 +367,32 @@ capture, kernel-log classification, and exact-module check without relying on
 `v4l2-ctl`'s exit status (version 1.32.0 returned zero after printing a DQBUF
 `EIO`).
 
+**Channel-1 full-period follow-up:** after loading the fail-closed module on
+2026-08-30, desktop channel-1 capture produced 96 queue failures. Every failure
+was a stable same-toggle VDONE at 16,567 through 16,733 us, almost exactly two
+60 Hz half periods; no deadline or guard failure was reported. Comparison with
+`upstream/baseline` found that baseline reread and acknowledged the shared
+sticky `INT_STATUS` register until empty, while commit `3ced02f` replaced that
+loop with a single snapshot when queued completion identities were introduced.
+A bounded drain-until-empty experiment built cleanly, but the exact loaded
+module (`8EFE134CAA90A958E59EB74`) continued producing the identical channel-1
+signature at the same rate. No drain-limit warning or new in-flight ambiguity
+appeared. The experiment was therefore reverted: the endpoint is losing or
+coalescing a channel-1 half-boundary independently of that handler difference.
+
+Baseline survives this condition by clearing its partial-half state, ignoring
+the same-toggle report, discarding the following orphan half where necessary,
+and continuing. The next working-tree recovery iteration retains v20's safer
+variant: a same-toggle report at either one normal phase period or tightly near
+two phase periods discards any partial VB2 buffer and enters copy-disabled
+synchronization. Stable changed-toggle events with complementary long/short
+cadence are accepted only in that synchronization phase and must pass live
+toggle, generation, deadline, and guard checks. Eight alternating identities
+are still required before copying resumes, while repeated duplicate identities
+remain bounded. This specifically fixes the resynchronization storm seen when
+the first two-period recovery experiment treated every complementary cadence
+event as a fresh restart. Hardware validation is pending.
+
 The module builds against Arch kernel `7.1.9-arch1-2`, `git diff --check` is
 clean, and Linux `checkpatch.pl` reports zero errors and zero warnings for the
 change. The deadline, W1C ambiguity, phase, generation, and fail-closed step is

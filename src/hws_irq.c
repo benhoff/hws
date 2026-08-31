@@ -100,6 +100,33 @@ static bool hws_video_cadence_ambiguous(const struct hws_video *v,
 	       interval_ns + interval_ns / 2 < period_ns;
 }
 
+static bool hws_video_duplicate_recoverable(const struct hws_video *v,
+					    u64 previous_ns, u64 current_ns)
+{
+	u64 double_period_ns;
+	u64 interval_ns;
+	u64 period_ns;
+	u64 tolerance_ns;
+
+	period_ns = hws_video_phase_period_ns(v);
+	if (!period_ns || !previous_ns || current_ns <= previous_ns)
+		return false;
+	if (!hws_video_cadence_ambiguous(v, previous_ns, current_ns))
+		return true;
+
+	/*
+	 * A same-toggle report near two phase periods is the observed channel-1
+	 * lost-boundary signature. Ring ownership has returned to the sampled
+	 * half, but the intervening frame cannot be reconstructed. Drop any
+	 * partial destination and synchronize only on future stable identities.
+	 */
+	interval_ns = current_ns - previous_ns;
+	double_period_ns = period_ns * 2;
+	tolerance_ns = period_ns / 4;
+	return interval_ns >= double_period_ns - tolerance_ns &&
+	       interval_ns <= double_period_ns + tolerance_ns;
+}
+
 static const char *
 hws_vdone_ambiguity_name(enum hws_vdone_ambiguity ambiguity)
 {
@@ -628,6 +655,7 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	u64 interval_us = 0;
 	u8 sync_attempt = 0;
 	bool cadence_ambiguous = false;
+	bool duplicate_recoverable = false;
 	bool report_recovery = false;
 	u8 toggle;
 
@@ -665,13 +693,33 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 			ambiguity = HWS_VDONE_AMBIG_DUPLICATE;
 		else if (cadence_ambiguous)
 			ambiguity = HWS_VDONE_AMBIG_CADENCE;
+		if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE)
+			duplicate_recoverable =
+				hws_video_duplicate_recoverable(v, previous_ns,
+								timestamp_ns);
 
 		v->completion_timestamp_ns = timestamp_ns;
 		v->completion_deadline_ns = hws_video_copy_deadline_ns(v);
 		v->completion_generation = generation;
 		v->completion_toggle = toggle;
-		if ((ambiguity == HWS_VDONE_AMBIG_DUPLICATE ||
-		     ambiguity == HWS_VDONE_AMBIG_CADENCE) &&
+		if (ambiguity == HWS_VDONE_AMBIG_CADENCE &&
+		    v->half_phase == HWS_VIDEO_PHASE_SYNC && !v->active &&
+		    !v->frame_generation && !v->frame_half0_valid) {
+			/*
+			 * Recovery can expose a complementary long/short VDONE pair.
+			 * No VB2 data is copied in SYNC, so accept a stable changed-toggle
+			 * identity and let the worker count it toward the required run of
+			 * eight alternating boundaries. Live-toggle, deadline, generation,
+			 * and guard verification remain active for every such event.
+			 */
+			if (sample->before_ack != sample->after_ack)
+				v->toggle_resamples++;
+			v->completion_state = HWS_VIDEO_COMPLETION_PENDING;
+			WRITE_ONCE(v->last_buf_half_toggle, toggle);
+			WRITE_ONCE(v->half_seen, true);
+			WRITE_ONCE(v->last_vdone_timestamp_ns, timestamp_ns);
+			result = HWS_VDONE_QUEUED;
+		} else if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE &&
 		    v->half_phase == HWS_VIDEO_PHASE_SYNC && !v->active &&
 		    !v->frame_generation && !v->frame_half0_valid &&
 		    v->sync_restart_streak < HWS_VIDEO_SYNC_RESTARTS_MAX) {
@@ -697,18 +745,18 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 			report_recovery = true;
 			result = HWS_VDONE_RESYNCED;
 		} else if (ambiguity == HWS_VDONE_AMBIG_DUPLICATE &&
-			   !cadence_ambiguous &&
+			   duplicate_recoverable &&
 			   v->half_phase != HWS_VIDEO_PHASE_SYNC &&
 			   v->sync_restart_streak <
 					HWS_VIDEO_SYNC_RESTARTS_MAX) {
 			/*
-			 * The characterized endpoint can assert a clean VDONE at a normal
-			 * half-period without changing ring ownership.  Baseline ignored
-			 * that edge and reset its partial-frame state.  Preserve that safe
-			 * behavior without silently delivering a mixed frame: invalidate
-			 * any partial VB2 buffer and reacquire eight
-			 * alternating boundaries.  A repeated disturbance before that run
-			 * completes remains bounded by HWS_VIDEO_SYNC_RESTARTS_MAX.
+			 * The characterized endpoint can assert a clean same-toggle VDONE
+			 * at a normal half-period or lose one boundary and report again after
+			 * two half-periods. Baseline discarded its partial state in either
+			 * case. Preserve that safe behavior without delivering a mixed frame:
+			 * invalidate any partial VB2 buffer and reacquire eight alternating
+			 * boundaries. A repeated duplicate before that run completes remains
+			 * bounded by HWS_VIDEO_SYNC_RESTARTS_MAX.
 			 */
 			v->sync_restart_streak++;
 			sync_attempt = v->sync_restart_streak;
