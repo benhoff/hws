@@ -248,6 +248,11 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->half_phase = HWS_VIDEO_PHASE_SYNC;
 	vid->sync_events = 0;
 	vid->sync_restart_streak = 0;
+	vid->overlap_pending = false;
+	vid->overlap_toggle = 0;
+	vid->overlap_events_pending = 0;
+	vid->overlap_timestamp_ns = 0;
+	vid->overlap_generation = 0;
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
@@ -260,6 +265,8 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->toggle_resamples = 0;
 	vid->toggle_sample_errors = 0;
 	vid->sync_restarts = 0;
+	vid->duplicate_recoveries = 0;
+	vid->overlap_recoveries = 0;
 	vid->phase_errors = 0;
 	vid->deadline_misses = 0;
 	vid->guard_errors = 0;
@@ -321,8 +328,11 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 void hws_video_drain_channel_work(struct hws_video *vid)
 {
-	if (vid)
-		flush_work(&vid->vdone_work);
+	if (!vid)
+		return;
+
+	flush_work(&vid->vdone_work);
+	flush_work(&vid->recovery_work);
 }
 
 void hws_video_drain_work(struct hws_pcie_dev *hws)
@@ -356,6 +366,11 @@ static void hws_video_reset_stream_phase_locked(struct hws_video *vid)
 	vid->half_phase = HWS_VIDEO_PHASE_SYNC;
 	vid->sync_events = 0;
 	vid->sync_restart_streak = 0;
+	vid->overlap_pending = false;
+	vid->overlap_toggle = 0;
+	vid->overlap_events_pending = 0;
+	vid->overlap_timestamp_ns = 0;
+	vid->overlap_generation = 0;
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
 	vid->frame_half0_valid = false;
@@ -1418,6 +1433,8 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	unsigned int seq = 0;
 	unsigned int ambiguity_count;
 	unsigned int sync_restart_count;
+	unsigned int duplicate_recovery_count;
+	unsigned int overlap_recovery_count;
 	unsigned int deadline_count;
 	unsigned int phase_error_count;
 	enum hws_video_half_phase half_phase;
@@ -1440,16 +1457,19 @@ static void hws_log_video_state(struct hws_video *v, const char *action,
 	phase_generation = v->phase_generation;
 	ambiguity_count = v->w1c_ambiguities;
 	sync_restart_count = v->sync_restarts;
+	duplicate_recovery_count = v->duplicate_recoveries;
+	overlap_recovery_count = v->overlap_recoveries;
 	phase_error_count = v->phase_errors;
 	deadline_count = v->deadline_misses;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 
 	dev_dbg(&hws->pdev->dev,
-		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u phase=%u generation=%llu ambiguity=%u sync_restarts=%u phase_errors=%u deadlines=%u\n",
+		"video:%s:%s ch=%u streaming=%d cap=%d stop=%d assembly=%p queued=%u tracked=%u seq=%u phase=%u generation=%llu ambiguity=%u sync_restarts=%u duplicate_recoveries=%u overlap_recoveries=%u phase_errors=%u deadlines=%u\n",
 		action, phase, v->channel_index, streaming, cap_active,
 		stop_requested, active, queued, tracked, seq, half_phase,
 		(unsigned long long)phase_generation, ambiguity_count,
-		sync_restart_count, phase_error_count, deadline_count);
+		sync_restart_count, duplicate_recovery_count,
+		overlap_recovery_count, phase_error_count, deadline_count);
 }
 
 static void hws_stop_streaming(struct vb2_queue *q)

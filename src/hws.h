@@ -139,6 +139,7 @@ struct hws_video {
 	bool queue_initialized;
 	struct list_head capture_queue;
 	struct work_struct vdone_work;
+	struct work_struct recovery_work;
 	/* VB2 buffer receiving the current ordered half pair. */
 	struct hwsvideo_buffer *active;
 	u64 completion_timestamp_ns;
@@ -150,6 +151,11 @@ struct hws_video {
 	enum hws_video_half_phase half_phase;
 	u8 sync_events;
 	u8 sync_restart_streak;
+	bool overlap_pending;
+	u8 overlap_toggle;
+	u32 overlap_events_pending;
+	u64 overlap_timestamp_ns;
+	u64 overlap_generation;
 	u64 phase_generation;
 	u64 frame_generation;
 	bool frame_half0_valid;
@@ -206,6 +212,16 @@ struct hws_video {
 	u32 toggle_resamples;
 	u32 toggle_sample_errors;
 	u32 sync_restarts;
+	u32 duplicate_recoveries;
+	u32 overlap_recoveries;
+	u32 recovery_reports_pending;
+	u64 recovery_report_generation;
+	u64 recovery_report_interval_us;
+	u8 recovery_report_toggle;
+	u8 recovery_report_attempt;
+	u8 recovery_report_reason;
+	bool recovery_report_dropped_partial;
+	bool recovery_report_steady;
 	u32 phase_errors;
 	u32 deadline_misses;
 	u32 guard_errors;
