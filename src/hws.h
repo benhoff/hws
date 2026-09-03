@@ -47,6 +47,11 @@ struct hws_pix_state {
 	u32 half_size;		/* hardware half-frame size */
 };
 
+static inline u32 hws_video_native_split(u32 frame_size)
+{
+	return round_down(frame_size / 2, (u32)SZ_2K);
+}
+
 #define	UNSET	(-1U)
 
 struct hws_pcie_dev;
@@ -65,6 +70,12 @@ enum hws_video_completion_state {
 	HWS_VIDEO_COMPLETION_OVERRUN,
 };
 
+enum hws_video_half_phase {
+	HWS_VIDEO_PHASE_SYNC,
+	HWS_VIDEO_PHASE_EXPECT_HALF0,
+	HWS_VIDEO_PHASE_EXPECT_HALF1,
+};
+
 struct hws_video {
 	/* Linkage */
 	struct hws_pcie_dev *parent;
@@ -76,10 +87,15 @@ struct hws_video {
 	/* VB2 buffer receiving the current ordered half pair. */
 	struct hwsvideo_buffer *active;
 	u64 completion_timestamp_ns;
+	u64 completion_deadline_ns;
 	u64 completion_generation;
 	u64 next_completion_generation;
 	enum hws_video_completion_state completion_state;
 	u8 completion_toggle;
+	enum hws_video_half_phase half_phase;
+	u8 sync_events;
+	u64 phase_generation;
+	u64 frame_generation;
 	bool frame_half0_valid;
 	u64 frame_timestamp_ns;
 	size_t ring_extent;
@@ -113,8 +129,11 @@ struct hws_video {
 	/* Per-channel capture state */
 	bool cap_active;
 	bool stop_requested;
+	bool dma_needs_idle;
+	bool ring_corrupt;
 	u8 last_buf_half_toggle;
 	bool half_seen;
+	u64 last_vdone_timestamp_ns;
 	atomic_t sequence_number;
 	u32 queued_count;
 
@@ -122,6 +141,11 @@ struct hws_video {
 	u32 timeout_count;
 	u32 error_count;
 	u32 completion_overruns;
+	u32 w1c_ambiguities;
+	u32 phase_errors;
+	u32 deadline_misses;
+	u32 copy_mismatches;
+	u32 guard_errors;
 
 	bool window_valid;
 	u32 last_dma_hi;
