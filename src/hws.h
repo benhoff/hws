@@ -50,7 +50,13 @@ struct hws_video;
 struct hwsvideo_buffer {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
-	int slot;
+};
+
+enum hws_video_completion_state {
+	HWS_VIDEO_COMPLETION_IDLE,
+	HWS_VIDEO_COMPLETION_PENDING,
+	HWS_VIDEO_COMPLETION_COPYING,
+	HWS_VIDEO_COMPLETION_OVERRUN,
 };
 
 struct hws_video {
@@ -60,8 +66,17 @@ struct hws_video {
 
 	struct vb2_queue buffer_queue;
 	struct list_head capture_queue;
+	/* VB2 buffer receiving the current ordered half pair. */
 	struct hwsvideo_buffer *active;
-	struct hwsvideo_buffer *next_prepared;
+	u64 completion_timestamp_ns;
+	u64 completion_generation;
+	u64 next_completion_generation;
+	enum hws_video_completion_state completion_state;
+	u8 completion_toggle;
+	bool frame_half0_valid;
+	u64 frame_timestamp_ns;
+	size_t ring_extent;
+	size_t ring_split;
 
 	/* Locking */
 	struct mutex state_lock;
@@ -99,6 +114,7 @@ struct hws_video {
 	/* Timeout and error handling */
 	u32 timeout_count;
 	u32 error_count;
+	u32 completion_overruns;
 
 	bool window_valid;
 	u32 last_dma_hi;
@@ -131,6 +147,7 @@ struct hws_scratch_dma {
 	void *cpu;
 	dma_addr_t dma;
 	size_t size;
+	bool owned;
 };
 
 struct hws_pcie_dev {
@@ -153,6 +170,7 @@ struct hws_pcie_dev {
 	u32 max_hw_video_buf_sz;
 	u8 max_channels;
 	u8 cur_max_video_ch;
+	u8 cur_max_audio_ch;
 	bool start_run;
 
 	bool buf_allocated;
@@ -166,16 +184,47 @@ struct hws_pcie_dev {
 	struct mutex dma_lock; /* serializes DMA-idle checks and fatal shutdown */
 	bool dma_quiesced; /* no device DMA can still target host memory */
 	bool dma_failed; /* fatal shutdown invalidated all stream ownership */
+	struct mutex scratch_lock; /* protects scratch DMA arenas and user refs */
+	unsigned int scratch_users[MAX_VID_CHANNELS];
 	struct hws_scratch_dma scratch_vid[MAX_VID_CHANNELS];
+	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];
 
 	bool suspended;
 	int irq;
 	spinlock_t capture_lock; /* serializes capture-enable register updates */
+	spinlock_t irq_thread_lock; /* protects threaded video IRQ work flags */
+	bool irq_pending_vdone[MAX_VID_CHANNELS];
 
 	/* Error flags */
 	int pci_lost;
 };
 
+static inline bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
+{
+	dma_addr_t end;
+
+	if (!size)
+		return false;
+
+	end = dma + size - 1;
+	if (end < dma)
+		return false;
+
+	return upper_32_bits(dma) == upper_32_bits(end) &&
+	       (lower_32_bits(dma) & PCI_E_BAR_ADD_MASK) ==
+	       (lower_32_bits(end) & PCI_E_BAR_ADD_MASK);
+}
+
+int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
+void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch,
+				 bool dma_idle);
+void *hws_video_ring_cpu(struct hws_pcie_dev *hws, unsigned int ch);
+dma_addr_t hws_video_ring_dma(struct hws_pcie_dev *hws, unsigned int ch);
+size_t hws_video_ring_capacity(void);
+int hws_video_ring_prepare(struct hws_pcie_dev *hws, unsigned int ch,
+			   size_t extent);
+bool hws_video_ring_guards_ok(struct hws_pcie_dev *hws, unsigned int ch,
+			      size_t extent);
 int hws_try_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 int hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 

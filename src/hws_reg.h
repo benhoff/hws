@@ -33,6 +33,13 @@
 #define PCI_E_BAR_ADD_MASK 0xE0000000
 #define PCI_E_BAR_ADD_LOWMASK 0x1FFFFFFF
 
+/*
+ * The legacy driver reserved a 10 KiB hardware capture window per audio
+ * channel even though the delivered packet size is smaller. Keep that headroom
+ * for the split-buffer DMA engine.
+ */
+#define MAX_AUDIO_CAP_SIZE         (10U * 1024U)
+
 #define MAX_VID_CHANNELS            4
 
 #define MAX_MM_VIDEO_SIZE            SZ_4M
@@ -87,11 +94,12 @@
 #define HWS_REG_HDCP_STATUS            (CVBS_IN_BASE +  8  * PCIE_BARADDROFSIZE)
 #define HWS_REG_DMA_MAX_SIZE   (CVBS_IN_BASE +  9 * PCIE_BARADDROFSIZE)
 
-/* Buffer addresses (written once during init/reset). */
-/* Base of host-visible buffer. */
-#define HWS_REG_VBUF1_ADDR            (CVBS_IN_BASE + 25 * PCIE_BARADDROFSIZE)
-/* Per-channel DMA address. */
-#define HWS_REG_DMA_ADDR(ch)          (CVBS_IN_BASE + (26 + (ch)) * PCIE_BARADDROFSIZE)
+/*
+ * Video DMA setup uses one BAR remap-table slot per capture channel. The
+ * remap-table slot supplies the host DMA page, while CVBS_IN_BUF_BASE +
+ * ch * 4 supplies the device-side buffer offset within that page.
+ */
+#define HWS_VIDEO_REMAP_SLOT_OFF(ch)  (0x208 + ((ch) * 8))
 
 /* Per-channel live buffer toggles (read-only). */
 #define HWS_REG_VBUF_TOGGLE(ch)       (CVBS_IN_BASE + (32 + (ch)) * PCIE_BARADDROFSIZE)

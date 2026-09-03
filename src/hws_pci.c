@@ -11,9 +11,13 @@
 #include <linux/err.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
+#include <linux/minmax.h>
 #include <linux/pm.h>
 #include <linux/freezer.h>
 #include <linux/pci_regs.h>
+#include <linux/slab.h>
+#include <linux/mm.h>
+#include <linux/string.h>
 
 #include <media/v4l2-ctrls.h>
 
@@ -27,6 +31,12 @@
 #define HWS_BUSY_POLL_DELAY_US 10
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
 #define HWS_DMA_IDLE_GRACE_US 100000
+#define HWS_VIDEO_GUARD_POISON 0xa5
+
+static bool hws_enable_audio = true;
+module_param_named(enable_audio, hws_enable_audio, bool, 0444);
+MODULE_PARM_DESC(enable_audio,
+		 "Enable ALSA embedded audio capture devices; set to 0 for video-only mode");
 
 static unsigned long long hws_elapsed_us(u64 start_ns)
 {
@@ -102,21 +112,31 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 	case 0x8504:
 	case 0x6504:
 		hdev->cur_max_video_ch = 4;
+		hdev->cur_max_audio_ch = 4;
 		break;
 	case 0x8532:
 		hdev->cur_max_video_ch = 2;
+		hdev->cur_max_audio_ch = 2;
 		break;
 	case 0x8512:
 	case 0x6502:
 		hdev->cur_max_video_ch = 2;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	case 0x8501:
 		hdev->cur_max_video_ch = 1;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	default:
 		hdev->cur_max_video_ch = 4;
+		hdev->cur_max_audio_ch = 0;
 		break;
 	}
+
+	if (hdev->cur_max_audio_ch > hdev->cur_max_video_ch)
+		hdev->cur_max_audio_ch = hdev->cur_max_video_ch;
+	if (!hws_enable_audio)
+		hdev->cur_max_audio_ch = 0;
 
 	/* universal buffer capacity */
 	hdev->max_hw_video_buf_sz = MAX_MM_VIDEO_SIZE;
@@ -271,39 +291,252 @@ static void hws_stop_kthread_action(void *data)
 	}
 }
 
-static int hws_alloc_seed_buffers(struct hws_pcie_dev *hws)
+static size_t hws_video_scratch_bytes(void)
 {
-	int ch;
-	/* 64 KiB is plenty for a safe dummy; hardware needs 64-byte alignment. */
-	const size_t need = ALIGN(64 * 1024, 64);
+	return PAGE_SIZE + hws_video_ring_capacity() + PAGE_SIZE;
+}
 
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+static size_t hws_audio_scratch_bytes(void)
+{
+	return ALIGN((size_t)MAX_AUDIO_CAP_SIZE, 64);
+}
+
+size_t hws_video_ring_capacity(void)
+{
+	return PAGE_ALIGN((size_t)MAX_VIDEO_SCALER_SIZE);
+}
+
+void *hws_video_ring_cpu(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_scratch_dma *arena;
+
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return NULL;
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes())
+		return NULL;
+	return (u8 *)arena->cpu + PAGE_SIZE;
+}
+
+dma_addr_t hws_video_ring_dma(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_scratch_dma *arena;
+
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return 0;
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes())
+		return 0;
+	return arena->dma + PAGE_SIZE;
+}
+
+static bool hws_video_fixed_guards_ok(struct hws_scratch_dma *arena)
+{
+	u8 *suffix;
+
+	if (!arena || !arena->cpu || arena->size < hws_video_scratch_bytes())
+		return false;
+	suffix = (u8 *)arena->cpu + PAGE_SIZE + hws_video_ring_capacity();
+	return !memchr_inv(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE) &&
+	       !memchr_inv(suffix, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+}
+
+int hws_video_ring_prepare(struct hws_pcie_dev *hws, unsigned int ch,
+			   size_t extent)
+{
+	struct hws_scratch_dma *arena;
+	u8 *ring;
+	int ret = 0;
+
+	if (!hws || ch >= hws->cur_max_video_ch || !PAGE_ALIGNED(extent) ||
+	    !extent || extent > hws_video_ring_capacity())
+		return -EINVAL;
+
+	mutex_lock(&hws->scratch_lock);
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes()) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	if (!hws_video_fixed_guards_ok(arena)) {
+		ret = -EOVERFLOW;
+		goto out_unlock;
+	}
+
+	ring = (u8 *)arena->cpu + PAGE_SIZE;
+	memset(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+	memset(ring + extent, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+	/* Publish guard initialization before VCAP can be enabled. */
+	dma_wmb();
+
+out_unlock:
+	mutex_unlock(&hws->scratch_lock);
+	return ret;
+}
+
+bool hws_video_ring_guards_ok(struct hws_pcie_dev *hws, unsigned int ch,
+			      size_t extent)
+{
+	struct hws_scratch_dma *arena;
+	u8 *ring;
+	bool ok;
+
+	if (!hws || ch >= hws->cur_max_video_ch || !PAGE_ALIGNED(extent) ||
+	    !extent || extent > hws_video_ring_capacity())
+		return false;
+
+	mutex_lock(&hws->scratch_lock);
+	arena = &hws->scratch_vid[ch];
+	if (!arena->cpu || arena->size < hws_video_scratch_bytes()) {
+		ok = false;
+		goto out_unlock;
+	}
+	ring = (u8 *)arena->cpu + PAGE_SIZE;
+	dma_rmb();
+	ok = !memchr_inv(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE) &&
+	     !memchr_inv(ring + extent, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+
+out_unlock:
+	mutex_unlock(&hws->scratch_lock);
+	return ok;
+}
+
+static void hws_clear_scratch(struct hws_scratch_dma *scratch)
+{
+	scratch->cpu = NULL;
+	scratch->dma = 0;
+	scratch->size = 0;
+	scratch->owned = false;
+}
+
+static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
+					    unsigned int ch)
+{
+	struct hws_scratch_dma *vid;
+	struct hws_scratch_dma *aud;
+	unsigned long flags;
+
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return;
+
+	vid = &hws->scratch_vid[ch];
+	aud = &hws->scratch_aud[ch];
+
+	/* Scratch cannot exist before the per-channel IRQ lock is initialized. */
+	if (ch < hws->cur_max_video_ch && (vid->cpu || aud->cpu)) {
+		spin_lock_irqsave(&hws->video[ch].irq_lock, flags);
+		hws->video[ch].window_valid = false;
+		hws->video[ch].last_dma_hi = 0;
+		hws->video[ch].last_dma_page = 0;
+		hws->video[ch].last_pci_addr = 0;
+		hws->video[ch].last_half16 = 0;
+		spin_unlock_irqrestore(&hws->video[ch].irq_lock, flags);
+	}
+	hws->scratch_users[ch] = 0;
+
+	if (aud->cpu && aud->owned)
+		dma_free_coherent(&hws->pdev->dev, aud->size, aud->cpu,
+				  aud->dma);
+	hws_clear_scratch(aud);
+
+	if (vid->cpu && vid->owned)
+		dma_free_coherent(&hws->pdev->dev, vid->size, vid->cpu,
+				  vid->dma);
+	hws_clear_scratch(vid);
+}
+
+int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	size_t aud_off = ALIGN(hws_video_scratch_bytes(), 64);
+	size_t arena_need = aud_off;
+	bool has_audio;
+
+	if (!hws || ch >= max_t(unsigned int, hws->cur_max_video_ch,
+				hws->cur_max_audio_ch))
+		return -EINVAL;
+
+	has_audio = ch < hws->cur_max_audio_ch;
+	if (has_audio)
+		arena_need = ALIGN(aud_off + hws_audio_scratch_bytes(), 64);
+
+	/*
+	 * One permanent coherent per-channel arena backs the guarded native video
+	 * half-ring and audio DMA. The video region is a leading guard page, the
+	 * maximum page-rounded ring, and a trailing guard page. Audio starts at
+	 * aud_off. The whole arena must fit inside one 512 MiB remap page because
+	 * video and audio share the channel remap slot.
+	 */
+	mutex_lock(&hws->scratch_lock);
+	if (hws->scratch_vid[ch].cpu) {
+		hws->scratch_users[ch]++;
+		mutex_unlock(&hws->scratch_lock);
+		return 0;
+	}
+
+	{
 #if defined(CONFIG_HAS_DMA) /* normal on PCIe platforms */
-		void *cpu = dma_alloc_coherent(&hws->pdev->dev, need,
-					       &hws->scratch_vid[ch].dma,
-					       GFP_KERNEL);
+		dma_addr_t dma = 0;
+		void *cpu = NULL;
+
+		cpu = dma_alloc_coherent(&hws->pdev->dev, arena_need, &dma,
+					 GFP_KERNEL);
 #else
 		void *cpu = NULL;
+		dma_addr_t dma = 0;
 #endif
 		if (!cpu) {
 			dev_warn(&hws->pdev->dev,
-				 "scratch: dma_alloc_coherent failed ch=%d\n", ch);
-			/* not fatal: free earlier ones and continue without seeding */
-			while (--ch >= 0) {
-				if (hws->scratch_vid[ch].cpu)
-					dma_free_coherent(&hws->pdev->dev,
-							  hws->scratch_vid[ch].size,
-							  hws->scratch_vid[ch].cpu,
-							  hws->scratch_vid[ch].dma);
-				hws->scratch_vid[ch].cpu = NULL;
-				hws->scratch_vid[ch].size = 0;
-			}
+				 "scratch arena: dma_alloc_coherent failed ch=%u\n",
+				 ch);
+			mutex_unlock(&hws->scratch_lock);
 			return -ENOMEM;
 		}
-		hws->scratch_vid[ch].cpu  = cpu;
-		hws->scratch_vid[ch].size = need;
+		if (!hws_dma_fits_remap_window(dma, arena_need)) {
+			dev_err_ratelimited(&hws->pdev->dev,
+					    "scratch arena: ch=%u dma=%pad size=%zu crosses 512 MiB remap window\n",
+					    ch, &dma, arena_need);
+			dma_free_coherent(&hws->pdev->dev, arena_need, cpu, dma);
+			mutex_unlock(&hws->scratch_lock);
+			return -ERANGE;
+		}
+
+		hws->scratch_vid[ch].dma = dma;
+		hws->scratch_vid[ch].cpu = cpu;
+		hws->scratch_vid[ch].size = arena_need;
+		hws->scratch_vid[ch].owned = true;
+		memset(cpu, HWS_VIDEO_GUARD_POISON, hws_video_scratch_bytes());
+
+		if (has_audio) {
+			hws->scratch_aud[ch].dma = dma + aud_off;
+			hws->scratch_aud[ch].cpu = (u8 *)cpu + aud_off;
+			hws->scratch_aud[ch].size = hws_audio_scratch_bytes();
+			hws->scratch_aud[ch].owned = false;
+		}
 	}
+	hws->scratch_users[ch] = 1;
+
+	dev_dbg(&hws->pdev->dev,
+		"scratch arena: allocated ch=%u size=%zu audio=%d\n",
+		ch, arena_need, has_audio);
+	mutex_unlock(&hws->scratch_lock);
 	return 0;
+}
+
+void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch,
+				 bool dma_idle)
+{
+	if (!hws || ch >= MAX_VID_CHANNELS)
+		return;
+	(void)dma_idle;
+
+	mutex_lock(&hws->scratch_lock);
+	if (!hws->scratch_users[ch]) {
+		mutex_unlock(&hws->scratch_lock);
+		return;
+	}
+
+	hws->scratch_users[ch]--;
+	mutex_unlock(&hws->scratch_lock);
 }
 
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
@@ -313,12 +546,17 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 	int ch;
 	int ret;
 
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
-		if (hws->scratch_vid[ch].cpu) {
+	if (!hws)
+		return;
+
+	mutex_lock(&hws->scratch_lock);
+	for (ch = 0; ch < MAX_VID_CHANNELS; ch++) {
+		if (hws->scratch_vid[ch].cpu || hws->scratch_aud[ch].cpu) {
 			allocated = true;
 			break;
 		}
 	}
+	mutex_unlock(&hws->scratch_lock);
 	if (!allocated)
 		return;
 
@@ -327,68 +565,19 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 	writel(0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
-	ret = hws_wait_dma_idle(hws, "seed-buffer teardown", -1);
+	ret = hws_wait_dma_idle(hws, "scratch teardown", -1);
 	if (ret) {
 		dev_crit(&hws->pdev->dev,
-			 "retaining seed buffers: DMA did not quiesce (%d)\n", ret);
+			 "retaining scratch arenas: DMA did not quiesce (%d)\n",
+			 ret);
 		return;
 	}
 
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
-		if (hws->scratch_vid[ch].cpu) {
-			dma_free_coherent(&hws->pdev->dev,
-					  hws->scratch_vid[ch].size,
-					  hws->scratch_vid[ch].cpu,
-					  hws->scratch_vid[ch].dma);
-			hws->scratch_vid[ch].cpu = NULL;
-			hws->scratch_vid[ch].size = 0;
-		}
-	}
-}
-
-static void hws_seed_channel(struct hws_pcie_dev *hws, int ch)
-{
-	dma_addr_t paddr = hws->scratch_vid[ch].dma;
-	u32 lo = lower_32_bits(paddr);
-	u32 hi = upper_32_bits(paddr);
-	u32 pci_addr = lo & PCI_E_BAR_ADD_LOWMASK;
-
-	lo &= PCI_E_BAR_ADD_MASK;
-
-	/* Program 64-bit BAR remap entry for this channel (table @ 0x208 + ch * 8) */
-	writel_relaxed(hi, hws->bar0_base +
-			    PCI_ADDR_TABLE_BASE + 0x208 + ch * 8);
-	writel_relaxed(lo, hws->bar0_base +
-			    PCI_ADDR_TABLE_BASE + 0x208 + ch * 8 +
-			    PCIE_BARADDROFSIZE);
-
-	/* Program capture engine per-channel base/half */
-	writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-		       hws->bar0_base + CVBS_IN_BUF_BASE +
-		       ch * PCIE_BARADDROFSIZE);
-
-	/* Half size: use either the current format's half or half of scratch. */
-	{
-		u32 half = hws->video[ch].pix.half_size ?
-			hws->video[ch].pix.half_size :
-			(u32)(hws->scratch_vid[ch].size / 2);
-
-		writel_relaxed(half / 16,
-			       hws->bar0_base + CVBS_IN_BUF_BASE2 +
-			       ch * PCIE_BARADDROFSIZE);
-	}
-
-	(void)readl(hws->bar0_base + HWS_REG_INT_STATUS); /* flush posted writes */
-}
-
-static void hws_seed_all_channels(struct hws_pcie_dev *hws)
-{
-	int ch;
-
-	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
-		if (hws->scratch_vid[ch].cpu)
-			hws_seed_channel(hws, ch);
-	}
+	/* Teardown-only force-free path after DMA has been proven idle. */
+	mutex_lock(&hws->scratch_lock);
+	for (ch = 0; ch < MAX_VID_CHANNELS; ch++)
+		hws_free_channel_scratch_locked(hws, ch);
+	mutex_unlock(&hws->scratch_lock);
 }
 
 static void hws_irq_mask_gate(struct hws_pcie_dev *hws)
@@ -440,7 +629,7 @@ static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 {
 	struct hws_pcie_dev *hws;
-	int i, ret, irq;
+	int i, ret, irq, scratch_ch;
 	unsigned long irqf = 0;
 	bool v4l2_registered = false;
 
@@ -454,7 +643,9 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws->suspended = false;
 	mutex_init(&hws->monitor_lock);
 	mutex_init(&hws->dma_lock);
+	mutex_init(&hws->scratch_lock);
 	spin_lock_init(&hws->capture_lock);
+	spin_lock_init(&hws->irq_thread_lock);
 	pci_set_drvdata(pdev, hws);
 
 	/* 1) Enable device + bus mastering (managed) */
@@ -507,12 +698,23 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		}
 	}
 
-	/* 6) Allocate scratch DMA and seed BAR table + channel base/half (legacy SetDMAAddress) */
-	ret = hws_alloc_seed_buffers(hws);
-	if (!ret)
-		hws_seed_all_channels(hws);
+	/*
+	 * Allocate every channel's guarded DMA arena before publishing V4L2
+	 * nodes. These mappings remain stable until PCI teardown; stream users
+	 * only take and drop references to them.
+	 */
+	for (scratch_ch = 0; scratch_ch < hws->cur_max_video_ch; scratch_ch++) {
+		ret = hws_alloc_channel_scratch(hws, scratch_ch);
+		if (ret) {
+			dev_err(&pdev->dev,
+				"permanent DMA arena allocation failed (ch=%d): %d\n",
+				scratch_ch, ret);
+			goto err_unwind_channels;
+		}
+		hws_release_channel_scratch(hws, scratch_ch, true);
+	}
 
-	/* 7) Start-run sequence. */
+	/* 6) Start-run sequence with the permanent DMA arenas retained. */
 	hws_init_video_sys(hws, false);
 
 	/* A) Force legacy INTx; legacy used request_irq(pdev->irq, ..., IRQF_SHARED) */
@@ -529,10 +731,12 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws_irq_clear_pending(hws);
 
 	/* D) Request the legacy shared interrupt line (no vectors/MSI/MSI-X) */
-	ret = devm_request_irq(&pdev->dev, irq, hws_irq_handler, irqf,
-			       dev_name(&pdev->dev), hws);
+	ret = devm_request_threaded_irq(&pdev->dev, irq, hws_irq_handler,
+					hws_irq_thread, irqf, dev_name(&pdev->dev),
+					hws);
 	if (ret) {
-		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n", irq, ret);
+		dev_err(&pdev->dev, "request_threaded_irq(%d) failed: %d\n",
+			irq, ret);
 		goto err_unwind_channels;
 	}
 
@@ -1027,8 +1231,7 @@ static int hws_pm_resume(struct device *dev)
 		dev_err(dev, "failed to restore chip identity: %d\n", ret);
 		goto err_disable_device;
 	}
-	/* Re-seed BAR remaps/DMA windows and restart the capture core */
-	hws_seed_all_channels(hws);
+	/* Restart the capture core and restore any retained DMA windows. */
 	hws_init_video_sys(hws, true);
 	hws_irq_clear_pending(hws);
 	/* The engines are initialized and idle; allow future stream starts. */
