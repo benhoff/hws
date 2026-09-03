@@ -702,12 +702,10 @@ int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 	return 0;
 }
 
-void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch,
-				 bool dma_idle)
+void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	if (!hws || ch >= MAX_VID_CHANNELS)
 		return;
-	(void)dma_idle;
 
 	mutex_lock(&hws->scratch_lock);
 	if (!hws->scratch_users[ch]) {
@@ -996,7 +994,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 				scratch_ch, ret);
 			goto err_unwind_channels;
 		}
-		hws_release_channel_scratch(hws, scratch_ch, true);
+		hws_release_channel_scratch(hws, scratch_ch);
 	}
 
 	hws->video_wq = alloc_workqueue("hws-video",

@@ -268,9 +268,9 @@ struct hws_audio {
 	bool cap_active;
 	bool stream_running;
 	bool stop_requested;
-	struct mutex scratch_state_lock; /* protects scratch_acquired */
+	struct mutex scratch_state_lock; /* protects scratch ownership/quarantine */
 	bool scratch_acquired;
-	bool dma_armed; /* ACAP has targeted scratch since it was acquired */
+	bool dma_armed; /* scratch remains quarantined until DMA idle is proved */
 
 	/* minimal HW packet tracking */
 	struct work_struct deliver_work;
@@ -385,8 +385,7 @@ static inline bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
 }
 
 int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
-void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch,
-				 bool dma_idle);
+void hws_release_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch);
 void *hws_video_ring_cpu(struct hws_pcie_dev *hws, unsigned int ch);
 dma_addr_t hws_video_ring_dma(struct hws_pcie_dev *hws, unsigned int ch);
 size_t hws_video_ring_capacity(void);

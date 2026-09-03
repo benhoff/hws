@@ -445,9 +445,10 @@ void hws_video_fail_queue(struct hws_video *vid, const char *reason)
 	hws_enable_video_capture(hws, vid->channel_index, false);
 
 	/*
-	 * This runs in the channel's completion worker. Leave every DMA-owned
-	 * buffer attached to the queue; STREAMOFF returns it only after the hard
-	 * IRQ and this worker have drained and DMA idle has been proved.
+	 * This runs in the channel's completion worker. Leave every driver-owned
+	 * buffer attached to the queue; STREAMOFF returns it after the hard IRQ
+	 * and this worker drain. The permanent DMA arena remains quarantined until
+	 * a later non-fatal idle proof permits guard verification and reuse.
 	 */
 	vb2_queue_error(&vid->buffer_queue);
 
@@ -742,6 +743,40 @@ int hws_check_card_status(struct hws_pcie_dev *hws)
 	return 0;
 }
 
+static int hws_video_reclaim_ring(struct hws_video *vid, const char *owner)
+{
+	struct hws_pcie_dev *hws;
+	int ret;
+
+	if (!vid || !vid->parent)
+		return -ENODEV;
+	if (!READ_ONCE(vid->dma_needs_idle))
+		return READ_ONCE(vid->ring_corrupt) ? -EUCLEAN : 0;
+
+	hws = vid->parent;
+	ret = hws_try_wait_dma_idle(hws, owner, vid->channel_index);
+	if (ret) {
+		dev_dbg(&hws->pdev->dev,
+			"%s ch=%u: DMA arena remains quarantined: %d\n",
+			owner, vid->channel_index, ret);
+		return ret == -ETIMEDOUT ? -EBUSY : ret;
+	}
+
+	WRITE_ONCE(vid->dma_needs_idle, false);
+	if (vid->ring_extent &&
+	    !hws_video_ring_guards_ok(hws, vid->channel_index,
+				      vid->ring_extent)) {
+		WRITE_ONCE(vid->ring_corrupt, true);
+		vid->guard_errors++;
+		dev_crit(&hws->pdev->dev,
+			 "video DMA guard corruption ch=%u during arena reclaim\n",
+			 vid->channel_index);
+		return -EUCLEAN;
+	}
+
+	return READ_ONCE(vid->ring_corrupt) ? -EUCLEAN : 0;
+}
+
 int hws_video_set_output_resolution(struct hws_video *vid, u32 width,
 				    u32 height)
 {
@@ -760,8 +795,11 @@ int hws_video_set_output_resolution(struct hws_video *vid, u32 width,
 	if (ret)
 		return ret;
 	/* OUT_RES must remain fixed for the complete DMA ownership interval. */
-	if (READ_ONCE(vid->cap_active) || READ_ONCE(vid->dma_needs_idle))
+	if (READ_ONCE(vid->cap_active))
 		return -EBUSY;
+	ret = hws_video_reclaim_ring(vid, "video geometry change");
+	if (ret)
+		return ret;
 
 	value = (height << 16) | width;
 	readback = readl(hws->bar0_base + HWS_REG_OUT_RES(vid->channel_index));
@@ -1171,7 +1209,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	u32 live_fps;
 	LIST_HEAD(queued);
 	bool scratch_acquired = false;
-	int idle_ret;
 	int ret;
 
 	dev_dbg(&hws->pdev->dev, "start_streaming: ch=%u count=%u\n",
@@ -1184,10 +1221,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	ret = hws_check_card_status(hws);
 	if (ret)
 		goto fail_return_buffers;
-	if (READ_ONCE(v->dma_needs_idle)) {
-		ret = -EBUSY;
-		goto fail_return_buffers;
-	}
 	if (READ_ONCE(v->ring_corrupt)) {
 		ret = -EUCLEAN;
 		goto fail_return_buffers;
@@ -1255,12 +1288,9 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		if (hws->irq >= 0)
 			synchronize_irq(hws->irq);
 		hws_video_drain_channel_work(v);
-		idle_ret = hws_wait_dma_idle(hws, "video STREAMON failure",
-					     v->channel_index);
-		if (idle_ret)
-			ret = idle_ret;
-		else
-			WRITE_ONCE(v->dma_needs_idle, false);
+		dev_dbg(&hws->pdev->dev,
+			"video STREAMON failure ch=%u quarantined DMA arena\n",
+			v->channel_index);
 	}
 	if (ret)
 		goto complete_return_buffers;
@@ -1283,8 +1313,7 @@ complete_return_buffers:
 			vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_QUEUED);
 		}
 		if (scratch_acquired)
-			hws_release_channel_scratch(hws, v->channel_index,
-						    true);
+			hws_release_channel_scratch(hws, v->channel_index);
 	}
 	return ret;
 }
@@ -1342,9 +1371,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	LIST_HEAD(done);
 	unsigned int done_cnt = 0;
 	u64 start_ns = ktime_get_mono_fast_ns();
-	bool guards_ok = true;
 	bool needs_idle;
-	int ret;
 
 	hws_log_video_state(v, "streamoff", "begin");
 	needs_idle = READ_ONCE(v->dma_needs_idle) ||
@@ -1361,29 +1388,10 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
 	hws_video_drain_channel_work(v);
-	ret = 0;
 	if (needs_idle)
-		ret = hws_wait_dma_idle(hws, "video STREAMOFF",
-					v->channel_index);
-	if (ret) {
-		vb2_queue_error(&v->buffer_queue);
-		dev_crit(&hws->pdev->dev,
-			 "video STREAMOFF ch=%u retained DMA-owned buffers: %d\n",
-			 v->channel_index, ret);
-		return;
-	}
-	WRITE_ONCE(v->dma_needs_idle, false);
-	if (v->ring_extent)
-		guards_ok = hws_video_ring_guards_ok(hws, v->channel_index,
-						     v->ring_extent);
-	if (!guards_ok) {
-		WRITE_ONCE(v->ring_corrupt, true);
-		v->guard_errors++;
-		vb2_queue_error(&v->buffer_queue);
-		dev_crit(&hws->pdev->dev,
-			 "video STREAMOFF ch=%u detected DMA guard corruption\n",
-			 v->channel_index);
-	}
+		dev_dbg(&hws->pdev->dev,
+			"video STREAMOFF ch=%u quarantined DMA arena\n",
+			v->channel_index);
 
 	/* 2) Collect in-flight + queued under the IRQ lock */
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -1401,7 +1409,7 @@ static void hws_stop_streaming(struct vb2_queue *q)
 		"video:streamoff:done ch=%u completed=%u (%lluus)\n",
 		v->channel_index, done_cnt, hws_elapsed_us(start_ns));
 	hws_log_video_state(v, "streamoff", "end");
-	hws_release_channel_scratch(hws, v->channel_index, true);
+	hws_release_channel_scratch(hws, v->channel_index);
 }
 
 static const struct vb2_ops hwspcie_video_qops = {
@@ -1593,13 +1601,26 @@ void hws_video_pm_resume(struct hws_pcie_dev *hws)
 	unsigned long flags;
 	unsigned int ch;
 
-	/* D3 transition proved global DMA idle; require fresh phase sync. */
+	/* D3 transition proved global DMA idle; verify quarantine before reuse. */
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 		struct hws_video *vid = &hws->video[ch];
+		bool corrupt = false;
+
+		if (READ_ONCE(vid->dma_needs_idle) && vid->ring_extent)
+			corrupt = !hws_video_ring_guards_ok(hws, ch,
+							  vid->ring_extent);
 
 		spin_lock_irqsave(&vid->irq_lock, flags);
 		hws_video_reset_stream_phase_locked(vid);
 		WRITE_ONCE(vid->dma_needs_idle, false);
+		if (corrupt) {
+			WRITE_ONCE(vid->ring_corrupt, true);
+			vid->guard_errors++;
+		}
 		spin_unlock_irqrestore(&vid->irq_lock, flags);
+		if (corrupt)
+			dev_crit(&hws->pdev->dev,
+				 "video DMA guard corruption ch=%u during PM resume\n",
+				 ch);
 	}
 }
