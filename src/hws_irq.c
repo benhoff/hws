@@ -170,7 +170,8 @@ hws_irq_take_queued_buffer_locked(struct hws_video *v)
 
 static int hws_video_copy_completed_half(struct hws_video *v,
 					 const struct hws_vdone_event *event,
-					 struct hwsvideo_buffer **done)
+					 struct hwsvideo_buffer **done,
+					 bool *frame_complete)
 {
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
@@ -185,9 +186,11 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	u8 toggle_after_copy;
 	u8 live_toggle;
 	u64 verify_ns;
+	bool completes_frame = false;
 	bool skip_copy = false;
 
 	*done = NULL;
+	*frame_complete = false;
 	if (hws_video_deadline_expired(event->deadline_ns, event->timestamp_ns,
 				       ktime_get_mono_fast_ns()))
 		return -ETIME;
@@ -241,15 +244,14 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		buf = hws_irq_take_queued_buffer_locked(v);
 		if (!buf) {
 			v->frame_generation = 0;
-			v->frame_timestamp_ns = 0;
 			skip_copy = true;
 		} else {
 			v->active = buf;
 			v->frame_generation = event->generation;
 			v->frame_half0_valid = false;
-			v->frame_timestamp_ns = event->timestamp_ns;
 		}
 	} else {
+		completes_frame = true;
 		v->phase_generation = event->generation;
 		v->half_phase = HWS_VIDEO_PHASE_EXPECT_HALF0;
 		if (!v->active) {
@@ -304,8 +306,10 @@ verify_phase:
 		return -ETIME;
 	if (!hws_video_ring_guards_ok(hws, ch, v->ring_extent))
 		return -EUCLEAN;
-	if (skip_copy)
+	if (skip_copy) {
+		*frame_complete = completes_frame;
 		return 0;
+	}
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state != HWS_VIDEO_COMPLETION_COPYING ||
@@ -336,6 +340,7 @@ verify_phase:
 		*done = buf;
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
+	*frame_complete = completes_frame;
 	return 0;
 }
 
@@ -346,8 +351,10 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hws_vdone_event event = { };
 	struct hwsvideo_buffer *done = NULL;
 	unsigned long flags;
+	u32 frame_sequence = 0;
 	bool abort = false;
 	bool fail = false;
+	bool frame_complete = false;
 	int ret = 0;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
@@ -383,7 +390,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		return;
 	}
 
-	ret = hws_video_copy_completed_half(v, &event, &done);
+	ret = hws_video_copy_completed_half(v, &event, &done,
+					    &frame_complete);
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state == HWS_VIDEO_COMPLETION_OVERRUN) {
@@ -410,17 +418,19 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		if (ret) {
 			hws_irq_mark_failure_locked(v, ret);
 			fail = true;
-		} else if (done) {
-			v->active = NULL;
-			v->frame_generation = 0;
-			v->frame_half0_valid = false;
-			done->vb.vb2_buf.timestamp = v->frame_timestamp_ns;
-			v->frame_timestamp_ns = 0;
-			vb2_set_plane_payload(&done->vb.vb2_buf, 0,
-					      v->pix.sizeimage);
-			done->vb.field = v->pix.field;
-			done->vb.sequence =
+		} else if (frame_complete) {
+			frame_sequence =
 				(u32)atomic_fetch_inc(&v->sequence_number);
+			if (done) {
+				v->active = NULL;
+				v->frame_generation = 0;
+				v->frame_half0_valid = false;
+				done->vb.vb2_buf.timestamp = event.timestamp_ns;
+				vb2_set_plane_payload(&done->vb.vb2_buf, 0,
+						      v->pix.sizeimage);
+				done->vb.field = v->pix.field;
+				done->vb.sequence = frame_sequence;
+			}
 		}
 		if (!fail)
 			hws_irq_reset_completion_locked(v);
@@ -438,6 +448,11 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			ch, done, (unsigned long long)event.generation,
 			event.toggle, done->vb.sequence);
 		vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	} else if (frame_complete) {
+		dev_dbg(&hws->pdev->dev,
+			"bh_video(ch=%u): dropped complete frame generation=%llu seq=%u (no queued VB2 buffer)\n",
+			ch, (unsigned long long)event.generation,
+			frame_sequence);
 	}
 	return;
 
@@ -560,7 +575,6 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     ambiguity == HWS_VDONE_AMBIG_CADENCE) &&
 		    v->half_phase == HWS_VIDEO_PHASE_SYNC && !v->active &&
 		    !v->frame_generation && !v->frame_half0_valid &&
-		    !v->frame_timestamp_ns &&
 		    v->sync_restart_streak < HWS_VIDEO_SYNC_RESTARTS_MAX) {
 			/*
 			 * Some rapid enables expose a stale first boundary while the

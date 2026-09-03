@@ -150,7 +150,6 @@ struct hws_video {
 	u64 phase_generation;
 	u64 frame_generation;
 	bool frame_half0_valid;
-	u64 frame_timestamp_ns;
 	size_t ring_extent;
 	size_t ring_split;
 
@@ -192,6 +191,7 @@ struct hws_video {
 	u8 last_buf_half_toggle;
 	bool half_seen;
 	u64 last_vdone_timestamp_ns;
+	/* Verified full hardware frames, including frames without a VB2 buffer. */
 	atomic_t sequence_number;
 	u32 queued_count;
 
