@@ -18,6 +18,7 @@
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-dev.h>
 #include <media/v4l2-event.h>
+#include <media/v4l2-dv-timings.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/v4l2-device.h>
 #include <media/videobuf2-dma-contig.h>
@@ -32,19 +33,15 @@
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
 #define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
 
-static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch,
-				   bool interlace);
-static bool hws_read_active_state(struct hws_pcie_dev *pdx, unsigned int ch,
-				  bool *interlace);
+static void hws_video_update_source_state(struct hws_pcie_dev *pdx,
+					  unsigned int ch, int status,
+					  const struct v4l2_dv_timings *timings,
+					  u32 fps);
 static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch);
 static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch);
-static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
-			      bool interlaced);
 
 /* DMA helper functions */
 static int hws_program_video_ring_locked(struct hws_video *vid);
-static struct hwsvideo_buffer *
-hws_take_queued_buffer_locked(struct hws_video *vid);
 static void hws_video_reset_completion_locked(struct hws_video *vid);
 static void hws_video_reset_stream_phase_locked(struct hws_video *vid);
 
@@ -163,7 +160,7 @@ static int hws_program_video_ring_locked(struct hws_video *vid)
 		u32 r_half = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
 
 		dev_dbg(&hws->pdev->dev,
-			"ch%u remap verify: hi=0x%08x page_lo=0x%08x exp_page=0x%08x base=0x%08x exp_base=0x%08x half16B=0x%08x exp_half=0x%08x\n",
+			"ch%u remap verify: hi=0x%08x page_lo=0x%08x exp_page=0x%08x base=0x%08x exp_base=0x%08x half16B=0x%08x exp_half=0x%08zx\n",
 			ch, r_hi, r_lo, page_lo, r_base,
 			(ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half,
 			split / 16);
@@ -173,127 +170,6 @@ static int hws_program_video_ring_locked(struct hws_video *vid)
 	}
 
 	return 0;
-}
-
-static struct hwsvideo_buffer *
-hws_take_queued_buffer_locked(struct hws_video *vid)
-{
-	struct hwsvideo_buffer *buf;
-
-	if (!vid || list_empty(&vid->capture_queue))
-		return NULL;
-
-	buf = list_first_entry(&vid->capture_queue,
-			       struct hwsvideo_buffer, list);
-	list_del_init(&buf->list);
-	if (vid->queued_count)
-		vid->queued_count--;
-	return buf;
-}
-
-static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
-{
-	struct hws_pcie_dev *hws;
-	unsigned long flags;
-	struct hwsvideo_buffer *buf = NULL;
-	size_t extent;
-	bool completed = false;
-	int ret = 0;
-
-	if (!v)
-		return false;
-	hws = v->parent;
-	if (!hws || !mutex_trylock(&v->state_lock))
-		return false;
-	if (READ_ONCE(v->stop_requested) || !READ_ONCE(v->cap_active))
-		goto out_unlock;
-
-	/* Stop DMA and drain this channel's completion before taking its buffer. */
-	hws_enable_video_capture(hws, v->channel_index, false);
-	if (hws->irq >= 0)
-		synchronize_irq(hws->irq);
-	hws_video_drain_channel_work(v);
-	ret = hws_try_wait_dma_idle(hws, tag ? tag : "no-signal",
-				    v->channel_index);
-	if (ret || READ_ONCE(hws->pci_lost)) {
-		WRITE_ONCE(v->stop_requested, true);
-		vb2_queue_error(&v->buffer_queue);
-		goto out_unlock;
-	}
-	WRITE_ONCE(v->dma_needs_idle, false);
-	extent = hws_video_dma_extent(v->pix.sizeimage);
-	if (v->ring_extent &&
-	    !hws_video_ring_guards_ok(hws, v->channel_index,
-				      v->ring_extent)) {
-		WRITE_ONCE(v->ring_corrupt, true);
-		v->guard_errors++;
-		ret = -EUCLEAN;
-		goto fail_queue;
-	}
-	ret = hws_video_ring_prepare(hws, v->channel_index, extent);
-	if (ret) {
-		if (ret == -EOVERFLOW) {
-			WRITE_ONCE(v->ring_corrupt, true);
-			v->guard_errors++;
-		}
-		goto fail_queue;
-	}
-
-	spin_lock_irqsave(&v->irq_lock, flags);
-	hws_video_reset_stream_phase_locked(v);
-	if (v->active) {
-		buf = v->active;
-		v->active = NULL;
-	} else {
-		buf = hws_take_queued_buffer_locked(v);
-	}
-	ret = hws_program_video_ring_locked(v);
-	spin_unlock_irqrestore(&v->irq_lock, flags);
-	if (ret)
-		goto fail_buffer;
-	if (!buf)
-		goto restart_capture;
-
-	/* Complete buffer with a neutral frame so dequeuers keep running. */
-	{
-		struct vb2_v4l2_buffer *vb2v = &buf->vb;
-		void *dst = vb2_plane_vaddr(&vb2v->vb2_buf, 0);
-
-		if (!dst) {
-			ret = -EFAULT;
-			vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_ERROR);
-			goto fail_queue;
-		}
-		memset(dst, 0x10, v->pix.sizeimage);
-		vb2_set_plane_payload(&vb2v->vb2_buf, 0, v->pix.sizeimage);
-		vb2v->field = v->pix.field;
-		vb2v->sequence = (u32)atomic_fetch_inc(&v->sequence_number);
-		vb2v->vb2_buf.timestamp = ktime_get_ns();
-		vb2_buffer_done(&vb2v->vb2_buf, VB2_BUF_STATE_DONE);
-		completed = true;
-	}
-
-restart_capture:
-	hws_ack_video_pending(hws, v->channel_index);
-	wmb(); /* publish the fixed ring before re-enabling VCAP */
-	hws_enable_video_capture(hws, v->channel_index, true);
-	if (!READ_ONCE(v->cap_active))
-		vb2_queue_error(&v->buffer_queue);
-	goto out_unlock;
-
-fail_buffer:
-	if (buf)
-		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-fail_queue:
-	WRITE_ONCE(v->stop_requested, true);
-	vb2_queue_error(&v->buffer_queue);
-	dev_warn_ratelimited(&hws->pdev->dev,
-			     "%s: failed to restart guarded ring ch=%u ret=%d\n",
-			     tag, v->channel_index, ret);
-
-out_unlock:
-	mutex_unlock(&v->state_lock);
-	return completed;
 }
 
 static int hws_ctrls_init(struct hws_video *vid)
@@ -395,16 +271,18 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->pix.sizeimage = (u32)hws_yuyv_packed_size(vid->pix.width,
 							vid->pix.height);
 	vid->pix.field = V4L2_FIELD_NONE;
-	vid->pix.colorspace = V4L2_COLORSPACE_REC709;
-	vid->pix.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
-	vid->pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
-	vid->pix.xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	hws_set_pix_colorimetry(&vid->pix);
 	vid->pix.interlaced = false;
 	vid->pix.half_size = hws_video_native_split(vid->pix.sizeimage);
 	vid->ring_extent = hws_video_dma_extent(vid->pix.sizeimage);
 	vid->ring_split = vid->pix.half_size;
-	hws_set_current_dv_timings(vid, vid->pix.width,
-				   vid->pix.height, vid->pix.interlaced);
+	if (hws_dv_timings_from_mode(vid->pix.width, vid->pix.height,
+				     false, 60, &vid->cur_dv_timings)) {
+		mutex_destroy(&vid->state_lock);
+		return -EINVAL;
+	}
+	vid->detected_dv_status = -ENOLINK;
+	vid->source_state_initialized = false;
 	vid->current_fps = 60;
 
 	/* color controls default (mid-scale) */
@@ -863,25 +741,25 @@ void check_video_format(struct hws_pcie_dev *pdx)
 	int i;
 
 	for (i = 0; i < pdx->cur_max_video_ch; i++) {
-		bool interlace = false;
+		struct v4l2_dv_timings timings;
+		u32 fps = 0;
+		int status;
 
-		if (!hws_read_active_state(pdx, i, &interlace)) {
-			/* No active video; optionally feed neutral frames to keep streaming. */
-			if (pdx->video[i].signal_loss_cnt == 0)
-				pdx->video[i].signal_loss_cnt = 1;
-			if (READ_ONCE(pdx->video[i].cap_active))
-				hws_force_no_signal_frame(&pdx->video[i],
-							  "monitor_nosignal");
-		} else {
+		status = hws_detect_dv_timings(&pdx->video[i], &timings,
+					       &fps);
+		if (!status) {
 			if (pdx->hw_ver > 0)
 				handle_hwv2_path(pdx, i);
 			else
-				/* Legacy path stub; see handle_legacy_path() comment. */
 				handle_legacy_path(pdx, i);
-
-			update_live_resolution(pdx, i, interlace);
 			pdx->video[i].signal_loss_cnt = 0;
+		} else if (status == -ENOLINK) {
+			pdx->video[i].signal_loss_cnt = 1;
 		}
+
+		if (status != -ENODEV)
+			hws_video_update_source_state(pdx, i, status, &timings,
+						      fps);
 	}
 }
 
@@ -910,22 +788,6 @@ static inline void hws_write_if_diff(struct hws_pcie_dev *hws, u32 reg_off,
 	}
 }
 
-static bool hws_read_active_state(struct hws_pcie_dev *pdx, unsigned int ch,
-				  bool *interlace)
-{
-	u32 reg;
-	bool active;
-
-	if (ch >= pdx->cur_max_video_ch)
-		return false;
-
-	reg = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
-	active = !!(reg & BIT(ch));
-	if (interlace)
-		*interlace = !!(reg & BIT(8 + ch));
-	return active;
-}
-
 /* Modern hardware path: keep HW registers in sync with current per-channel
  * software state.
  */
@@ -938,6 +800,8 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 		return;
 
 	vid = &hws->video[ch];
+	if (!mutex_trylock(&vid->state_lock))
+		return;
 
 	/* 1) Input frame rate (read-only; log or export via debugfs if wanted) */
 	in_fps = readl(hws->bar0_base + HWS_REG_FRAME_RATE(ch));
@@ -981,6 +845,7 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 	/* 5) HDCP detect: read only (no cache field in your structs today) */
 	reg = readl(hws->bar0_base + HWS_REG_HDCP_STATUS);
 	/* bool hdcp = !!(reg & BIT(ch)); // use if you later add a field/control */
+	mutex_unlock(&vid->state_lock);
 }
 
 static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch)
@@ -1014,163 +879,69 @@ static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch)
 	(void)ch;
 }
 
-static void hws_video_apply_mode_change(struct hws_pcie_dev *pdx,
-					unsigned int ch, u16 w, u16 h,
-					bool interlaced, u32 fps)
+static void hws_video_update_source_state(struct hws_pcie_dev *pdx,
+					  unsigned int ch, int status,
+					  const struct v4l2_dv_timings *timings,
+					  u32 fps)
 {
-	struct hws_video *v = &pdx->video[ch];
-	unsigned long flags;
-	bool queue_busy;
-	bool geometry_changed;
-	struct list_head done;
-	struct hwsvideo_buffer *b, *tmp;
-	int ret;
+	struct hws_video *v;
+	struct v4l2_event ev = {
+		.type = V4L2_EVENT_SOURCE_CHANGE,
+	};
+	bool changed;
+	bool initialized;
 
-	if (!pdx || !pdx->bar0_base)
+	if (!pdx || !pdx->bar0_base || !timings)
 		return;
 	if (ch >= pdx->max_channels)
 		return;
-	if (!w || !h || w > MAX_VIDEO_HW_W ||
-	    (!interlaced && h > MAX_VIDEO_HW_H) ||
-	    (interlaced && (h * 2) > MAX_VIDEO_HW_H))
-		return;
-	if (!fps || fps == 0xFFFFFFFF || fps > 240)
-		fps = (h == 576) ? 50 : 60;
 
-	geometry_changed = w != v->pix.width || h != v->pix.height ||
-		interlaced != v->pix.interlaced;
-	if (!geometry_changed && fps == v->current_fps)
-		return;
-
-	if (!geometry_changed) {
-		/* Refresh cached live timing state, but don't emit a resolution
-		 * change event when only the frame rate changes.
-		 */
-		mutex_lock(&v->state_lock);
-		v->pix.interlaced = interlaced;
-		v->pix.field = interlaced ? V4L2_FIELD_INTERLACED :
-					    V4L2_FIELD_NONE;
-		hws_set_current_dv_timings(v, w, h, interlaced);
-		v->current_fps = fps;
-		mutex_unlock(&v->state_lock);
-		return;
-	}
-
+	v = &pdx->video[ch];
 	if (!mutex_trylock(&v->state_lock))
 		return;
 
-	INIT_LIST_HEAD(&done);
-	queue_busy = vb2_is_busy(&v->buffer_queue);
+	initialized = v->source_state_initialized;
+	changed = initialized &&
+		(status != v->detected_dv_status ||
+		 fps != v->detected_fps ||
+		 memcmp(timings, &v->detected_dv_timings, sizeof(*timings)));
+	v->detected_dv_status = status;
+	v->detected_fps = fps;
+	v->detected_dv_timings = *timings;
+	v->source_state_initialized = true;
 
-	WRITE_ONCE(v->stop_requested, true);
-	WRITE_ONCE(v->cap_active, false);
-	/* Publish software stop first so the IRQ completion path sees the stop
-	 * before we touch MMIO or the lists. Pairs with READ_ONCE() checks in the
-	 * VDONE handler to prevent half copies while modes change.
+	if (!changed)
+		goto out_unlock;
+
+	/*
+	 * Detection never changes the configured timings or buffer layout.
+	 * Stop the private DMA producer, fail active dequeue operations, and
+	 * let userspace QUERY, STREAMOFF, S_DV_TIMINGS, and reallocate.
 	 */
-	smp_wmb();
-
-	hws_enable_video_capture(pdx, ch, false);
-	readl(pdx->bar0_base + HWS_REG_INT_STATUS);
-
-	if (v->parent && v->parent->irq >= 0)
-		synchronize_irq(v->parent->irq);
-	hws_video_drain_channel_work(v);
-	ret = hws_try_wait_dma_idle(pdx, "video mode change", ch);
-	if (ret || READ_ONCE(pdx->pci_lost)) {
+	if (READ_ONCE(v->cap_active)) {
+		WRITE_ONCE(v->stop_requested, true);
+		WRITE_ONCE(v->cap_active, false);
+		/* Publish the stop state before disabling the producer in MMIO. */
+		smp_wmb();
+		hws_enable_video_capture(pdx, ch, false);
+		(void)readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+		if (pdx->irq >= 0)
+			synchronize_irq(pdx->irq);
+		hws_video_drain_channel_work(v);
 		vb2_queue_error(&v->buffer_queue);
-		mutex_unlock(&v->state_lock);
-		return;
-	}
-	WRITE_ONCE(v->dma_needs_idle, false);
-	if (v->ring_extent &&
-	    !hws_video_ring_guards_ok(pdx, ch, v->ring_extent)) {
-		WRITE_ONCE(v->ring_corrupt, true);
-		v->guard_errors++;
-		vb2_queue_error(&v->buffer_queue);
-		mutex_unlock(&v->state_lock);
-		return;
 	}
 
-	spin_lock_irqsave(&v->irq_lock, flags);
-	hws_video_collect_done_locked(v, &done);
-	v->window_valid = false;
-	spin_unlock_irqrestore(&v->irq_lock, flags);
-
-	/* Update software pixel state */
-	v->pix.width = w;
-	v->pix.height = h;
-	v->pix.interlaced = interlaced;
-	hws_set_current_dv_timings(v, w, h, interlaced);
-	v->current_fps = fps;
-
-	hws_calc_sizeimage(v, w, h, interlaced);
-
-	/* Geometry changes require userspace renegotiation once buffers exist.
-	 * Emit SOURCE_CHANGE, mark the queue in error, and let userspace
-	 * STREAMOFF/REQBUFS/STREAMON rather than trying to restart capture
-	 * with partially drained in-flight state.
-	 */
-	if (queue_busy) {
-		struct v4l2_event ev = {
-			.type = V4L2_EVENT_SOURCE_CHANGE,
-		};
-
-		ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
+	ev.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION;
+	if (v->video_device && video_is_registered(v->video_device))
 		v4l2_event_queue(v->video_device, &ev);
-		vb2_queue_error(&v->buffer_queue);
-	} else {
-		WRITE_ONCE(v->stop_requested, false);
-	}
 
-	/* Program HW with new resolution */
-	hws_write_if_diff(pdx, HWS_REG_OUT_RES(ch), (h << 16) | w);
+	dev_dbg(&pdx->pdev->dev,
+		"source change ch=%u status=%d %ux%u%c%u\n", ch, status,
+		timings->bt.width, timings->bt.height,
+		timings->bt.interlaced ? 'i' : 'p', fps);
 
-	/* Legacy half-buffer programming */
-	writel(v->pix.half_size / 16,
-	       pdx->bar0_base + CVBS_IN_BUF_BASE2 + ch * PCIE_BARADDROFSIZE);
-	(void)readl(pdx->bar0_base + CVBS_IN_BUF_BASE2 +
-		    ch * PCIE_BARADDROFSIZE);
-
-	/* Reset per-channel toggles/counters */
-	WRITE_ONCE(v->last_buf_half_toggle, 0);
-	atomic_set(&v->sequence_number, 0);
-
+out_unlock:
 	mutex_unlock(&v->state_lock);
-
-	list_for_each_entry_safe(b, tmp, &done, list) {
-		list_del_init(&b->list);
-		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
-	}
-}
-
-static void update_live_resolution(struct hws_pcie_dev *pdx, unsigned int ch,
-				   bool interlace)
-{
-	u32 reg = readl(pdx->bar0_base + HWS_REG_IN_RES(ch));
-	u32 fps = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(ch));
-	u16 res_w = reg & 0xFFFF;
-	u16 res_h = (reg >> 16) & 0xFFFF;
-	struct hws_video *vid = &pdx->video[ch];
-	bool geometry_changed;
-	bool fps_changed;
-
-	bool within_hw = (res_w <= MAX_VIDEO_HW_W) &&
-	    ((!interlace && res_h <= MAX_VIDEO_HW_H) ||
-	     (interlace && (res_h * 2) <= MAX_VIDEO_HW_H));
-
-	if (!within_hw)
-		return;
-
-	geometry_changed = res_w != vid->pix.width ||
-		res_h != vid->pix.height ||
-		interlace != vid->pix.interlaced;
-	fps_changed = fps && fps != 0xFFFFFFFF && fps <= 240 &&
-		fps != vid->current_fps;
-
-	if (geometry_changed || fps_changed)
-		hws_video_apply_mode_change(pdx, ch, res_w, res_h, interlace,
-					    fps);
 }
 
 static int hws_open(struct file *file)
@@ -1239,28 +1010,6 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_g_parm = hws_vidioc_g_parm,
 };
 
-static u32 hws_calc_sizeimage(struct hws_video *v, u16 w, u16 h,
-			      bool interlaced)
-{
-	/* HWS exposes only tightly packed, 16-bpp YUYV frames. */
-	u32 bytesperline = hws_yuyv_packed_stride(w);
-	u32 sizeimage, half0;
-
-	/* publish into pix, since we now carry these in-state */
-	v->pix.bytesperline = bytesperline;
-	sizeimage = (u32)hws_yuyv_packed_size(w, h);
-
-	half0 = hws_video_native_split(sizeimage);
-
-	v->pix.sizeimage = sizeimage;
-	v->pix.half_size = half0;	/* native first half; second is remainder */
-	v->ring_extent = hws_video_dma_extent(sizeimage);
-	v->ring_split = half0;
-	v->pix.field = interlaced ? V4L2_FIELD_INTERLACED : V4L2_FIELD_NONE;
-
-	return v->pix.sizeimage;
-}
-
 static int hws_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
 			   unsigned int *nplanes, unsigned int sizes[],
 			   struct device *alloc_devs[])
@@ -1323,6 +1072,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	unsigned long flags;
 	dma_addr_t ring_dma;
 	size_t extent;
+	struct v4l2_dv_timings detected;
 	u32 live_fps;
 	LIST_HEAD(queued);
 	bool scratch_acquired = false;
@@ -1347,10 +1097,20 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -EUCLEAN;
 		goto fail_return_buffers;
 	}
-	live_fps = readl(hws->bar0_base +
-			 HWS_REG_FRAME_RATE(v->channel_index));
-	if (live_fps && live_fps != U32_MAX && live_fps <= 240)
-		WRITE_ONCE(v->current_fps, live_fps);
+
+	/* Capture can start only after userspace configured the detected mode. */
+	ret = hws_detect_dv_timings(v, &detected, &live_fps);
+	if (ret)
+		goto fail_return_buffers;
+	if (!v4l2_match_dv_timings(&detected, &v->cur_dv_timings, 0, true)) {
+		ret = -EPIPE;
+		goto fail_return_buffers;
+	}
+	WRITE_ONCE(v->current_fps, live_fps);
+	v->detected_dv_timings = detected;
+	v->detected_dv_status = 0;
+	v->detected_fps = live_fps;
+	v->source_state_initialized = true;
 
 	ret = hws_alloc_channel_scratch(hws, v->channel_index);
 	if (ret)
@@ -1365,9 +1125,6 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		}
 		goto fail_return_buffers;
 	}
-
-	(void)hws_read_active_state(hws, v->channel_index,
-				       &v->pix.interlaced);
 
 	lockdep_assert_held(&v->state_lock);
 	/* init per-stream state */
