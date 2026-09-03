@@ -37,6 +37,8 @@ static void hws_video_update_source_state(struct hws_pcie_dev *pdx,
 					  unsigned int ch, int status,
 					  const struct v4l2_dv_timings *timings,
 					  u32 fps);
+static void hws_video_update_power_present(struct hws_pcie_dev *pdx,
+					   unsigned int ch);
 static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch);
 static void handle_legacy_path(struct hws_pcie_dev *hws, unsigned int ch);
 
@@ -62,7 +64,7 @@ MODULE_PARM_DESC(dma_window_verify,
 
 static size_t hws_video_dma_extent(size_t frame_size)
 {
-	return PAGE_ALIGN(frame_size);
+	return PAGE_ALIGN(frame_size + HWS_VIDEO_DMA_TAIL_BYTES);
 }
 
 static void hws_ack_video_pending(struct hws_pcie_dev *hws, unsigned int ch)
@@ -176,8 +178,8 @@ static int hws_ctrls_init(struct hws_video *vid)
 {
 	struct v4l2_ctrl_handler *hdl = &vid->control_handler;
 
-	/* Create BCHS controls. */
-	v4l2_ctrl_handler_init(hdl, 4);
+	/* Create BCHS controls and the single-input HDMI power indicator. */
+	v4l2_ctrl_handler_init(hdl, 5);
 
 	vid->ctrl_brightness = v4l2_ctrl_new_std(hdl, &hws_ctrl_ops,
 						 V4L2_CID_BRIGHTNESS,
@@ -200,12 +202,16 @@ static int hws_ctrls_init(struct hws_video *vid)
 					  MIN_VAMP_HUE_UNITS,
 					  MAX_VAMP_HUE_UNITS, 1,
 					  HWS_HUE_DEFAULT);
+	vid->ctrl_dv_rx_power_present =
+		v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_DV_RX_POWER_PRESENT,
+				  0, BIT(0), 0, 0);
 	if (hdl->error) {
 		int err = hdl->error;
 
 		v4l2_ctrl_handler_free(hdl);
 		return err;
 	}
+	hws_video_update_power_present(vid->parent, vid->channel_index);
 	return 0;
 }
 
@@ -736,15 +742,78 @@ int hws_check_card_status(struct hws_pcie_dev *hws)
 	return 0;
 }
 
+int hws_video_set_output_resolution(struct hws_video *vid, u32 width,
+				    u32 height)
+{
+	struct hws_pcie_dev *hws;
+	u32 readback;
+	u32 value;
+	int ret;
+
+	if (!vid || width < MIN_VIDEO_HW_W || width > MAX_VIDEO_HW_W ||
+	    height < MIN_VIDEO_HW_H || height > MAX_VIDEO_HW_H)
+		return -EINVAL;
+	lockdep_assert_held(&vid->state_lock);
+
+	hws = vid->parent;
+	ret = hws_check_card_status(hws);
+	if (ret)
+		return ret;
+	/* OUT_RES must remain fixed for the complete DMA ownership interval. */
+	if (READ_ONCE(vid->cap_active) || READ_ONCE(vid->dma_needs_idle))
+		return -EBUSY;
+
+	value = (height << 16) | width;
+	readback = readl(hws->bar0_base + HWS_REG_OUT_RES(vid->channel_index));
+	if (readback == U32_MAX) {
+		WRITE_ONCE(hws->pci_lost, true);
+		return -ENODEV;
+	}
+	if (readback == value)
+		return 0;
+
+	writel(value, hws->bar0_base + HWS_REG_OUT_RES(vid->channel_index));
+	readback = readl(hws->bar0_base + HWS_REG_OUT_RES(vid->channel_index));
+	if (readback == U32_MAX) {
+		WRITE_ONCE(hws->pci_lost, true);
+		return -ENODEV;
+	}
+	return readback == value ? 0 : -EIO;
+}
+
+static void hws_video_update_power_present(struct hws_pcie_dev *pdx,
+					   unsigned int ch)
+{
+	struct hws_video *vid;
+	u32 active;
+
+	if (!pdx || !pdx->bar0_base || ch >= pdx->max_channels)
+		return;
+
+	vid = &pdx->video[ch];
+	if (!vid->ctrl_dv_rx_power_present)
+		return;
+
+	active = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
+	if (active == U32_MAX) {
+		WRITE_ONCE(pdx->pci_lost, true);
+		return;
+	}
+
+	/* Each video node represents one HDMI input, exposed as bit zero. */
+	v4l2_ctrl_s_ctrl(vid->ctrl_dv_rx_power_present, active & BIT(ch) ? 1 : 0);
+}
+
 void check_video_format(struct hws_pcie_dev *pdx)
 {
 	int i;
 
 	for (i = 0; i < pdx->cur_max_video_ch; i++) {
-		struct v4l2_dv_timings timings;
+		struct v4l2_dv_timings timings = {};
 		u32 fps = 0;
 		int status;
 
+		hws_video_update_power_present(pdx, i);
 		status = hws_detect_dv_timings(&pdx->video[i], &timings,
 					       &fps);
 		if (!status) {
@@ -813,7 +882,8 @@ static void handle_hwv2_path(struct hws_pcie_dev *hws, unsigned int ch)
 	 */
 	want_out_res = (vid->pix.height << 16) | vid->pix.width;
 	cur_out_res = readl(hws->bar0_base + HWS_REG_OUT_RES(ch));
-	if (cur_out_res != want_out_res)
+	if (!READ_ONCE(vid->cap_active) &&
+	    !READ_ONCE(vid->dma_needs_idle) && cur_out_res != want_out_res)
 		hws_write_if_diff(hws, HWS_REG_OUT_RES(ch), want_out_res);
 
 	/* 3) Output FPS: only program if you actually track a target.
@@ -971,6 +1041,31 @@ static int hws_subscribe_event(struct v4l2_fh *fh,
 	}
 }
 
+static int hws_vidioc_streamon(struct file *file, void *fh,
+			       enum v4l2_buf_type type)
+{
+	struct hws_video *vid = video_drvdata(file);
+	struct v4l2_dv_timings detected;
+	u32 live_fps;
+	int ret;
+
+	if (type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	/*
+	 * Reject an absent or changed source at VIDIOC_STREAMON, before userspace
+	 * can enter its dequeue loop.  hws_start_streaming() repeats this check
+	 * after buffer setup to close the race with a source transition.
+	 */
+	ret = hws_detect_dv_timings(vid, &detected, &live_fps);
+	if (ret)
+		return ret;
+	if (!v4l2_match_dv_timings(&detected, &vid->cur_dv_timings, 0, true))
+		return -EPIPE;
+
+	return vb2_ioctl_streamon(file, fh, type);
+}
+
 static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	/* Core caps/info */
 	.vidioc_querycap = hws_vidioc_querycap,
@@ -989,7 +1084,7 @@ static const struct v4l2_ioctl_ops hws_ioctl_fops = {
 	.vidioc_qbuf = vb2_ioctl_qbuf,
 	.vidioc_dqbuf = vb2_ioctl_dqbuf,
 	.vidioc_expbuf = vb2_ioctl_expbuf,
-	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamon = hws_vidioc_streamon,
 	.vidioc_streamoff = vb2_ioctl_streamoff,
 
 	/* Inputs */
@@ -1097,6 +1192,9 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 		ret = -EUCLEAN;
 		goto fail_return_buffers;
 	}
+	ret = hws_video_set_output_resolution(v, v->pix.width, v->pix.height);
+	if (ret)
+		goto fail_return_buffers;
 
 	/* Capture can start only after userspace configured the detected mode. */
 	ret = hws_detect_dv_timings(v, &detected, &live_fps);

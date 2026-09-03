@@ -295,7 +295,10 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	struct hws_video *vid = video_drvdata(file);
 	const struct hws_dv_mode *m;
 	const struct v4l2_bt_timings *bt;
+	unsigned long flags;
+	bool geometry_changed;
 	bool timing_changed;
+	int ret;
 
 	if (!timings)
 		return -EINVAL;
@@ -309,6 +312,8 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 		return -EINVAL;
 
 	lockdep_assert_held(&vid->state_lock);
+	geometry_changed = vid->pix.width != bt->width ||
+			   vid->pix.height != bt->height;
 	timing_changed = !v4l2_match_dv_timings(&vid->cur_dv_timings,
 						&m->timings, 0, true);
 
@@ -318,6 +323,15 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 			return -EBUSY;
 		*timings = m->timings;
 		return 0;
+	}
+	ret = hws_video_set_output_resolution(vid, bt->width, bt->height);
+	if (ret)
+		return ret;
+	if (geometry_changed) {
+		/* Rewriting the fixed base while idle resets the engine's ring phase. */
+		spin_lock_irqsave(&vid->irq_lock, flags);
+		vid->window_valid = false;
+		spin_unlock_irqrestore(&vid->irq_lock, flags);
 	}
 
 	vid->pix.width      = bt->width;
@@ -333,14 +347,6 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->cur_dv_timings   = m->timings;
 	vid->current_fps      = m->refresh_hz;
-	if (vid->parent && vid->parent->bar0_base &&
-	    !READ_ONCE(vid->parent->pci_lost)) {
-		writel((bt->height << 16) | bt->width,
-		       vid->parent->bar0_base +
-		       HWS_REG_OUT_RES(vid->channel_index));
-		(void)readl(vid->parent->bar0_base +
-			    HWS_REG_OUT_RES(vid->channel_index));
-	}
 	*timings = m->timings;
 	return 0;
 }
@@ -502,25 +508,28 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	struct hws_video *vid = file ? video_drvdata(file) : NULL;
 	struct hws_pcie_dev *pdev = vid ? vid->parent : NULL;
 	struct v4l2_pix_format *pix = &f->fmt.pix;
-	u32 req_w = pix->width, req_h = pix->height;
-	u32 w, h, bpl;
+	const struct v4l2_bt_timings *bt;
+	u32 w, h, bpl, split;
 	u64 size;
 	size_t max_frame = pdev ? pdev->max_hw_video_buf_sz : MAX_MM_VIDEO_SIZE;
+
+	if (!vid || vid->cur_dv_timings.type != V4L2_DV_BT_656_1120)
+		return -EINVAL;
+	bt = &vid->cur_dv_timings.bt;
+	if (bt->interlaced || bt->width < MIN_VIDEO_HW_W ||
+	    bt->width > MAX_VIDEO_HW_W || bt->height < MIN_VIDEO_HW_H ||
+	    bt->height > MAX_VIDEO_HW_H)
+		return -EINVAL;
 
 	/* Only YUYV */
 	pix->pixelformat = V4L2_PIX_FMT_YUYV;
 
-	/* Defaults then clamp */
-	w = (req_w ? req_w : 640);
-	h = (req_h ? req_h : 480);
-	if (w > MAX_VIDEO_HW_W)
-		w = MAX_VIDEO_HW_W;
-	if (h > MAX_VIDEO_HW_H)
-		h = MAX_VIDEO_HW_H;
-	if (!w)
-		w = 640; /* hard fallback in case macros are odd */
-	if (!h)
-		h = 480;
+	/*
+	 * Hardware evidence shows that OUT_RES does not safely scale the DMA
+	 * geometry. Expose only packed native capture at the configured DV mode.
+	 */
+	w = bt->width;
+	h = bt->height;
 
 	/* Field policy */
 	pix->field = V4L2_FIELD_NONE;
@@ -529,6 +538,9 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	bpl = hws_yuyv_packed_stride(w);
 	size = hws_yuyv_packed_size(w, h);
 	if (size > U32_MAX || size > max_frame)
+		return -ERANGE;
+	split = hws_video_native_split((u32)size);
+	if (!split || split >= size)
 		return -ERANGE;
 
 	pix->width        = w;
@@ -548,6 +560,8 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct hws_video *vid = video_drvdata(file);
+	unsigned long flags;
+	bool geometry_changed;
 	int ret;
 
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
@@ -558,12 +572,25 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	if (ret)
 		return ret;
 
+	geometry_changed = f->fmt.pix.width != vid->pix.width ||
+			   f->fmt.pix.height != vid->pix.height;
+
 	/* Don't allow buffer layout changes while buffers are queued. */
 	if (vb2_is_busy(&vid->buffer_queue)) {
-		if (f->fmt.pix.width  != vid->pix.width  ||
-		    f->fmt.pix.height != vid->pix.height ||
+		if (geometry_changed ||
 		    f->fmt.pix.bytesperline != vid->pix.bytesperline)
 			return -EBUSY;
+		return 0;
+	}
+	ret = hws_video_set_output_resolution(vid, f->fmt.pix.width,
+					      f->fmt.pix.height);
+	if (ret)
+		return ret;
+	if (geometry_changed) {
+		/* Rewriting the fixed base while idle resets the engine's ring phase. */
+		spin_lock_irqsave(&vid->irq_lock, flags);
+		vid->window_valid = false;
+		spin_unlock_irqrestore(&vid->irq_lock, flags);
 	}
 
 	/* Apply to driver state */

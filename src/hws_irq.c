@@ -34,6 +34,13 @@ struct hws_vdone_toggle_sample {
 	bool status_reasserted;
 };
 
+struct hws_adone_toggle_sample {
+	u8 before_ack;
+	u8 after_ack;
+	bool post_ack_stable;
+	bool status_reasserted;
+};
+
 enum hws_vdone_record_result {
 	HWS_VDONE_IGNORED,
 	HWS_VDONE_QUEUED,
@@ -707,15 +714,33 @@ static void hws_irq_queue_video_work(struct hws_pcie_dev *pdx, u32 work_mask)
 	}
 }
 
-static u32 hws_irq_record_audio(struct hws_pcie_dev *pdx, u32 int_state,
-				u64 timestamp_ns)
+static void
+hws_irq_sample_audio_before_ack(struct hws_pcie_dev *pdx, u32 int_state,
+				struct hws_adone_toggle_sample samples[])
+{
+	unsigned int ch;
+
+	for (ch = 0; ch < pdx->cur_max_audio_ch; ch++) {
+		if (!(int_state & HWS_INT_ADONE_BIT(ch)))
+			continue;
+		samples[ch].before_ack = readl(pdx->bar0_base +
+						 HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+		samples[ch].after_ack = samples[ch].before_ack;
+	}
+}
+
+static u32
+hws_irq_record_audio(struct hws_pcie_dev *pdx, u32 int_state,
+		     u32 status_after_ack,
+		     struct hws_adone_toggle_sample samples[], u64 timestamp_ns)
 {
 	u32 work_mask = 0;
 	unsigned int ch;
 
 	for (ch = 0; ch < pdx->cur_max_audio_ch; ++ch) {
 		u32 abit = HWS_INT_ADONE_BIT(ch);
-		u8 cur_toggle;
+		enum hws_audio_xrun_reason ambiguity = HWS_AUDIO_XRUN_NONE;
+		u8 first, second;
 
 		if (!(int_state & abit))
 			continue;
@@ -727,17 +752,32 @@ static u32 hws_irq_record_audio(struct hws_pcie_dev *pdx, u32 int_state,
 			continue;
 
 		/*
-		 * Baseline read ABUF_TOGGLE for every ADONE interrupt.
-		 * The register reports the half the device is filling now, so
-		 * the completed packet is the opposite half. Read it in the
-		 * hard handler so the deferred audio work receives the edge's
-		 * toggle value, not a later one.
+		 * Sticky ADONE cannot identify multiple packets. Sample after W1C
+		 * with ordered reads and fail closed if another completion can have
+		 * crossed the acknowledge window.
 		 */
-		cur_toggle = readl_relaxed(pdx->bar0_base +
-					   HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-		if (hws_audio_record_interrupt(pdx, ch, cur_toggle,
-					       timestamp_ns))
+		first = readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+		second = readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+		samples[ch].after_ack = second;
+		samples[ch].post_ack_stable = first == second;
+		samples[ch].status_reasserted = status_after_ack & abit;
+		if (samples[ch].status_reasserted)
+			ambiguity = HWS_AUDIO_XRUN_W1C_STATUS_REASSERTED;
+		else if (!samples[ch].post_ack_stable)
+			ambiguity = HWS_AUDIO_XRUN_W1C_TOGGLE_UNSTABLE;
+		else if (samples[ch].before_ack != samples[ch].after_ack)
+			ambiguity = HWS_AUDIO_XRUN_W1C_TOGGLE_CHANGED;
+
+		if (hws_audio_record_interrupt(pdx, ch, second, timestamp_ns,
+					       ambiguity))
 			work_mask |= BIT(ch);
+		if (ambiguity != HWS_AUDIO_XRUN_NONE)
+			dev_err_ratelimited(&pdx->pdev->dev,
+					    "ADONE ambiguity ch=%u pre_ack=%u post_ack=%u post_stable=%u reasserted=%u\n",
+					    ch, samples[ch].before_ack,
+					    samples[ch].after_ack,
+					    samples[ch].post_ack_stable,
+					    samples[ch].status_reasserted);
 	}
 
 	return work_mask;
@@ -756,6 +796,7 @@ static void hws_irq_queue_audio_work(struct hws_pcie_dev *pdx, u32 work_mask)
 irqreturn_t hws_irq_handler(int irq, void *info)
 {
 	struct hws_pcie_dev *pdx = info;
+	struct hws_adone_toggle_sample audio_samples[MAX_VID_CHANNELS] = { };
 	struct hws_vdone_toggle_sample video_samples[MAX_VID_CHANNELS] = { };
 	u64 timestamp_ns;
 	u32 status_after_ack;
@@ -784,8 +825,10 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	dev_dbg(&pdx->pdev->dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
 
 	hws_irq_sample_video_before_ack(pdx, int_state, video_samples);
-	audio_work = hws_irq_record_audio(pdx, int_state, timestamp_ns);
+	hws_irq_sample_audio_before_ack(pdx, int_state, audio_samples);
 	status_after_ack = hws_irq_ack_status(pdx, int_state);
+	audio_work = hws_irq_record_audio(pdx, int_state, status_after_ack,
+					  audio_samples, timestamp_ns);
 	video_work = hws_irq_record_video(pdx, int_state, status_after_ack,
 					  video_samples, timestamp_ns);
 	/* No DMA-backed copy may start until the sticky causes are acknowledged. */

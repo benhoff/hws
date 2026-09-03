@@ -9,7 +9,8 @@ int hws_audio_register(struct hws_pcie_dev *dev);
 void hws_audio_unregister(struct hws_pcie_dev *hws);
 void hws_audio_seed_channels(struct hws_pcie_dev *hws);
 bool hws_audio_record_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
-				u8 cur_toggle, u64 irq_ns);
+				u8 cur_toggle, u64 irq_ns,
+				enum hws_audio_xrun_reason ambiguity);
 void hws_audio_queue_work(struct hws_pcie_dev *hws, unsigned int ch);
 void hws_audio_drain_work(struct hws_pcie_dev *hws);
 void hws_audio_dma_fault_all(struct hws_pcie_dev *hws);

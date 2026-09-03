@@ -73,23 +73,33 @@ static inline u64 hws_yuyv_packed_size(u32 width, u32 height)
 	return (u64)hws_yuyv_packed_stride(width) * height;
 }
 
+static inline u32 hws_video_native_split(u32 frame_size)
+{
+	return round_down(frame_size / 2, (u32)SZ_2K);
+}
+
+/* Hardware characterization shows a write tail beyond packed sizeimage. */
+#define HWS_VIDEO_DMA_TAIL_BYTES SZ_2K
+
 static inline bool hws_yuyv_layout_valid(const struct hws_pix_state *pix)
 {
 	u64 stride, size;
+	u32 split;
 
-	if (!pix || !pix->width || !pix->height ||
-	    pix->fourcc != V4L2_PIX_FMT_YUYV)
+	if (!pix || pix->fourcc != V4L2_PIX_FMT_YUYV ||
+	    pix->width < MIN_VIDEO_HW_W || pix->width > MAX_VIDEO_HW_W ||
+	    pix->height < MIN_VIDEO_HW_H || pix->height > MAX_VIDEO_HW_H ||
+	    !IS_ALIGNED(pix->width, 2) || pix->interlaced ||
+	    pix->field != V4L2_FIELD_NONE)
 		return false;
 
 	stride = (u64)pix->width * 2;
 	size = stride * pix->height;
+	split = size <= U32_MAX ? hws_video_native_split((u32)size) : 0;
 	return stride <= U32_MAX && size <= U32_MAX &&
-		pix->bytesperline == stride && pix->sizeimage == size;
-}
-
-static inline u32 hws_video_native_split(u32 frame_size)
-{
-	return round_down(frame_size / 2, (u32)SZ_2K);
+		size <= MAX_VIDEO_SCALER_SIZE && split && split < size &&
+		pix->bytesperline == stride && pix->sizeimage == size &&
+		pix->half_size == split;
 }
 
 #define	UNSET	(-1U)
@@ -162,6 +172,7 @@ struct hws_video {
 	struct v4l2_ctrl *ctrl_contrast;
 	struct v4l2_ctrl *ctrl_saturation;
 	struct v4l2_ctrl *ctrl_hue;
+	struct v4l2_ctrl *ctrl_dv_rx_power_present;
 
 	/* Capture queue status */
 	struct hws_pix_state pix;
@@ -219,6 +230,9 @@ enum hws_audio_xrun_reason {
 	HWS_AUDIO_XRUN_DUPLICATE_TOGGLE,
 	HWS_AUDIO_XRUN_IRQ_TIMESTAMP,
 	HWS_AUDIO_XRUN_CADENCE,
+	HWS_AUDIO_XRUN_W1C_STATUS_REASSERTED,
+	HWS_AUDIO_XRUN_W1C_TOGGLE_UNSTABLE,
+	HWS_AUDIO_XRUN_W1C_TOGGLE_CHANGED,
 	HWS_AUDIO_XRUN_WORK_DEADLINE,
 	HWS_AUDIO_XRUN_POST_COPY_TOGGLE,
 	HWS_AUDIO_XRUN_GENERATION,
@@ -230,6 +244,7 @@ enum hws_audio_xrun_reason {
 	HWS_AUDIO_XRUN_SCRATCH_BOUNDS,
 	HWS_AUDIO_XRUN_STAGING_MISSING,
 	HWS_AUDIO_XRUN_WORKQUEUE_MISSING,
+	HWS_AUDIO_XRUN_DMA_GUARD,
 };
 
 struct hws_audio {
@@ -274,12 +289,16 @@ struct hws_audio {
 	u32 primed_packets;
 	u32 dropped_packets;
 	u32 cadence_errors;
+	u32 w1c_ambiguities;
 	u32 toggle_errors;
 	u32 generation_errors;
 	u32 deadline_misses;
+	u32 guard_errors;
+	size_t observed_dma_extent;
 	u64 last_work_latency_ns;
 	u64 max_work_latency_ns;
 	enum hws_audio_xrun_reason xrun_reason;
+	bool scratch_corrupt;
 
 	/* PCM format */
 	u32 output_sample_rate;
@@ -375,6 +394,10 @@ int hws_video_ring_prepare(struct hws_pcie_dev *hws, unsigned int ch,
 			   size_t extent);
 bool hws_video_ring_guards_ok(struct hws_pcie_dev *hws, unsigned int ch,
 			      size_t extent);
+size_t hws_audio_dma_capacity(void);
+int hws_audio_scratch_prepare(struct hws_pcie_dev *hws, unsigned int ch);
+int hws_audio_scratch_verify(struct hws_pcie_dev *hws, unsigned int ch,
+			     size_t *observed_extent);
 int hws_try_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 int hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner, int ch);
 

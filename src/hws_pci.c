@@ -33,6 +33,7 @@
 #define HWS_BUSY_POLL_TIMEOUT_US 1000000
 #define HWS_DMA_IDLE_GRACE_US 100000
 #define HWS_VIDEO_GUARD_POISON 0xa5
+#define HWS_AUDIO_CANARY_SEED 0x6d
 
 static bool hws_enable_audio = true;
 module_param_named(enable_audio, hws_enable_audio, bool, 0444);
@@ -336,12 +337,18 @@ static size_t hws_video_scratch_bytes(void)
 
 static size_t hws_audio_scratch_bytes(void)
 {
-	return ALIGN((size_t)MAX_AUDIO_CAP_SIZE, 64);
+	return hws_audio_dma_capacity() + PAGE_SIZE;
+}
+
+size_t hws_audio_dma_capacity(void)
+{
+	return PAGE_ALIGN((size_t)MAX_AUDIO_CAP_SIZE);
 }
 
 size_t hws_video_ring_capacity(void)
 {
-	return PAGE_ALIGN((size_t)MAX_VIDEO_SCALER_SIZE);
+	return PAGE_ALIGN((size_t)MAX_VIDEO_SCALER_SIZE +
+			  HWS_VIDEO_DMA_TAIL_BYTES);
 }
 
 void *hws_video_ring_cpu(struct hws_pcie_dev *hws, unsigned int ch)
@@ -416,7 +423,10 @@ bool hws_video_ring_guards_ok(struct hws_pcie_dev *hws, unsigned int ch,
 			      size_t extent)
 {
 	struct hws_scratch_dma *arena;
+	u8 *bad;
 	u8 *ring;
+	long leading_bad = -1;
+	long trailing_bad = -1;
 	bool ok;
 
 	if (!hws || ch >= hws->cur_max_video_ch || !PAGE_ALIGNED(extent) ||
@@ -431,12 +441,139 @@ bool hws_video_ring_guards_ok(struct hws_pcie_dev *hws, unsigned int ch,
 	}
 	ring = (u8 *)arena->cpu + PAGE_SIZE;
 	dma_rmb();
-	ok = !memchr_inv(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE) &&
-	     !memchr_inv(ring + extent, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+	bad = memchr_inv(arena->cpu, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+	if (bad)
+		leading_bad = bad - (u8 *)arena->cpu;
+	bad = memchr_inv(ring + extent, HWS_VIDEO_GUARD_POISON, PAGE_SIZE);
+	if (bad)
+		trailing_bad = bad - (ring + extent);
+	ok = leading_bad < 0 && trailing_bad < 0;
 
 out_unlock:
 	mutex_unlock(&hws->scratch_lock);
+	if (!ok)
+		dev_err_ratelimited(&hws->pdev->dev,
+				    "video DMA guard mismatch ch=%u extent=%zu leading_off=%ld trailing_off=%ld\n",
+				    ch, extent, leading_bad, trailing_bad);
 	return ok;
+}
+
+static size_t hws_audio_ring_bytes(void)
+{
+	return 2 * (size_t)MAX_DMA_AUDIO_PK_SIZE;
+}
+
+static u8 hws_audio_canary_value(size_t offset)
+{
+	return HWS_AUDIO_CANARY_SEED ^ (u8)offset ^ (u8)(offset >> 8) ^
+	       (u8)(offset >> 16);
+}
+
+static void hws_audio_fill_canary(u8 *base, size_t first, size_t end)
+{
+	size_t offset;
+
+	for (offset = first; offset < end; offset++)
+		base[offset] = hws_audio_canary_value(offset);
+}
+
+static bool hws_audio_scratch_view_valid(struct hws_pcie_dev *hws,
+					 unsigned int ch)
+{
+	struct hws_scratch_dma *owner = &hws->scratch_vid[ch];
+	struct hws_scratch_dma *audio = &hws->scratch_aud[ch];
+	size_t need = hws_video_scratch_bytes() + hws_audio_scratch_bytes();
+
+	return owner->cpu && owner->size >= need && audio->cpu &&
+	       audio->size == hws_audio_dma_capacity() &&
+	       audio->cpu == (u8 *)owner->cpu + hws_video_scratch_bytes();
+}
+
+int hws_audio_scratch_prepare(struct hws_pcie_dev *hws, unsigned int ch)
+{
+	struct hws_scratch_dma *audio;
+	u8 *base;
+	size_t offset;
+	size_t capacity = hws_audio_dma_capacity();
+	size_t total = hws_audio_scratch_bytes();
+	int ret = 0;
+
+	if (!hws || ch >= hws->cur_max_audio_ch)
+		return -EINVAL;
+
+	mutex_lock(&hws->scratch_lock);
+	if (!hws_audio_scratch_view_valid(hws, ch)) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	audio = &hws->scratch_aud[ch];
+	base = audio->cpu;
+	dma_rmb();
+	if (memchr_inv(base - PAGE_SIZE, HWS_VIDEO_GUARD_POISON, PAGE_SIZE)) {
+		ret = -EOVERFLOW;
+		goto out_unlock;
+	}
+	for (offset = capacity; offset < total; offset++) {
+		if (base[offset] != hws_audio_canary_value(offset)) {
+			ret = -EOVERFLOW;
+			goto out_unlock;
+		}
+	}
+
+	hws_audio_fill_canary(base, hws_audio_ring_bytes(), total);
+	/* Publish padding and trailing-guard canaries before ACAP can start. */
+	dma_wmb();
+
+out_unlock:
+	mutex_unlock(&hws->scratch_lock);
+	return ret;
+}
+
+int hws_audio_scratch_verify(struct hws_pcie_dev *hws, unsigned int ch,
+			     size_t *observed_extent)
+{
+	struct hws_scratch_dma *audio;
+	u8 *base;
+	size_t capacity = hws_audio_dma_capacity();
+	size_t observed = hws_audio_ring_bytes();
+	size_t total = hws_audio_scratch_bytes();
+	size_t offset;
+	bool guard_ok = true;
+	int ret = 0;
+
+	if (observed_extent)
+		*observed_extent = 0;
+	if (!hws || ch >= hws->cur_max_audio_ch)
+		return -EINVAL;
+
+	mutex_lock(&hws->scratch_lock);
+	if (!hws_audio_scratch_view_valid(hws, ch)) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+
+	audio = &hws->scratch_aud[ch];
+	base = audio->cpu;
+	/* The caller must prove DMA idle before this snapshot is authoritative. */
+	dma_rmb();
+	if (memchr_inv(base - PAGE_SIZE, HWS_VIDEO_GUARD_POISON, PAGE_SIZE))
+		guard_ok = false;
+	for (offset = hws_audio_ring_bytes(); offset < total; offset++) {
+		if (base[offset] == hws_audio_canary_value(offset))
+			continue;
+		observed = offset + 1;
+		if (offset >= capacity)
+			guard_ok = false;
+	}
+	if (!guard_ok)
+		ret = -EOVERFLOW;
+
+out_unlock:
+	if (observed_extent)
+		*observed_extent = observed;
+	mutex_unlock(&hws->scratch_lock);
+	return ret;
 }
 
 static void hws_clear_scratch(struct hws_scratch_dma *scratch)
@@ -485,7 +622,7 @@ static void hws_free_channel_scratch_locked(struct hws_pcie_dev *hws,
 
 int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	size_t aud_off = ALIGN(hws_video_scratch_bytes(), 64);
+	size_t aud_off = hws_video_scratch_bytes();
 	size_t arena_need = aud_off;
 	bool has_audio;
 
@@ -501,8 +638,9 @@ int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 	 * One permanent coherent per-channel arena backs the guarded native video
 	 * half-ring and audio DMA. The video region is a leading guard page, the
 	 * maximum page-rounded ring, and a trailing guard page. Audio starts at
-	 * aud_off. The whole arena must fit inside one 512 MiB remap page because
-	 * video and audio share the channel remap slot.
+	 * aud_off with a page-rounded DMA capacity followed by its own canary page.
+	 * The whole arena must fit inside one 512 MiB remap page because video and
+	 * audio share the channel remap slot.
 	 */
 	mutex_lock(&hws->scratch_lock);
 	if (hws->scratch_vid[ch].cpu) {
@@ -545,10 +683,14 @@ int hws_alloc_channel_scratch(struct hws_pcie_dev *hws, unsigned int ch)
 		memset(cpu, HWS_VIDEO_GUARD_POISON, hws_video_scratch_bytes());
 
 		if (has_audio) {
-			hws->scratch_aud[ch].dma = dma + aud_off;
-			hws->scratch_aud[ch].cpu = (u8 *)cpu + aud_off;
-			hws->scratch_aud[ch].size = hws_audio_scratch_bytes();
-			hws->scratch_aud[ch].owned = false;
+			struct hws_scratch_dma *audio = &hws->scratch_aud[ch];
+
+			audio->dma = dma + aud_off;
+			audio->cpu = (u8 *)cpu + aud_off;
+			audio->size = hws_audio_dma_capacity();
+			audio->owned = false;
+			hws_audio_fill_canary(audio->cpu, hws_audio_ring_bytes(),
+					      hws_audio_scratch_bytes());
 		}
 	}
 	hws->scratch_users[ch] = 1;

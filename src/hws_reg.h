@@ -45,6 +45,8 @@
 
 #define MAX_MM_VIDEO_SIZE            SZ_4M
 
+#define MIN_VIDEO_HW_W 640
+#define MIN_VIDEO_HW_H 480
 #define MAX_VIDEO_HW_W 1920
 #define MAX_VIDEO_HW_H 1080
 #define MAX_VIDEO_SCALER_SIZE     (1920U * 1080U * 2U)
