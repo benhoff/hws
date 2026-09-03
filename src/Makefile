@@ -4,7 +4,8 @@ HwsCapture-objs := \
 	 hws_pci.o \
 	 hws_irq.o \
 	 hws_video.o \
-	 hws_v4l2_ioctl.o 
+	 hws_v4l2_ioctl.o \
+	 hws_audio.o
 
 src := $(CURDIR)
 

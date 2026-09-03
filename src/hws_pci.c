@@ -22,6 +22,7 @@
 #include <media/v4l2-ctrls.h>
 
 #include "hws.h"
+#include "hws_audio.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws_irq.h"
@@ -159,6 +160,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 }
 
 static void hws_stop_device(struct hws_pcie_dev *hws);
+static void hws_free_seed_buffers(struct hws_pcie_dev *hws);
 static void hws_publish_stop_flags(struct hws_pcie_dev *hws);
 
 static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
@@ -289,6 +291,21 @@ static void hws_stop_kthread_action(void *data)
 			"lifecycle:kthread-stop:done (%lluus)\n",
 			hws_elapsed_us(start_ns));
 	}
+}
+
+static void hws_destroy_audio_workqueue(struct hws_pcie_dev *hws)
+{
+	struct workqueue_struct *wq;
+
+	if (!hws)
+		return;
+
+	wq = hws->audio_wq;
+	if (!wq)
+		return;
+
+	WRITE_ONCE(hws->audio_wq, NULL);
+	destroy_workqueue(wq);
 }
 
 static size_t hws_video_scratch_bytes(void)
@@ -563,8 +580,13 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 	/* Some probe-unwind paths arrive here without hws_stop_device(). */
 	spin_lock_irqsave(&hws->capture_lock, flags);
 	writel(0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	writel(0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	(void)readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
+	if (hws->irq >= 0)
+		synchronize_irq(hws->irq);
+	if (hws->audio_wq)
+		hws_audio_drain_work(hws);
 	ret = hws_wait_dma_idle(hws, "scratch teardown", -1);
 	if (ret) {
 		dev_crit(&hws->pdev->dev,
@@ -626,23 +648,63 @@ static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 		hws_irq_clear_pending(hws);
 }
 
+static void hws_v4l2_release(struct v4l2_device *v4l2_dev)
+{
+	struct hws_pcie_dev *hws =
+		container_of(v4l2_dev, struct hws_pcie_dev, v4l2_device);
+	unsigned int i;
+
+	/* All video-device references, including open files, are gone. */
+	for (i = 0; i < hws->max_channels; i++) {
+		v4l2_ctrl_handler_free(&hws->video[i].control_handler);
+		mutex_destroy(&hws->video[i].state_lock);
+	}
+
+	v4l2_device_unregister(v4l2_dev);
+	kfree(hws);
+}
+
+/*
+ * Registered before all other managed resources, so this runs after their
+ * teardown. Open V4L2 files keep their own references and defer the final
+ * hws_v4l2_release() until their release paths have finished.
+ */
+static void hws_put_device_action(void *data)
+{
+	struct hws_pcie_dev *hws = data;
+
+	if (hws->pdev && pci_get_drvdata(hws->pdev) == hws)
+		pci_set_drvdata(hws->pdev, NULL);
+
+	if (hws->v4l2_ref_held) {
+		hws->v4l2_ref_held = false;
+		v4l2_device_put(&hws->v4l2_device);
+	} else {
+		kfree(hws);
+	}
+}
+
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 {
 	struct hws_pcie_dev *hws;
 	int i, ret, irq, scratch_ch;
 	unsigned long irqf = 0;
-	bool v4l2_registered = false;
+	bool audio_registered = false;
 
-	/* devres-backed device object */
-	hws = devm_kzalloc(&pdev->dev, sizeof(*hws), GFP_KERNEL);
+	/* V4L2 file handles can outlive PCI remove, so hws cannot be devm-owned. */
+	hws = kzalloc_obj(*hws);
 	if (!hws)
 		return -ENOMEM;
-
 	hws->pdev = pdev;
+	ret = devm_add_action_or_reset(&pdev->dev, hws_put_device_action, hws);
+	if (ret)
+		return ret;
+
 	hws->irq = -1;
 	hws->suspended = false;
 	mutex_init(&hws->monitor_lock);
 	mutex_init(&hws->dma_lock);
+	hws->v4l2_device.release = hws_v4l2_release;
 	mutex_init(&hws->scratch_lock);
 	spin_lock_init(&hws->capture_lock);
 	spin_lock_init(&hws->irq_thread_lock);
@@ -681,6 +743,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 
 	/* 4) Identify chip & capabilities */
 	hws_init_probe_state(hws);
+	hws->audio_pkt_size = MAX_DMA_AUDIO_PK_SIZE;
 	ret = read_chip_id(hws);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
@@ -689,21 +752,30 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		 pdev->vendor, pdev->device);
 	hws_init_video_sys(hws, false);
 
-	/* 5) Init channels (video state, locks, vb2, ctrls) */
+	/* 5) Init channels (video/audio state, locks, vb2, ctrls) */
 	for (i = 0; i < hws->max_channels; i++) {
 		ret = hws_video_init_channel(hws, i);
 		if (ret) {
 			dev_err(&pdev->dev, "video channel init failed (ch=%d)\n", i);
 			goto err_unwind_channels;
 		}
+		ret = hws_audio_init_channel(hws, i);
+		if (ret) {
+			dev_err(&pdev->dev, "audio channel init failed (ch=%d)\n", i);
+			hws_video_cleanup_channel(hws, i);
+			goto err_unwind_channels;
+		}
 	}
 
 	/*
-	 * Allocate every channel's guarded DMA arena before publishing V4L2
-	 * nodes. These mappings remain stable until PCI teardown; stream users
-	 * only take and drop references to them.
+	 * Allocate every channel's guarded DMA arena before publishing ALSA or
+	 * V4L2 nodes. These mappings remain stable until PCI teardown; stream
+	 * users only take and drop references to them.
 	 */
-	for (scratch_ch = 0; scratch_ch < hws->cur_max_video_ch; scratch_ch++) {
+	for (scratch_ch = 0;
+	     scratch_ch < max_t(unsigned int, hws->cur_max_video_ch,
+				 hws->cur_max_audio_ch);
+	     scratch_ch++) {
 		ret = hws_alloc_channel_scratch(hws, scratch_ch);
 		if (ret) {
 			dev_err(&pdev->dev,
@@ -712,6 +784,19 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 			goto err_unwind_channels;
 		}
 		hws_release_channel_scratch(hws, scratch_ch, true);
+	}
+
+	if (hws->cur_max_audio_ch) {
+		hws->audio_wq = alloc_workqueue("hws-audio",
+						WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM,
+						0);
+		if (!hws->audio_wq) {
+			ret = -ENOMEM;
+			dev_err(&pdev->dev, "audio workqueue allocation failed\n");
+			goto err_unwind_channels;
+		}
+	} else {
+		dev_info(&pdev->dev, "audio capture disabled; video-only mode\n");
 	}
 
 	/* 6) Start-run sequence with the permanent DMA arenas retained. */
@@ -755,43 +840,61 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	dev_info(&pdev->dev, "INT_EN_GATE readback=0x%08x\n",
 		 readl(hws->bar0_base + INT_EN_REG_BASE));
 
-	/* 11) Register V4L2 */
-	ret = hws_video_register(hws);
-	if (ret) {
-		dev_err(&pdev->dev, "video_register: %d\n", ret);
-		goto err_unwind_channels;
-	}
-	v4l2_registered = true;
-
-	/* 12) Background monitor thread (managed) */
+	/* 11) Finish private initialization before exposing user-visible nodes. */
 	hws->main_task = kthread_run(main_ks_thread_handle, hws, "hws-mon");
 	if (IS_ERR(hws->main_task)) {
 		ret = PTR_ERR(hws->main_task);
 		hws->main_task = NULL;
 		dev_err(&pdev->dev, "kthread_run: %d\n", ret);
-		goto err_unregister_va;
+		goto err_stop_private;
 	}
 	ret = devm_add_action_or_reset(&pdev->dev, hws_stop_kthread_action, hws);
 	if (ret) {
 		dev_err(&pdev->dev, "devm_add_action kthread_stop: %d\n", ret);
-		goto err_unregister_va; /* reset already stopped the thread */
+		goto err_stop_private; /* reset already stopped the thread */
+	}
+
+	/* 12) Register ALSA before making V4L2 the final visible interface. */
+	ret = hws_audio_register(hws);
+	if (ret) {
+		dev_err(&pdev->dev, "audio_register: %d\n", ret);
+		goto err_stop_private;
+	}
+	audio_registered = !!hws->snd_card;
+
+	ret = hws_video_register(hws);
+	if (ret) {
+		dev_err(&pdev->dev, "video_register: %d\n", ret);
+		goto err_stop_private;
 	}
 
 	/* 13) Final: show the line is armed */
 	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
 	return 0;
 
-err_unregister_va:
+err_stop_private:
+	hws_block_hotpaths(hws);
+	hws_stop_kthread_action(hws);
 	hws_stop_device(hws);
-	hws_video_unregister(hws);
+	if (audio_registered)
+		hws_audio_unregister(hws);
 	hws_free_seed_buffers(hws);
+	/* V4L2 owns initialized channel state once its parent ref is live. */
+	if (!hws->v4l2_ref_held) {
+		while (--i >= 0) {
+			hws_video_cleanup_channel(hws, i);
+			hws_audio_cleanup_channel(hws, i, true);
+		}
+	}
+	hws_destroy_audio_workqueue(hws);
 	return ret;
 err_unwind_channels:
 	hws_free_seed_buffers(hws);
-	if (!v4l2_registered) {
-		while (--i >= 0)
-			hws_video_cleanup_channel(hws, i);
+	while (--i >= 0) {
+		hws_video_cleanup_channel(hws, i);
+		hws_audio_cleanup_channel(hws, i, true);
 	}
+	hws_destroy_audio_workqueue(hws);
 	return ret;
 }
 
@@ -839,7 +942,7 @@ static void hws_fail_active_video_queues(struct hws_pcie_dev *hws)
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 		struct hws_video *vid = &hws->video[ch];
 
-		if (vid->video_device && video_is_registered(vid->video_device) &&
+		if (vid->queue_initialized &&
 		    vb2_is_streaming(&vid->buffer_queue))
 			vb2_queue_error(&vid->buffer_queue);
 	}
@@ -913,12 +1016,16 @@ static int hws_force_dma_quiesce_locked(struct hws_pcie_dev *hws,
 
 	spin_lock_irqsave(&hws->capture_lock, flags);
 	writel(0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	writel(0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	(void)readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
 
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
+	if (hws->audio_wq)
+		hws_audio_drain_work(hws);
 	hws_fail_active_video_queues(hws);
+	hws_audio_dma_fault_all(hws);
 
 	ret = hws_poll_dma_idle(hws, HWS_BUSY_POLL_TIMEOUT_US, &status);
 	if (!ret)
@@ -1008,7 +1115,7 @@ static void hws_stop_dsp(struct hws_pcie_dev *hws)
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 }
 
-/* Publish stop so ISR/BH will not touch video buffers anymore. */
+/* Publish stop so ISR/BH will not touch ALSA/VB2 anymore. */
 static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 {
 	unsigned int i;
@@ -1018,6 +1125,14 @@ static void hws_publish_stop_flags(struct hws_pcie_dev *hws)
 
 		WRITE_ONCE(v->cap_active,     false);
 		WRITE_ONCE(v->stop_requested, true);
+	}
+
+	for (i = 0; i < hws->cur_max_audio_ch; ++i) {
+		struct hws_audio *a = &hws->audio[i];
+
+		WRITE_ONCE(a->stream_running, false);
+		WRITE_ONCE(a->cap_active, false);
+		WRITE_ONCE(a->stop_requested, true);
 	}
 
 	smp_wmb(); /* make flags visible before we touch MMIO/queues */
@@ -1035,7 +1150,8 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 	/* Mask device enables: no new DMA starts. */
 	spin_lock_irqsave(&hws->capture_lock, flags);
 	writel(0x0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
-	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	writel(0x0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	(void)readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
 
 	/* Do not release any DMA-owned memory until the engine is idle. */
@@ -1043,9 +1159,11 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 	if (!ret)
 		WRITE_ONCE(hws->dma_quiesced, true);
 
-	/* Ack any latched VDONE. */
+	/* Ack any latched VDONE/ADONE. */
 	for (i = 0; i < hws->cur_max_video_ch; ++i)
 		ackmask |= HWS_INT_VDONE_BIT(i);
+	for (i = 0; i < hws->cur_max_audio_ch; ++i)
+		ackmask |= HWS_INT_ADONE_BIT(i);
 	if (ackmask) {
 		writel(ackmask, hws->bar0_base + HWS_REG_INT_STATUS);
 		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
@@ -1054,6 +1172,7 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 	/* Ensure no hard IRQ is still running. */
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
+	hws_audio_drain_work(hws);
 
 	dev_dbg(&hws->pdev->dev, "lifecycle:drain-after-stop:done (%lluus)\n",
 		hws_elapsed_us(start_ns));
@@ -1156,11 +1275,15 @@ static void hws_remove(struct pci_dev *pdev)
 	hws_block_hotpaths(hws);
 	hws_stop_kthread_action(hws);
 
+	/* Prevent new V4L2 opens before any teardown operation can wait. */
+	hws_video_unregister(hws);
+
 	/* Stop hardware and capture cleanly. */
 	hws_stop_device(hws);
 
-	/* Unregister V4L2 resources. */
-	hws_video_unregister(hws);
+	/* snd_card_free() may wait for existing audio file descriptors. */
+	hws_audio_unregister(hws);
+	hws_destroy_audio_workqueue(hws);
 
 	/* Release seeded DMA buffers */
 	hws_free_seed_buffers(hws);
@@ -1175,11 +1298,16 @@ static int hws_pm_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct hws_pcie_dev *hws = pci_get_drvdata(pdev);
+	int aret;
 	int vret;
 	u64 start_ns = ktime_get_mono_fast_ns();
 	u64 step_ns;
 
 	dev_info(dev, "lifecycle:pm_suspend begin\n");
+	aret = hws_audio_pm_suspend_all(hws);
+	if (aret)
+		dev_warn(dev, "lifecycle:pm_suspend audio quiesce returned %d\n",
+			 aret);
 	vret = hws_quiesce_for_transition(hws, "pm_suspend", false);
 
 	step_ns = ktime_get_mono_fast_ns();
@@ -1233,6 +1361,7 @@ static int hws_pm_resume(struct device *dev)
 	}
 	/* Restart the capture core and restore any retained DMA windows. */
 	hws_init_video_sys(hws, true);
+	hws_audio_pm_resume(hws);
 	hws_irq_clear_pending(hws);
 	/* The engines are initialized and idle; allow future stream starts. */
 	mutex_lock(&hws->dma_lock);

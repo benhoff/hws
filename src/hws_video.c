@@ -25,6 +25,7 @@
 #include "hws.h"
 #include "hws_reg.h"
 #include "hws_video.h"
+#include "hws_audio.h"
 #include "hws_irq.h"
 #include "hws_v4l2_ioctl.h"
 
@@ -247,6 +248,7 @@ static bool hws_force_no_signal_frame(struct hws_video *v, const char *tag)
 		goto fail_buffer;
 	if (!buf)
 		goto restart_capture;
+
 	/* Complete buffer with a neutral frame so dequeuers keep running. */
 	{
 		struct vb2_v4l2_buffer *vb2v = &buf->vb;
@@ -444,18 +446,20 @@ static void hws_video_drain_queue_locked(struct hws_video *vid)
 
 static void hws_video_release_registration(struct hws_video *vid)
 {
-	if (vid->buffer_queue.ops) {
-		vb2_queue_release(&vid->buffer_queue);
-		vid->buffer_queue.ops = NULL;
-	}
-
 	if (!vid->video_device)
 		return;
 
-	if (video_is_registered(vid->video_device))
+	if (video_is_registered(vid->video_device)) {
+		/* Unpublish first, then release the queue under its file-op lock. */
 		vb2_video_unregister_device(vid->video_device);
-	else
+	} else {
+		/* A never-published node cannot have an open file descriptor. */
+		if (vid->queue_initialized)
+			vb2_queue_release(&vid->buffer_queue);
 		video_device_release(vid->video_device);
+	}
+
+	vid->queue_initialized = false;
 	vid->video_device = NULL;
 }
 
@@ -616,7 +620,6 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	status = on ? (status | BIT(chan)) : (status & ~BIT(chan));
 	writel(status, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	(void)readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
-
 	WRITE_ONCE(hws->video[chan].cap_active, on);
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
 
@@ -729,12 +732,14 @@ void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable)
 	/* 1) reset the decoder mode register to 0 */
 	writel(0x00000000, hws->bar0_base + HWS_REG_DEC_MODE);
 	hws_seed_dma_windows(hws);
+	hws_audio_seed_channels(hws);
 
 	/* 3) on a full reset, clear all per-channel status and indices */
 	if (!enable) {
 		for (i = 0; i < hws->max_channels; i++) {
 			/* helpers to arm/disable capture engines */
 			hws_enable_video_capture(hws, i, false);
+			hws_enable_audio_capture(hws, i, false);
 		}
 	}
 
@@ -1432,7 +1437,9 @@ int hws_video_register(struct hws_pcie_dev *dev)
 			ret);
 		return ret;
 	}
+	dev->v4l2_ref_held = true;
 
+	/* Prepare every channel before publishing the first device node. */
 	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
 		struct video_device *vdev;
@@ -1494,6 +1501,7 @@ int hws_video_register(struct hws_pcie_dev *dev)
 				"vb2_queue_init ch%u failed: %d\n", i, ret);
 			goto err_unwind;
 		}
+		ch->queue_initialized = true;
 
 		/* Make controls live (no-op if none or already set up) */
 		if (ch->control_handler.error) {
@@ -1502,7 +1510,17 @@ int hws_video_register(struct hws_pcie_dev *dev)
 				"ctrl handler ch%u error: %d\n", i, ret);
 			goto err_unwind;
 		}
-		v4l2_ctrl_handler_setup(&ch->control_handler);
+		ret = v4l2_ctrl_handler_setup(&ch->control_handler);
+		if (ret) {
+			dev_err(&dev->pdev->dev,
+				"ctrl handler setup ch%u failed: %d\n", i, ret);
+			goto err_unwind;
+		}
+	}
+
+	for (i = 0; i < dev->cur_max_video_ch; i++) {
+		struct video_device *vdev = dev->video[i].video_device;
+
 		ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 		if (ret) {
 			dev_err(&dev->pdev->dev,
@@ -1515,12 +1533,11 @@ int hws_video_register(struct hws_pcie_dev *dev)
 	return 0;
 
 err_unwind:
-	for (; i >= 0; i--) {
+	for (i = 0; i < dev->cur_max_video_ch; i++) {
 		struct hws_video *ch = &dev->video[i];
 
 		hws_video_release_registration(ch);
 	}
-	v4l2_device_unregister(&dev->v4l2_device);
 	return ret;
 }
 
@@ -1535,9 +1552,7 @@ void hws_video_unregister(struct hws_pcie_dev *dev)
 		struct hws_video *ch = &dev->video[i];
 
 		hws_video_release_registration(ch);
-		v4l2_ctrl_handler_free(&ch->control_handler);
 	}
-	v4l2_device_unregister(&dev->v4l2_device);
 }
 
 int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
@@ -1553,7 +1568,7 @@ int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason)
 		u64 ch_start_ns = ktime_get_mono_fast_ns();
 		bool streaming;
 
-		if (!q || !q->ops) {
+		if (!vid->queue_initialized) {
 			dev_dbg(&hws->pdev->dev,
 				"video:%s:ch=%d skipped queue-unavailable\n",
 				reason, i);
