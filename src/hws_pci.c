@@ -313,6 +313,22 @@ static void hws_destroy_audio_workqueue(struct hws_pcie_dev *hws)
 	destroy_workqueue(wq);
 }
 
+static void hws_destroy_video_workqueue(struct hws_pcie_dev *hws)
+{
+	struct workqueue_struct *wq;
+
+	if (!hws)
+		return;
+
+	wq = hws->video_wq;
+	if (!wq)
+		return;
+
+	hws_video_drain_work(hws);
+	WRITE_ONCE(hws->video_wq, NULL);
+	destroy_workqueue(wq);
+}
+
 static size_t hws_video_scratch_bytes(void)
 {
 	return PAGE_SIZE + hws_video_ring_capacity() + PAGE_SIZE;
@@ -590,6 +606,7 @@ static void hws_free_seed_buffers(struct hws_pcie_dev *hws)
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
+	hws_video_drain_work(hws);
 	if (hws->audio_wq)
 		hws_audio_drain_work(hws);
 	ret = hws_wait_dma_idle(hws, "scratch teardown", -1);
@@ -696,6 +713,9 @@ static void hws_block_hotpaths(struct hws_pcie_dev *hws)
 	mutex_lock(&hws->monitor_lock);
 	mutex_unlock(&hws->monitor_lock);
 
+	/* The monitor can stop/restart a channel, so drain only after it exits. */
+	hws_video_drain_work(hws);
+
 	if (hws->bar0_base)
 		hws_irq_clear_pending(hws);
 }
@@ -759,7 +779,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	hws->v4l2_device.release = hws_v4l2_release;
 	mutex_init(&hws->scratch_lock);
 	spin_lock_init(&hws->capture_lock);
-	spin_lock_init(&hws->irq_thread_lock);
 	pci_set_drvdata(pdev, hws);
 
 	/* 1) Enable device + bus mastering (managed) */
@@ -838,6 +857,15 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		hws_release_channel_scratch(hws, scratch_ch, true);
 	}
 
+	hws->video_wq = alloc_workqueue("hws-video",
+					WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM,
+					hws->cur_max_video_ch);
+	if (!hws->video_wq) {
+		ret = -ENOMEM;
+		dev_err(&pdev->dev, "video workqueue allocation failed\n");
+		goto err_unwind_channels;
+	}
+
 	if (hws->cur_max_audio_ch) {
 		hws->audio_wq = alloc_workqueue("hws-audio",
 						WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM,
@@ -866,12 +894,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	/* C) Clear any sticky pending interrupt status (W1C) before we arm the line */
 	hws_irq_clear_pending(hws);
 
-	/* D) Install the same demultiplexing handler for MSI or INTx. */
-	ret = devm_request_threaded_irq(&pdev->dev, irq, hws_irq_handler,
-					hws_irq_thread, irqf, dev_name(&pdev->dev),
-					hws);
+	/* D) The hard handler demultiplexes causes into per-channel workers. */
+	ret = devm_request_irq(&pdev->dev, irq, hws_irq_handler, irqf,
+			       dev_name(&pdev->dev), hws);
 	if (ret) {
-		dev_err(&pdev->dev, "request_threaded_irq(%d) failed: %d\n",
+		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n",
 			irq, ret);
 		goto err_unwind_channels;
 	}
@@ -938,6 +965,7 @@ err_stop_private:
 		}
 	}
 	hws_destroy_audio_workqueue(hws);
+	hws_destroy_video_workqueue(hws);
 	return ret;
 err_unwind_channels:
 	hws_free_seed_buffers(hws);
@@ -946,6 +974,7 @@ err_unwind_channels:
 		hws_audio_cleanup_channel(hws, i, true);
 	}
 	hws_destroy_audio_workqueue(hws);
+	hws_destroy_video_workqueue(hws);
 	return ret;
 }
 
@@ -1073,6 +1102,7 @@ static int hws_force_dma_quiesce_locked(struct hws_pcie_dev *hws,
 
 	if (hws->irq >= 0)
 		synchronize_irq(hws->irq);
+	hws_video_drain_work(hws);
 	if (hws->audio_wq)
 		hws_audio_drain_work(hws);
 	hws_fail_active_video_queues(hws);
@@ -1205,6 +1235,12 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 	(void)readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
 
+	/* No new hard IRQ can queue work after the published stop. */
+	if (hws->irq >= 0)
+		synchronize_irq(hws->irq);
+	hws_video_drain_work(hws);
+	hws_audio_drain_work(hws);
+
 	/* Do not release any DMA-owned memory until the engine is idle. */
 	ret = hws_wait_dma_idle(hws, "device stop", -1);
 	if (!ret)
@@ -1219,11 +1255,6 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 		writel(ackmask, hws->bar0_base + HWS_REG_INT_STATUS);
 		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 	}
-
-	/* Ensure no hard IRQ is still running. */
-	if (hws->irq >= 0)
-		synchronize_irq(hws->irq);
-	hws_audio_drain_work(hws);
 
 	dev_dbg(&hws->pdev->dev, "lifecycle:drain-after-stop:done (%lluus)\n",
 		hws_elapsed_us(start_ns));
@@ -1338,6 +1369,7 @@ static void hws_remove(struct pci_dev *pdev)
 
 	/* Release seeded DMA buffers */
 	hws_free_seed_buffers(hws);
+	hws_destroy_video_workqueue(hws);
 	/* kthread is stopped by the devm action registered in probe. */
 	hws_log_lifecycle_snapshot(hws, "remove", "end");
 	dev_info(&pdev->dev, "lifecycle:remove done (%lluus)\n",

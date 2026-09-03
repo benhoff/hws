@@ -229,9 +229,6 @@ static const struct hws_dv_mode hws_dv_modes[] = {
 
 static const size_t hws_dv_modes_cnt = ARRAY_SIZE(hws_dv_modes);
 
-/* YUYV: 16 bpp; align to 64 as you did elsewhere */
-static inline u32 hws_calc_bpl_yuyv(u32 w)     { return ALIGN(w * 2, 64); }
-static inline u32 hws_calc_size_yuyv(u32 w, u32 h) { return hws_calc_bpl_yuyv(w) * h; }
 static inline u32 hws_calc_half_size(u32 sizeimage)
 {
 	return hws_video_native_split(sizeimage);
@@ -591,8 +588,8 @@ int hws_vidioc_s_dv_timings(struct file *file, void *fh,
 	hws_set_colorimetry_state(&vid->pix);
 
 	/* Recompute stride, sizeimage, and half_size. */
-	vid->pix.bytesperline = hws_calc_bpl_yuyv(new_w);
-	vid->pix.sizeimage    = hws_calc_size_yuyv(new_w, new_h);
+	vid->pix.bytesperline = hws_yuyv_packed_stride(new_w);
+	vid->pix.sizeimage = (u32)hws_yuyv_packed_size(new_w, new_h);
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->cur_dv_timings   = m->timings;
 	vid->current_fps      = m->refresh_hz;
@@ -747,8 +744,8 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	struct hws_pcie_dev *pdev = vid ? vid->parent : NULL;
 	struct v4l2_pix_format *pix = &f->fmt.pix;
 	u32 req_w = pix->width, req_h = pix->height;
-	u32 w, h, min_bpl, bpl;
-	size_t size; /* wider than u32 for overflow check */
+	u32 w, h, bpl;
+	u64 size;
 	size_t max_frame = pdev ? pdev->max_hw_video_buf_sz : MAX_MM_VIDEO_SIZE;
 
 	/* Only YUYV */
@@ -769,45 +766,16 @@ int hws_vidioc_try_fmt_vid_cap(struct file *file, void *fh, struct v4l2_format *
 	/* Field policy */
 	pix->field = V4L2_FIELD_NONE;
 
-	/* Stride policy for packed 16bpp, 64B align */
-	min_bpl = ALIGN(w * 2, 64);
-
-	/* Bound requested bpl to something sane, then align */
-	bpl = pix->bytesperline;
-	if (bpl < min_bpl) {
-		bpl = min_bpl;
-	} else {
-		/* Cap at 16x width to avoid silly values that overflow sizeimage */
-		u32 max_bpl = ALIGN(w * 2 * 16, 64);
-
-		if (bpl > max_bpl)
-			bpl = max_bpl;
-		bpl = ALIGN(bpl, 64);
-	}
-	if (h && max_frame) {
-		size_t max_bpl_hw = max_frame / h;
-
-		if (max_bpl_hw < min_bpl)
-			return -ERANGE;
-		max_bpl_hw = rounddown(max_bpl_hw, 64);
-		if (!max_bpl_hw)
-			return -ERANGE;
-		if (bpl > max_bpl_hw) {
-			if (pdev)
-				dev_dbg(&pdev->pdev->dev,
-					"try_fmt: clamp bpl %u -> %zu due to hw buf cap %zu\n",
-					bpl, max_bpl_hw, max_frame);
-			bpl = (u32)max_bpl_hw;
-		}
-	}
-	size = (size_t)bpl * (size_t)h;
-	if (size > max_frame)
+	/* Ignore requested padding: the hardware and API layout is packed YUYV. */
+	bpl = hws_yuyv_packed_stride(w);
+	size = hws_yuyv_packed_size(w, h);
+	if (size > U32_MAX || size > max_frame)
 		return -ERANGE;
 
 	pix->width        = w;
 	pix->height       = h;
 	pix->bytesperline = bpl;
-	pix->sizeimage    = (u32)size; /* logical size, not page-aligned */
+	pix->sizeimage    = (u32)size;
 
 	hws_set_colorimetry_fmt(pix);
 	if (pdev)
@@ -850,8 +818,9 @@ int hws_vidioc_s_fmt_vid_cap(struct file *file, void *priv, struct v4l2_format *
 	vid->pix.xfer_func    = f->fmt.pix.xfer_func;
 
 	/* Update negotiated buffer sizes. */
-	vid->pix.bytesperline = f->fmt.pix.bytesperline; /* aligned */
-	vid->pix.sizeimage    = f->fmt.pix.sizeimage;    /* logical */
+	vid->pix.bytesperline = hws_yuyv_packed_stride(vid->pix.width);
+	vid->pix.sizeimage = (u32)hws_yuyv_packed_size(vid->pix.width,
+							vid->pix.height);
 	vid->pix.half_size    = hws_calc_half_size(vid->pix.sizeimage);
 	vid->pix.interlaced   = false;
 	/* S_FMT negotiates buffer layout only. Keep detector-owned DV timing

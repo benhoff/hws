@@ -17,6 +17,8 @@ int hws_check_card_status(struct hws_pcie_dev *hws);
 void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable);
 
 void hws_video_fail_queue(struct hws_video *vid, const char *reason);
+void hws_video_drain_channel_work(struct hws_video *vid);
+void hws_video_drain_work(struct hws_pcie_dev *hws);
 
 int hws_video_quiesce(struct hws_pcie_dev *hws, const char *reason);
 void hws_video_pm_resume(struct hws_pcie_dev *hws);

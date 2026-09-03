@@ -47,6 +47,30 @@ struct hws_pix_state {
 	u32 half_size;		/* hardware half-frame size */
 };
 
+static inline u32 hws_yuyv_packed_stride(u32 width)
+{
+	return width * 2;
+}
+
+static inline u64 hws_yuyv_packed_size(u32 width, u32 height)
+{
+	return (u64)hws_yuyv_packed_stride(width) * height;
+}
+
+static inline bool hws_yuyv_layout_valid(const struct hws_pix_state *pix)
+{
+	u64 stride, size;
+
+	if (!pix || !pix->width || !pix->height ||
+	    pix->fourcc != V4L2_PIX_FMT_YUYV)
+		return false;
+
+	stride = (u64)pix->width * 2;
+	size = stride * pix->height;
+	return stride <= U32_MAX && size <= U32_MAX &&
+		pix->bytesperline == stride && pix->sizeimage == size;
+}
+
 static inline u32 hws_video_native_split(u32 frame_size)
 {
 	return round_down(frame_size / 2, (u32)SZ_2K);
@@ -84,6 +108,7 @@ struct hws_video {
 	struct vb2_queue buffer_queue;
 	bool queue_initialized;
 	struct list_head capture_queue;
+	struct work_struct vdone_work;
 	/* VB2 buffer receiving the current ordered half pair. */
 	struct hwsvideo_buffer *active;
 	u64 completion_timestamp_ns;
@@ -94,6 +119,7 @@ struct hws_video {
 	u8 completion_toggle;
 	enum hws_video_half_phase half_phase;
 	u8 sync_events;
+	u8 sync_restart_streak;
 	u64 phase_generation;
 	u64 frame_generation;
 	bool frame_half0_valid;
@@ -142,6 +168,9 @@ struct hws_video {
 	u32 error_count;
 	u32 completion_overruns;
 	u32 w1c_ambiguities;
+	u32 toggle_resamples;
+	u32 toggle_sample_errors;
+	u32 sync_restarts;
 	u32 phase_errors;
 	u32 deadline_misses;
 	u32 copy_mismatches;
@@ -168,13 +197,18 @@ enum hws_audio_xrun_reason {
 	HWS_AUDIO_XRUN_NONE,
 	HWS_AUDIO_XRUN_PACKET_IN_FLIGHT,
 	HWS_AUDIO_XRUN_DUPLICATE_TOGGLE,
+	HWS_AUDIO_XRUN_IRQ_TIMESTAMP,
+	HWS_AUDIO_XRUN_CADENCE,
 	HWS_AUDIO_XRUN_WORK_DEADLINE,
+	HWS_AUDIO_XRUN_POST_COPY_TOGGLE,
+	HWS_AUDIO_XRUN_GENERATION,
 	HWS_AUDIO_XRUN_STREAM_STATE,
 	HWS_AUDIO_XRUN_SUBSTREAM_MISSING,
 	HWS_AUDIO_XRUN_RUNTIME_MISSING,
 	HWS_AUDIO_XRUN_RING_INVALID,
 	HWS_AUDIO_XRUN_SCRATCH_MISSING,
 	HWS_AUDIO_XRUN_SCRATCH_BOUNDS,
+	HWS_AUDIO_XRUN_STAGING_MISSING,
 	HWS_AUDIO_XRUN_WORKQUEUE_MISSING,
 };
 
@@ -209,6 +243,8 @@ struct hws_audio {
 	snd_pcm_uframes_t period_used_byframes;
 	size_t frame_bytes;
 	size_t hw_packet_bytes;
+	void *staging_buffer;
+	size_t staging_size;
 
 	/* stream state */
 	bool cap_active;
@@ -220,14 +256,24 @@ struct hws_audio {
 
 	/* minimal HW packet tracking */
 	struct work_struct deliver_work;
-	spinlock_t pending_lock; /* protects packet state/toggles/IRQ timestamp */
+	spinlock_t pending_lock; /* protects packet/cadence/generation state */
 	enum hws_audio_packet_state packet_state;
 	u8 pending_toggle;
+	bool pending_publish;
 	u64 pending_irq_ns;
+	u64 pending_generation;
+	u64 next_generation;
 	u8 last_irq_toggle;
+	u64 last_irq_ns;
+	u64 last_irq_interval_ns;
 	u32 irq_count;
 	u32 delivered_count;
+	u32 primed_packets;
 	u32 dropped_packets;
+	u32 cadence_errors;
+	u32 toggle_errors;
+	u32 generation_errors;
+	u32 deadline_misses;
 	u64 last_work_latency_ns;
 	u64 max_work_latency_ns;
 	enum hws_audio_xrun_reason xrun_reason;
@@ -253,6 +299,7 @@ struct hws_pcie_dev {
 
 	/* BAR and workqueues */
 	void __iomem *bar0_base;
+	struct workqueue_struct *video_wq;
 	struct workqueue_struct *audio_wq;
 
 	/* Device identity and capabilities */
@@ -294,8 +341,6 @@ struct hws_pcie_dev {
 	bool suspended;
 	int irq;
 	spinlock_t capture_lock; /* serializes capture-enable register updates */
-	spinlock_t irq_thread_lock; /* protects threaded video IRQ work flags */
-	bool irq_pending_vdone[MAX_VID_CHANNELS];
 
 	/* Error flags */
 	int pci_lost;
