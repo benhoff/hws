@@ -214,12 +214,14 @@ static void hws_audio_program_remap_slot(struct hws_pcie_dev *hws,
 }
 
 static int hws_audio_seed_capture_buffer_locked(struct hws_pcie_dev *hws,
-						unsigned int ch)
+						unsigned int ch,
+						bool require_base_readback)
 {
 	struct hws_video *vid;
 	dma_addr_t dma;
 	u32 lo, hi, pci_addr;
 	u32 audio_table_off;
+	u32 readback;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
@@ -238,7 +240,44 @@ static int hws_audio_seed_capture_buffer_locked(struct hws_pcie_dev *hws,
 	hws_audio_program_remap_slot(hws, audio_table_off, hi, lo);
 	writel_relaxed((ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
 		       hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
-	(void)readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
+	readback = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
+			 audio_table_off);
+	if (readback == U32_MAX)
+		return -ENODEV;
+	if (readback != hi) {
+		dev_err(&hws->pdev->dev,
+			"audio seed ch%u remap-hi mismatch: expected=0x%08x actual=0x%08x\n",
+			ch, hi, readback);
+		return -EIO;
+	}
+	readback = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
+			 audio_table_off + PCIE_BARADDROFSIZE);
+	if (readback == U32_MAX)
+		return -ENODEV;
+	if (readback != lo) {
+		dev_err(&hws->pdev->dev,
+			"audio seed ch%u remap-lo mismatch: expected=0x%08x actual=0x%08x\n",
+			ch, lo, readback);
+		return -EIO;
+	}
+	readback = readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
+	if (readback == U32_MAX)
+		return -ENODEV;
+	/*
+	 * Idle inputs on this hardware can read their audio DMA base back as
+	 * zero even though the write is accepted.  Probe and resume leave every
+	 * producer disabled, so the exact remap-table checks above are the
+	 * durable restoration proof there.  A stream start must still prove the
+	 * base register itself before ACAP_ENABLE can arm DMA.
+	 */
+	if (require_base_readback &&
+	    readback != (ch + 1u) * PCIEBAR_AXI_BASE + pci_addr) {
+		dev_err(&hws->pdev->dev,
+			"audio seed ch%u DMA-base mismatch: expected=0x%08x actual=0x%08x\n",
+			ch, (ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
+			readback);
+		return -EIO;
+	}
 	return 0;
 }
 
@@ -271,7 +310,7 @@ static int hws_audio_seed_capture_buffer(struct hws_pcie_dev *hws,
 
 	vid = &hws->video[ch];
 	spin_lock_irqsave(&vid->irq_lock, flags);
-	ret = hws_audio_seed_capture_buffer_locked(hws, ch);
+	ret = hws_audio_seed_capture_buffer_locked(hws, ch, false);
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 	return ret;
 }
@@ -290,17 +329,18 @@ static int hws_audio_guard_and_seed_capture_buffer(struct hws_pcie_dev *hws,
 	spin_lock_irqsave(&vid->irq_lock, flags);
 	ret = hws_guard_audio_video_remap_page_locked(hws, ch);
 	if (!ret)
-		ret = hws_audio_seed_capture_buffer_locked(hws, ch);
+		ret = hws_audio_seed_capture_buffer_locked(hws, ch, true);
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 	return ret;
 }
 
-void hws_audio_seed_channels(struct hws_pcie_dev *hws)
+int hws_audio_seed_channels(struct hws_pcie_dev *hws)
 {
 	unsigned int ch;
+	int first_error = 0;
 
 	if (!hws || !hws->bar0_base)
-		return;
+		return -ENODEV;
 
 	/* Match scratch teardown's scratch_lock -> channel irq_lock order. */
 	mutex_lock(&hws->scratch_lock);
@@ -311,11 +351,15 @@ void hws_audio_seed_channels(struct hws_pcie_dev *hws)
 			continue;
 
 		ret = hws_audio_seed_capture_buffer(hws, ch);
-		if (ret)
+		if (ret) {
 			dev_warn(&hws->pdev->dev,
 				 "audio seed ch%u failed ret=%d\n", ch, ret);
+			if (!first_error)
+				first_error = ret;
+		}
 	}
 	mutex_unlock(&hws->scratch_lock);
+	return first_error;
 }
 
 static size_t hws_audio_packet_offset(const struct hws_audio *a, u8 cur_toggle)
@@ -1454,19 +1498,36 @@ static void hws_audio_disable_capture_and_ack(struct hws_pcie_dev *hws,
 	hws_audio_ack_pending(hws, ch);
 }
 
-static inline void hws_audio_ack_all(struct hws_pcie_dev *hws)
+static inline int hws_audio_ack_all(struct hws_pcie_dev *hws)
 {
 	u32 mask = 0;
+	u32 pending = 0;
+	unsigned int attempt;
 
 	if (!hws || !hws->bar0_base)
-		return;
+		return -ENODEV;
 
 	for (unsigned int ch = 0; ch < hws->cur_max_audio_ch; ch++)
 		mask |= HWS_INT_ADONE_BIT(ch);
-	if (mask) {
-		writel(mask, hws->bar0_base + HWS_REG_INT_ACK);
-		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	for (attempt = 0; attempt <= HWS_IRQ_CLEAR_RETRIES; attempt++) {
+		u32 status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+
+		if (status == U32_MAX) {
+			WRITE_ONCE(hws->pci_lost, true);
+			return -ENODEV;
+		}
+		pending = status & mask;
+		if (!pending)
+			return 0;
+		if (attempt == HWS_IRQ_CLEAR_RETRIES)
+			break;
+		writel(pending, hws->bar0_base + HWS_REG_INT_ACK);
 	}
+
+	dev_err(&hws->pdev->dev,
+		"audio IRQ causes remained pending after %u clears: 0x%08x\n",
+		HWS_IRQ_CLEAR_RETRIES, pending);
+	return -EBUSY;
 }
 
 static void hws_stop_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
@@ -1491,31 +1552,42 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 			      unsigned int ch, bool enable)
 {
 	unsigned long flags;
-	u32 reg, mask = BIT(ch);
+	u32 readback, reg, mask = BIT(ch);
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return;
 
 	spin_lock_irqsave(&hws->capture_lock, flags);
-	if (READ_ONCE(hws->dma_quiesced)) {
-		WRITE_ONCE(hws->audio[ch].cap_active, false);
-		spin_unlock_irqrestore(&hws->capture_lock, flags);
-		return;
-	}
-	if (enable && (READ_ONCE(hws->pci_lost) ||
-		       READ_ONCE(hws->suspended))) {
+	if (READ_ONCE(hws->dma_quiesced) || READ_ONCE(hws->dma_failed) ||
+	    READ_ONCE(hws->pci_lost) || READ_ONCE(hws->suspended)) {
 		WRITE_ONCE(hws->audio[ch].cap_active, false);
 		spin_unlock_irqrestore(&hws->capture_lock, flags);
 		return;
 	}
 	reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	if (reg == U32_MAX) {
+		WRITE_ONCE(hws->pci_lost, true);
+		WRITE_ONCE(hws->audio[ch].cap_active, false);
+		spin_unlock_irqrestore(&hws->capture_lock, flags);
+		return;
+	}
 	if (enable)
 		reg |= mask;
 	else
 		reg &= ~mask;
 
 	writel(reg, hws->bar0_base + HWS_REG_ACAP_ENABLE);
-	(void)readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	readback = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	if (readback == U32_MAX) {
+		WRITE_ONCE(hws->pci_lost, true);
+		WRITE_ONCE(hws->audio[ch].cap_active, false);
+	} else if (!!(readback & mask) != enable) {
+		WRITE_ONCE(hws->pci_lost, true);
+		WRITE_ONCE(hws->audio[ch].cap_active, false);
+	} else {
+		WRITE_ONCE(hws->audio[ch].cap_active,
+			   enable && !!(readback & mask));
+	}
 	spin_unlock_irqrestore(&hws->capture_lock, flags);
 
 	dev_dbg(&hws->pdev->dev, "audio capture %s ch%u, reg=0x%08x\n",
@@ -1807,7 +1879,7 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 		synchronize_irq(hws->irq);
 
 	hws_audio_drain_work(hws);
-	hws_audio_ack_all(hws);
+	(void)hws_audio_ack_all(hws);
 
 	for (unsigned int i = 0; i < hws->cur_max_audio_ch; i++) {
 		struct hws_audio *a = &hws->audio[i];
@@ -1877,12 +1949,14 @@ int hws_audio_pm_suspend_all(struct hws_pcie_dev *hws)
 	return ret;
 }
 
-void hws_audio_pm_resume(struct hws_pcie_dev *hws)
+int hws_audio_pm_resume(struct hws_pcie_dev *hws)
 {
 	unsigned int ch;
+	int ack_ret;
+	int first_error = 0;
 
 	if (!hws || !hws->bar0_base)
-		return;
+		return -ENODEV;
 
 	for (ch = 0; ch < hws->cur_max_audio_ch && ch < MAX_VID_CHANNELS; ch++) {
 		struct hws_audio *a = &hws->audio[ch];
@@ -1907,8 +1981,13 @@ void hws_audio_pm_resume(struct hws_pcie_dev *hws)
 			dev_err(&hws->pdev->dev,
 				"audio PM resume scratch validation failed ch=%u: %d\n",
 				ch, ret);
+		if (ret && !first_error)
+			first_error = ret;
 	}
-	hws_audio_ack_all(hws);
+	ack_ret = hws_audio_ack_all(hws);
+	if (ack_ret && !first_error)
+		first_error = ack_ret;
+	return first_error;
 }
 
 void hws_audio_drain_work(struct hws_pcie_dev *hws)

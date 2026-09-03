@@ -499,6 +499,19 @@ static u32 hws_irq_ack_status(struct hws_pcie_dev *pdx, u32 int_state)
 	return readl(pdx->bar0_base + HWS_REG_INT_STATUS);
 }
 
+static u32 hws_irq_owned_status_mask(const struct hws_pcie_dev *pdx)
+{
+	u32 mask = 0;
+	unsigned int ch;
+
+	for (ch = 0; ch < pdx->cur_max_video_ch; ch++)
+		mask |= HWS_INT_VDONE_BIT(ch);
+	for (ch = 0; ch < pdx->cur_max_audio_ch; ch++)
+		mask |= HWS_INT_ADONE_BIT(ch);
+
+	return mask;
+}
+
 static void hws_irq_queue_vdone_work(struct hws_pcie_dev *pdx,
 				     unsigned int ch)
 {
@@ -809,8 +822,22 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 	(void)irq;
 
-	if (!pdx || READ_ONCE(pdx->suspended) || !pdx->bar0_base)
+	if (!pdx || !pdx->bar0_base)
 		return IRQ_NONE;
+	if (READ_ONCE(pdx->suspended)) {
+		/*
+		 * A failed device-local mask must not leave a shared level IRQ
+		 * asserted while lifecycle teardown is draining the device.  Ack
+		 * causes without sampling DMA buffers or queueing any work.
+		 */
+		int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+		if (int_state != U32_MAX)
+			int_state &= hws_irq_owned_status_mask(pdx);
+		if (!int_state || int_state == U32_MAX)
+			return IRQ_NONE;
+		(void)hws_irq_ack_status(pdx, int_state);
+		return IRQ_HANDLED;
+	}
 
 	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
 	dev_dbg(&pdx->pdev->dev,
