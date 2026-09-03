@@ -145,8 +145,6 @@ static void hws_irq_mark_failure_locked(struct hws_video *v, int ret)
 		v->timeout_count++;
 	} else if (ret == -EILSEQ || ret == -EOVERFLOW) {
 		v->phase_errors++;
-	} else if (ret == -EBADMSG) {
-		v->copy_mismatches++;
 	} else if (ret == -EUCLEAN) {
 		v->guard_errors++;
 		WRITE_ONCE(v->ring_corrupt, true);
@@ -185,7 +183,6 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	size_t length;
 	u8 completed_half = event->toggle ^ 1;
 	u8 toggle_after_copy;
-	u8 toggle_after_verify;
 	u8 live_toggle;
 	u64 verify_ns;
 	bool skip_copy = false;
@@ -199,8 +196,7 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	    v->ring_extent < v->pix.sizeimage)
 		return -ENODEV;
 
-	live_toggle = readl_relaxed(hws->bar0_base +
-				    HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	live_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
 	if (live_toggle != event->toggle)
 		return -EOVERFLOW;
 
@@ -289,15 +285,10 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	dma_rmb();
 	memcpy((u8 *)dst + offset, (u8 *)ring + offset, length);
 	dma_rmb();
-	toggle_after_copy = readl_relaxed(hws->bar0_base +
-					  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-	if (memcmp((u8 *)dst + offset, (u8 *)ring + offset, length))
-		return -EBADMSG;
+	toggle_after_copy = readl(hws->bar0_base +
+				  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
 	verify_ns = ktime_get_mono_fast_ns();
-	toggle_after_verify = readl_relaxed(hws->bar0_base +
-					    HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-	if (toggle_after_copy != event->toggle ||
-	    toggle_after_verify != event->toggle)
+	if (toggle_after_copy != event->toggle)
 		return -EOVERFLOW;
 	if (hws_video_deadline_expired(event->deadline_ns,
 				       event->timestamp_ns, verify_ns))
@@ -305,8 +296,7 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 
 verify_phase:
 	verify_ns = ktime_get_mono_fast_ns();
-	live_toggle = readl_relaxed(hws->bar0_base +
-				    HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	live_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
 	if (live_toggle != event->toggle)
 		return -EOVERFLOW;
 	if (hws_video_deadline_expired(event->deadline_ns,
@@ -458,7 +448,7 @@ fail_queue:
 			div_u64(now_ns - event.timestamp_ns, NSEC_PER_USEC) : 0;
 
 		dev_err_ratelimited(&hws->pdev->dev,
-				    "VDONE half-ring failure ch=%u generation=%llu toggle=%u phase=%u elapsed=%lluus ret=%d ambiguity=%u resamples=%u sample_errors=%u phase_errors=%u deadlines=%u mismatches=%u guards=%u\n",
+				    "VDONE half-ring failure ch=%u generation=%llu toggle=%u phase=%u elapsed=%lluus ret=%d ambiguity=%u resamples=%u sample_errors=%u phase_errors=%u deadlines=%u guards=%u\n",
 				    ch, (unsigned long long)event.generation,
 				    event.toggle, READ_ONCE(v->half_phase),
 				    (unsigned long long)elapsed_us, ret,
@@ -467,7 +457,6 @@ fail_queue:
 				    READ_ONCE(v->toggle_sample_errors),
 				    READ_ONCE(v->phase_errors),
 				    READ_ONCE(v->deadline_misses),
-				    READ_ONCE(v->copy_mismatches),
 				    READ_ONCE(v->guard_errors));
 	}
 	hws_video_fail_queue(v,
@@ -814,7 +803,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 		"irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
 		readl(pdx->bar0_base + INT_EN_REG_BASE),
 		readl(pdx->bar0_base + HWS_REG_INT_STATUS));
-	int_state = readl_relaxed(pdx->bar0_base + HWS_REG_INT_STATUS);
+	int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
 	if (!int_state || int_state == 0xFFFFFFFF) {
 		dev_dbg(&pdx->pdev->dev,
 			"irq: spurious or device-gone int_state=0x%08x\n",

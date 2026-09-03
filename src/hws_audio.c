@@ -935,8 +935,7 @@ static bool hws_audio_stage_one_packet(struct hws_audio *a, u8 cur_toggle,
 		return false;
 	}
 
-	live_toggle = readl_relaxed(hws->bar0_base +
-				    HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+	live_toggle = readl(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 	if (live_toggle != cur_toggle) {
 		if (failure)
 			*failure = HWS_AUDIO_XRUN_POST_COPY_TOGGLE;
@@ -960,8 +959,7 @@ static bool hws_audio_stage_one_packet(struct hws_audio *a, u8 cur_toggle,
 	memcpy(staging, (char *)cpu + offset, a->hw_packet_bytes);
 	/* Order the DMA read before observing whether hardware changed halves. */
 	dma_rmb();
-	live_toggle = readl_relaxed(hws->bar0_base +
-				    HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+	live_toggle = readl(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
 	if (live_toggle != cur_toggle) {
 		if (failure)
 			*failure = HWS_AUDIO_XRUN_POST_COPY_TOGGLE;
@@ -1560,12 +1558,32 @@ static int hws_pcie_audio_open(struct snd_pcm_substream *substream)
 	return 0;
 }
 
+static void hws_pcie_audio_release_stream(struct hws_audio *a)
+{
+	struct hws_pcie_dev *hws = a->parent;
+
+	/*
+	 * snd_card_disconnect() preserves the original release callback. A late
+	 * ALSA close may therefore arrive after PCI remove has released BAR/IRQ
+	 * resources. Removal publishes suspended before disconnecting the card;
+	 * in that state only unwind software ownership retained by the card ref.
+	 */
+	if (hws && !READ_ONCE(hws->suspended) &&
+	    !READ_ONCE(hws->pci_lost) && !READ_ONCE(hws->dma_quiesced)) {
+		hws_audio_quiesce_capture(hws, a->channel_index, true);
+	} else {
+		hws_audio_publish_stopped(a);
+		hws_audio_reset_runtime_state(a);
+	}
+	hws_audio_release_scratch(a,
+				  hws && READ_ONCE(hws->dma_quiesced));
+}
+
 static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
 
-	hws_audio_quiesce_capture(a->parent, a->channel_index, true);
-	hws_audio_release_scratch(a, false);
+	hws_pcie_audio_release_stream(a);
 	WRITE_ONCE(a->pcm_substream, NULL);
 	return 0;
 }
@@ -1604,8 +1622,7 @@ static int hws_pcie_audio_hw_free(struct snd_pcm_substream *substream)
 {
 	struct hws_audio *a = snd_pcm_substream_chip(substream);
 
-	hws_audio_quiesce_capture(a->parent, a->channel_index, true);
-	hws_audio_release_scratch(a, false);
+	hws_pcie_audio_release_stream(a);
 	return 0;
 }
 
@@ -1674,6 +1691,11 @@ static const struct snd_pcm_ops hws_pcie_pcm_ops = {
 	.pointer   = hws_pcie_audio_pointer,
 };
 
+static void hws_audio_card_private_free(struct snd_card *card)
+{
+	hws_put_device(card->private_data);
+}
+
 int hws_audio_register(struct hws_pcie_dev *hws)
 {
 	struct snd_card *card = NULL;
@@ -1698,6 +1720,9 @@ int hws_audio_register(struct hws_pcie_dev *hws)
 		dev_err(&hws->pdev->dev, "snd_card_new failed: %d\n", ret);
 		return ret;
 	}
+	hws_get_device(hws);
+	card->private_data = hws;
+	card->private_free = hws_audio_card_private_free;
 
 	snd_card_set_dev(card, &hws->pdev->dev);
 	strscpy(card->driver,   KBUILD_MODNAME, sizeof(card->driver));
@@ -1758,12 +1783,15 @@ error_card:
 
 void hws_audio_unregister(struct hws_pcie_dev *hws)
 {
+	struct snd_card *card;
+
 	if (!hws)
 		return;
+	card = hws->snd_card;
 
 	/* Prevent new opens and mark existing streams disconnected */
-	if (hws->snd_card)
-		snd_card_disconnect(hws->snd_card);
+	if (card)
+		snd_card_disconnect(card);
 
 	for (unsigned int i = 0; i < hws->cur_max_audio_ch; i++) {
 		struct hws_audio *a = &hws->audio[i];
@@ -1783,27 +1811,18 @@ void hws_audio_unregister(struct hws_pcie_dev *hws)
 
 	for (unsigned int i = 0; i < hws->cur_max_audio_ch; i++) {
 		struct hws_audio *a = &hws->audio[i];
-		struct snd_pcm_substream *ss = READ_ONCE(a->pcm_substream);
 
-		if (ss) {
-			unsigned long flags;
-
-			snd_pcm_stream_lock_irqsave(ss, flags);
-			if (ss->runtime)
-				snd_pcm_stop(ss, SNDRV_PCM_STATE_DISCONNECTED);
-			snd_pcm_stream_unlock_irqrestore(ss, flags);
-		}
-
+		/* ALSA's PCM disconnect callback has already stopped open streams. */
 		WRITE_ONCE(a->pcm_substream, NULL);
 		hws_audio_reset_runtime_state(a);
 		hws_audio_release_scratch(a, false);
 		hws_audio_free_staging(a);
 	}
 
-	if (hws->snd_card) {
-		/* No PCM callback may outlive the final parent reference. */
-		snd_card_free(hws->snd_card);
+	if (card) {
 		hws->snd_card = NULL;
+		/* The card's private reference retains hws until the last close. */
+		snd_card_free_when_closed(card);
 	}
 
 	dev_info(&hws->pdev->dev, "audio unregistered (%u channels)\n",

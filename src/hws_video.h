@@ -16,7 +16,7 @@ void check_video_format(struct hws_pcie_dev *pdx);
 int hws_check_card_status(struct hws_pcie_dev *hws);
 int hws_video_set_output_resolution(struct hws_video *vid, u32 width,
 				    u32 height);
-void hws_init_video_sys(struct hws_pcie_dev *hws, bool enable);
+void hws_init_video_sys(struct hws_pcie_dev *hws);
 
 void hws_video_fail_queue(struct hws_video *vid, const char *reason);
 void hws_video_drain_channel_work(struct hws_video *vid);

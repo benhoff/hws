@@ -102,9 +102,23 @@ static const struct pci_device_id hws_pci_table[] = {
 	{}
 };
 
-static void enable_pcie_relaxed_ordering(struct pci_dev *dev)
+static int hws_enforce_pcie_ordering(struct pci_dev *dev)
 {
-	pcie_capability_set_word(dev, PCI_EXP_DEVCTL, PCI_EXP_DEVCTL_RELAX_EN);
+	const u16 unsafe = PCI_EXP_DEVCTL_RELAX_EN |
+			   PCI_EXP_DEVCTL_NOSNOOP_EN;
+	int ret;
+	u16 control;
+
+	ret = pcie_capability_clear_word(dev, PCI_EXP_DEVCTL, unsafe);
+	if (ret)
+		return ret;
+	ret = pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &control);
+	if (ret)
+		return ret;
+	if (control & unsafe)
+		return -EIO;
+
+	return 0;
 }
 
 static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
@@ -165,7 +179,7 @@ static void hws_configure_hardware_capabilities(struct hws_pcie_dev *hdev)
 	}
 }
 
-static void hws_stop_device(struct hws_pcie_dev *hws);
+static int hws_stop_device(struct hws_pcie_dev *hws);
 static void hws_free_seed_buffers(struct hws_pcie_dev *hws);
 static void hws_publish_stop_flags(struct hws_pcie_dev *hws);
 
@@ -233,9 +247,6 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 	hdev->sub_ver = FIELD_GET(DEVINFO_SUBVER, reg);
 	hdev->support_yv12 = FIELD_GET(DEVINFO_YV12, reg);
 	hdev->port_id = FIELD_GET(DEVINFO_PORTID, reg);
-
-	writel(0x00, hdev->bar0_base + HWS_REG_DEC_MODE);
-	writel(0x10, hdev->bar0_base + HWS_REG_DEC_MODE);
 
 	hws_configure_hardware_capabilities(hdev);
 
@@ -770,9 +781,21 @@ static void hws_irq_mask_gate(struct hws_pcie_dev *hws)
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
+static u32 hws_irq_source_mask(const struct hws_pcie_dev *hws)
+{
+	u32 mask = 0;
+	unsigned int ch;
+
+	for (ch = 0; ch < hws->cur_max_video_ch; ch++)
+		mask |= HWS_INT_VDONE_BIT(ch);
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++)
+		mask |= HWS_INT_ADONE_BIT(ch);
+	return mask;
+}
+
 static void hws_irq_unmask_gate(struct hws_pcie_dev *hws)
 {
-	writel(HWS_INT_EN_MASK, hws->bar0_base + INT_EN_REG_BASE);
+	writel(hws_irq_source_mask(hws), hws->bar0_base + INT_EN_REG_BASE);
 	(void)readl(hws->bar0_base + INT_EN_REG_BASE);
 }
 
@@ -784,6 +807,35 @@ static void hws_irq_clear_pending(struct hws_pcie_dev *hws)
 		writel(st, hws->bar0_base + HWS_REG_INT_STATUS); /* W1C */
 		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 	}
+}
+
+static void hws_irq_enable_control(struct hws_pcie_dev *hws)
+{
+	u32 control = readl(hws->bar0_base + HWS_REG_CTL);
+
+	control |= HWS_CTL_IRQ_ENABLE_BIT;
+	writel(control, hws->bar0_base + HWS_REG_CTL);
+	(void)readl(hws->bar0_base + HWS_REG_CTL);
+}
+
+static void hws_quiesce_probe_hardware(struct hws_pcie_dev *hws)
+{
+	unsigned long flags;
+	u32 control;
+
+	hws_irq_mask_gate(hws);
+	control = readl(hws->bar0_base + HWS_REG_CTL);
+	control &= ~HWS_CTL_IRQ_ENABLE_BIT;
+	writel(control, hws->bar0_base + HWS_REG_CTL);
+	writel(0, hws->bar0_base + PCIEBR_EN_REG_BASE);
+	spin_lock_irqsave(&hws->capture_lock, flags);
+	writel(0, hws->bar0_base + HWS_REG_VCAP_ENABLE);
+	writel(0, hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	writel(0, hws->bar0_base + HWS_REG_DEC_MODE);
+	(void)readl(hws->bar0_base + HWS_REG_DEC_MODE);
+	spin_unlock_irqrestore(&hws->capture_lock, flags);
+	hws_irq_clear_pending(hws);
+	hws->start_run = false;
 }
 
 static void hws_free_irq_vectors(void *data)
@@ -873,13 +925,32 @@ static void hws_v4l2_release(struct v4l2_device *v4l2_dev)
 	}
 
 	v4l2_device_unregister(v4l2_dev);
+	hws_put_device(hws);
+}
+
+static void hws_release_device(struct kref *ref)
+{
+	struct hws_pcie_dev *hws =
+		container_of(ref, struct hws_pcie_dev, lifetime_ref);
+
 	kfree(hws);
+}
+
+void hws_get_device(struct hws_pcie_dev *hws)
+{
+	kref_get(&hws->lifetime_ref);
+}
+
+void hws_put_device(struct hws_pcie_dev *hws)
+{
+	if (hws)
+		kref_put(&hws->lifetime_ref, hws_release_device);
 }
 
 /*
  * Registered before all other managed resources, so this runs after their
- * teardown. Open V4L2 files keep their own references and defer the final
- * hws_v4l2_release() until their release paths have finished.
+ * teardown. Open V4L2 or ALSA files keep independent references and defer the
+ * final hws release until their disconnected release paths have finished.
  */
 static void hws_put_device_action(void *data)
 {
@@ -891,9 +962,8 @@ static void hws_put_device_action(void *data)
 	if (hws->v4l2_ref_held) {
 		hws->v4l2_ref_held = false;
 		v4l2_device_put(&hws->v4l2_device);
-	} else {
-		kfree(hws);
 	}
+	hws_put_device(hws);
 }
 
 static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
@@ -903,10 +973,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	unsigned long irqf = 0;
 	bool audio_registered = false;
 
-	/* V4L2 file handles can outlive PCI remove, so hws cannot be devm-owned. */
+	/* V4L2 and ALSA files can outlive PCI remove, so hws is refcounted. */
 	hws = kzalloc_obj(*hws);
 	if (!hws)
 		return -ENOMEM;
+	kref_init(&hws->lifetime_ref);
 	hws->pdev = pdev;
 	ret = devm_add_action_or_reset(&pdev->dev, hws_put_device_action, hws);
 	if (ret)
@@ -921,11 +992,11 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	spin_lock_init(&hws->capture_lock);
 	pci_set_drvdata(pdev, hws);
 
-	/* 1) Enable device + bus mastering (managed) */
+	/* 1) Enable the function, but do not permit DMA during construction. */
 	ret = pcim_enable_device(pdev);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret, "pcim_enable_device\n");
-	pci_set_master(pdev);
+	pci_clear_master(pdev);
 
 	/* 2) Map BAR0 (managed) */
 	ret = pcim_iomap_regions(pdev, BIT(0), KBUILD_MODNAME);
@@ -946,14 +1017,20 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_dbg(&pdev->dev, "Using 64-bit DMA mask\n");
 	}
 
-	/* 3) Apply optional PCIe tuning. */
-	enable_pcie_relaxed_ordering(pdev);
+	/* 3) Enforce ordered requester transactions for DMA completion. */
+	ret = hws_enforce_pcie_ordering(pdev);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to enforce PCIe requester ordering\n");
+	dev_info(&pdev->dev,
+		 "PCIe requester ordering: Relaxed Ordering off, No Snoop off\n");
 #ifdef CONFIG_ARCH_TI816X
 	pcie_set_readrq(pdev, 128);
 #endif
 
-	/* 4) Identify chip & capabilities */
+	/* 4) Hold every engine and interrupt gate closed before discovery. */
 	hws_init_probe_state(hws);
+	hws_quiesce_probe_hardware(hws);
 	hws->audio_pkt_size = MAX_DMA_AUDIO_PK_SIZE;
 	ret = read_chip_id(hws);
 	if (ret)
@@ -961,7 +1038,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 				     "failed to read chip identity\n");
 	dev_info(&pdev->dev, "Device VID=0x%04x DID=0x%04x\n",
 		 pdev->vendor, pdev->device);
-	hws_init_video_sys(hws, false);
 
 	/* 5) Init channels (video/audio state, locks, vb2, ctrls) */
 	for (i = 0; i < hws->max_channels; i++) {
@@ -1019,9 +1095,6 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_info(&pdev->dev, "audio capture disabled; video-only mode\n");
 	}
 
-	/* 6) Start-run sequence with the permanent DMA arenas retained. */
-	hws_init_video_sys(hws, false);
-
 	/* A) Prefer the card's single MSI vector; retain shared INTx fallback. */
 	ret = hws_alloc_irq(hws, &irqf);
 	if (ret)
@@ -1040,20 +1113,20 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	if (ret) {
 		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n",
 			irq, ret);
+		hws->irq = -1;
 		goto err_unwind_channels;
 	}
 
-	/* E) Set the global interrupt enable bit in main control register */
-	{
-		u32 ctl_reg = readl(hws->bar0_base + HWS_REG_CTL);
+	/* E) Initialize the idle core while PCI bus mastering remains disabled. */
+	hws_init_video_sys(hws);
 
-		ctl_reg |= HWS_CTL_IRQ_ENABLE_BIT;
-		writel(ctl_reg, hws->bar0_base + HWS_REG_CTL);
-		(void)readl(hws->bar0_base + HWS_REG_CTL); /* flush write */
-		dev_info(&pdev->dev, "Global IRQ enable bit set in control register\n");
-	}
+	/* F) Enable the core IRQ output while the source gate remains masked. */
+	hws_irq_enable_control(hws);
 
-	/* F) Open the global gate just like legacy did */
+	/* G) Permit DMA only after targets, workers, and the handler are ready. */
+	pci_set_master(pdev);
+
+	/* H) Unmask only sources decoded by the installed handler. */
 	hws_irq_unmask_gate(hws);
 	dev_info(&pdev->dev, "INT_EN_GATE readback=0x%08x\n",
 		 readl(hws->bar0_base + INT_EN_REG_BASE));
@@ -1401,16 +1474,19 @@ static int hws_drain_after_stop(struct hws_pcie_dev *hws)
 	return ret;
 }
 
-static void hws_stop_device(struct hws_pcie_dev *hws)
+static int hws_stop_device(struct hws_pcie_dev *hws)
 {
 	u32 status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 	u64 start_ns = ktime_get_mono_fast_ns();
 	bool live = status != 0xFFFFFFFF;
-	int ret;
+	int ret = 0;
 
 	dev_dbg(&hws->pdev->dev, "%s: status=0x%08x\n", __func__, status);
 	if (!live) {
 		hws->pci_lost = true;
+		ret = hws_isolate_pci_dma(hws, "device stop", -1);
+		if (!ret)
+			WRITE_ONCE(hws->dma_quiesced, true);
 		goto out;
 	}
 	hws_log_lifecycle_snapshot(hws, "stop-device", "begin");
@@ -1435,6 +1511,7 @@ out:
 	dev_dbg(&hws->pdev->dev, "lifecycle:stop-device:done (%lluus)\n",
 		hws_elapsed_us(start_ns));
 	dev_dbg(&hws->pdev->dev, "%s: complete\n", __func__);
+	return ret;
 }
 
 static int hws_quiesce_for_transition(struct hws_pcie_dev *hws,
@@ -1444,7 +1521,8 @@ static int hws_quiesce_for_transition(struct hws_pcie_dev *hws,
 	struct device *dev = &hws->pdev->dev;
 	u64 start_ns = ktime_get_mono_fast_ns();
 	u64 step_ns;
-	int vret;
+	int stop_ret;
+	int video_ret;
 
 	hws_log_lifecycle_snapshot(hws, action, "begin");
 
@@ -1462,29 +1540,30 @@ static int hws_quiesce_for_transition(struct hws_pcie_dev *hws,
 	}
 
 	step_ns = ktime_get_mono_fast_ns();
-	hws_stop_device(hws);
+	stop_ret = hws_stop_device(hws);
 	dev_dbg(dev, "lifecycle:%s:stop-device (%lluus)\n", action,
 		hws_elapsed_us(step_ns));
 
 	/* DMA is globally idle before vb2 is allowed to return its buffers. */
 	step_ns = ktime_get_mono_fast_ns();
-	vret = hws_video_quiesce(hws, action);
+	video_ret = hws_video_quiesce(hws, action);
 	dev_dbg(dev, "lifecycle:%s:video-quiesce ret=%d (%lluus)\n", action,
-		vret, hws_elapsed_us(step_ns));
-	if (vret)
+		video_ret, hws_elapsed_us(step_ns));
+	if (video_ret)
 		dev_warn(dev, "lifecycle:%s video quiesce returned %d\n",
-			 action, vret);
+			 action, video_ret);
 	hws_log_lifecycle_snapshot(hws, action, "end");
 	dev_dbg(dev, "lifecycle:%s:quiesce-done ret=%d (%lluus)\n", action,
-		vret, hws_elapsed_us(start_ns));
+		stop_ret ?: video_ret, hws_elapsed_us(start_ns));
 
-	return vret;
+	return stop_ret ?: video_ret;
 }
 
 static void hws_remove(struct pci_dev *pdev)
 {
 	struct hws_pcie_dev *hws = pci_get_drvdata(pdev);
 	u64 start_ns;
+	int ret;
 
 	if (!hws)
 		return;
@@ -1493,18 +1572,16 @@ static void hws_remove(struct pci_dev *pdev)
 	dev_info(&pdev->dev, "lifecycle:remove begin\n");
 	hws_log_lifecycle_snapshot(hws, "remove", "begin");
 
-	/* Stop the monitor thread before tearing down V4L2/vb2 objects. */
-	hws_block_hotpaths(hws);
-	hws_stop_kthread_action(hws);
+	/* Establish one device-wide DMA boundary before unpublishing interfaces. */
+	ret = hws_quiesce_for_transition(hws, "remove", true);
+	if (ret)
+		dev_crit(&pdev->dev,
+			 "remove could not establish complete DMA quiescence: %d\n",
+			 ret);
 
-	/* Prevent new V4L2 opens before any teardown operation can wait. */
-	hws_video_unregister(hws);
-
-	/* Stop hardware and capture cleanly. */
-	hws_stop_device(hws);
-
-	/* snd_card_free() may wait for existing audio file descriptors. */
+	/* Disconnect user interfaces only after IRQ, work, and DMA are stopped. */
 	hws_audio_unregister(hws);
+	hws_video_unregister(hws);
 	hws_destroy_audio_workqueue(hws);
 
 	/* Release seeded DMA buffers */
@@ -1517,6 +1594,26 @@ static void hws_remove(struct pci_dev *pdev)
 }
 
 #ifdef CONFIG_PM_SLEEP
+static void hws_restart_quiesced_core(struct hws_pcie_dev *hws)
+{
+	hws_init_video_sys(hws);
+	hws_audio_pm_resume(hws);
+	hws_video_pm_resume(hws);
+	hws_irq_clear_pending(hws);
+	hws_irq_enable_control(hws);
+	pci_set_master(hws->pdev);
+
+	mutex_lock(&hws->dma_lock);
+	WRITE_ONCE(hws->pci_lost, false);
+	WRITE_ONCE(hws->dma_quiesced, false);
+	mutex_unlock(&hws->dma_lock);
+
+	WRITE_ONCE(hws->suspended, false);
+	/* Publish live state and restored arenas before reopening the IRQ gate. */
+	smp_mb();
+	hws_irq_unmask_gate(hws);
+}
+
 static int hws_pm_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -1532,6 +1629,17 @@ static int hws_pm_suspend(struct device *dev)
 		dev_warn(dev, "lifecycle:pm_suspend audio quiesce returned %d\n",
 			 aret);
 	vret = hws_quiesce_for_transition(hws, "pm_suspend", false);
+	if (aret || vret) {
+		int ret = aret ?: vret;
+
+		dev_err(dev,
+			"lifecycle:pm_suspend aborted audio=%d quiesce=%d\n",
+			aret, vret);
+		if (!READ_ONCE(hws->dma_failed) &&
+		    READ_ONCE(hws->dma_quiesced))
+			hws_restart_quiesced_core(hws);
+		return ret;
+	}
 
 	step_ns = ktime_get_mono_fast_ns();
 	pci_save_state(pdev);
@@ -1568,12 +1676,17 @@ static int hws_pm_resume(struct device *dev)
 		return ret;
 	}
 	pci_restore_state(pdev);
-	pci_set_master(pdev);
+	pci_clear_master(pdev);
 	dev_dbg(dev, "lifecycle:pm_resume:pci-enable (%lluus)\n",
 		hws_elapsed_us(step_ns));
 
-	/* Reapply any PCIe tuning lost across D3 */
-	enable_pcie_relaxed_ordering(pdev);
+	/* Restore the conservative requester-ordering contract lost across D3. */
+	ret = hws_enforce_pcie_ordering(pdev);
+	if (ret) {
+		dev_err(dev, "failed to enforce PCIe requester ordering: %d\n",
+			ret);
+		goto err_disable_device;
+	}
 
 	/* Reinitialize chip-side capabilities / registers */
 	step_ns = ktime_get_mono_fast_ns();
@@ -1582,31 +1695,9 @@ static int hws_pm_resume(struct device *dev)
 		dev_err(dev, "failed to restore chip identity: %d\n", ret);
 		goto err_disable_device;
 	}
-	/* Restart the capture core and restore any retained DMA windows. */
-	hws_init_video_sys(hws, true);
-	hws_audio_pm_resume(hws);
-	hws_irq_clear_pending(hws);
-	/* The engines are initialized and idle; allow future stream starts. */
-	mutex_lock(&hws->dma_lock);
-	WRITE_ONCE(hws->pci_lost, false);
-	WRITE_ONCE(hws->dma_quiesced, false);
-	mutex_unlock(&hws->dma_lock);
+	/* Restore retained DMA windows while every producer and IRQ is masked. */
+	hws_restart_quiesced_core(hws);
 	dev_dbg(dev, "lifecycle:pm_resume:chip-reinit (%lluus)\n",
-		hws_elapsed_us(step_ns));
-
-	/* Make our handler live before reopening only this device's IRQ gate. */
-	step_ns = ktime_get_mono_fast_ns();
-	WRITE_ONCE(hws->suspended, false);
-	/* Publish the live state before the device can raise another interrupt. */
-	smp_mb();
-	hws_irq_unmask_gate(hws);
-	dev_dbg(dev, "lifecycle:pm_resume:irq-unsuspend (%lluus)\n",
-		hws_elapsed_us(step_ns));
-
-	/* vb2: nothing mandatory; userspace will STREAMON again when ready */
-	step_ns = ktime_get_mono_fast_ns();
-	hws_video_pm_resume(hws);
-	dev_dbg(dev, "lifecycle:pm_resume:video-resume (%lluus)\n",
 		hws_elapsed_us(step_ns));
 	hws_log_lifecycle_snapshot(hws, "pm_resume", "end");
 	dev_info(dev, "lifecycle:pm_resume done (%lluus)\n",
