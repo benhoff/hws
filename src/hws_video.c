@@ -29,6 +29,7 @@
 #include "hws_audio.h"
 #include "hws_irq.h"
 #include "hws_v4l2_ioctl.h"
+#include "hws_trace.h"
 
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
 #define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
@@ -379,6 +380,34 @@ static void hws_video_reset_stream_phase_locked(struct hws_video *vid)
 	WRITE_ONCE(vid->last_vdone_timestamp_ns, 0);
 }
 
+static void hws_video_reset_evidence_locked(struct hws_video *vid)
+{
+	lockdep_assert_held(&vid->irq_lock);
+
+	vid->evidence_stream_epoch++;
+	if (!vid->evidence_stream_epoch)
+		vid->evidence_stream_epoch++;
+	vid->evidence_vdone_observed = 0;
+	vid->evidence_vdone_ignored = 0;
+	vid->evidence_vdone_accepted = 0;
+	vid->evidence_vdone_deferred = 0;
+	vid->evidence_vdone_resynced = 0;
+	vid->evidence_vdone_recovered = 0;
+	vid->evidence_vdone_fatal = 0;
+	vid->evidence_completed_half[0] = 0;
+	vid->evidence_completed_half[1] = 0;
+	vid->evidence_frames_completed = 0;
+	vid->evidence_frames_delivered = 0;
+	vid->evidence_frames_no_buffer = 0;
+	vid->evidence_partial_recycles = 0;
+	vid->evidence_recovery_reports = 0;
+	vid->evidence_duplicate_reports = 0;
+	vid->evidence_overlap_reports = 0;
+	vid->evidence_resync_reports = 0;
+	vid->evidence_queue_failures = 0;
+	vid->recovery_notice_mask = 0;
+}
+
 static void hws_video_drain_queue_locked(struct hws_video *vid)
 {
 	hws_video_reset_stream_phase_locked(vid);
@@ -447,11 +476,15 @@ static void hws_video_collect_done_locked(struct hws_video *vid,
 void hws_video_fail_queue(struct hws_video *vid, const char *reason)
 {
 	struct hws_pcie_dev *hws;
+	unsigned long flags;
 
 	if (!vid || !vid->parent)
 		return;
 
 	hws = vid->parent;
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	vid->evidence_queue_failures++;
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
 	WRITE_ONCE(vid->stop_requested, true);
 	WRITE_ONCE(vid->cap_active, false);
 	hws_enable_video_capture(hws, vid->channel_index, false);
@@ -1288,13 +1321,7 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 {
 	struct hws_video *vid = vb->vb2_queue->drv_priv;
 	struct hwsvideo_buffer *buf = to_hwsbuf(vb);
-	struct hws_pcie_dev *hws = vid->parent;
 	unsigned long flags;
-
-	dev_dbg(&hws->pdev->dev,
-		"buffer_queue(ch=%u): vb=%p sizeimage=%u q_active=%d\n",
-		vid->channel_index, vb, vid->pix.sizeimage,
-		READ_ONCE(vid->cap_active));
 
 	spin_lock_irqsave(&vid->irq_lock, flags);
 	list_add_tail(&buf->list, &vid->capture_queue);
@@ -1371,9 +1398,17 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	/* Program the permanent ring once, before enabling VCAP. */
 	spin_lock_irqsave(&v->irq_lock, flags);
 	hws_video_reset_stream_phase_locked(v);
+	hws_video_reset_evidence_locked(v);
 	v->active = NULL;
 	ret = hws_program_video_ring_locked(v);
 	if (!ret) {
+		trace_hws_vdone_stream(pci_name(hws->pdev), v->channel_index,
+				       v->evidence_stream_epoch, 1,
+				       v->pix.width, v->pix.height,
+				       v->pix.fourcc,
+				       READ_ONCE(v->current_fps),
+				       v->pix.sizeimage, v->ring_extent,
+				       v->ring_split, v->last_half16);
 		hws_ack_video_pending(hws, v->channel_index);
 		(void)readl(hws->bar0_base + HWS_REG_INT_STATUS);
 		wmb(); /* publish ring registers before enabling VCAP */
@@ -1481,6 +1516,19 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	LIST_HEAD(done);
 	unsigned int done_cnt = 0;
 	u64 start_ns = ktime_get_mono_fast_ns();
+	u64 epoch;
+	u64 observed;
+	u64 accepted;
+	u64 deferred;
+	u64 resynced;
+	u64 recovered;
+	u64 fatal;
+	u64 frames;
+	u64 delivered;
+	u64 no_buffer;
+	u64 partial;
+	u64 recovery_reports;
+	u64 queue_failures;
 	bool needs_idle;
 
 	hws_log_video_state(v, "streamoff", "begin");
@@ -1515,6 +1563,36 @@ static void hws_stop_streaming(struct vb2_queue *q)
 		vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
 		done_cnt++;
 	}
+	spin_lock_irqsave(&v->irq_lock, flags);
+	epoch = v->evidence_stream_epoch;
+	observed = v->evidence_vdone_observed;
+	accepted = v->evidence_vdone_accepted;
+	deferred = v->evidence_vdone_deferred;
+	resynced = v->evidence_vdone_resynced;
+	recovered = v->evidence_vdone_recovered;
+	fatal = v->evidence_vdone_fatal;
+	frames = v->evidence_frames_completed;
+	delivered = v->evidence_frames_delivered;
+	no_buffer = v->evidence_frames_no_buffer;
+	partial = v->evidence_partial_recycles;
+	recovery_reports = v->evidence_recovery_reports;
+	queue_failures = v->evidence_queue_failures;
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+	trace_hws_vdone_stream(pci_name(hws->pdev), v->channel_index, epoch, 0,
+			       v->pix.width, v->pix.height, v->pix.fourcc,
+			       READ_ONCE(v->current_fps), v->pix.sizeimage,
+			       v->ring_extent, v->ring_split,
+			       READ_ONCE(v->last_half16));
+	dev_info(&hws->pdev->dev,
+		 "VDONE stream summary ch=%u epoch=%llu observed=%llu accepted=%llu deferred=%llu resynced=%llu recovered=%llu fatal=%llu frames=%llu delivered=%llu no_buffer=%llu partial_recycles=%llu recovery_reports=%llu queue_failures=%llu\n",
+		 v->channel_index, (unsigned long long)epoch,
+		 (unsigned long long)observed, (unsigned long long)accepted,
+		 (unsigned long long)deferred, (unsigned long long)resynced,
+		 (unsigned long long)recovered, (unsigned long long)fatal,
+		 (unsigned long long)frames, (unsigned long long)delivered,
+		 (unsigned long long)no_buffer, (unsigned long long)partial,
+		 (unsigned long long)recovery_reports,
+		 (unsigned long long)queue_failures);
 	dev_dbg(&hws->pdev->dev,
 		"video:streamoff:done ch=%u completed=%u (%lluus)\n",
 		v->channel_index, done_cnt, hws_elapsed_us(start_ns));

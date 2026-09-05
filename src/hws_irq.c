@@ -13,6 +13,7 @@
 #include "hws_video.h"
 #include "hws.h"
 #include "hws_audio.h"
+#include "hws_trace.h"
 
 /* Characterized minimum reuse was 7,950 us at 1080p60. */
 #define HWS_VIDEO_COPY_DEADLINE_NS (7500ULL * NSEC_PER_USEC)
@@ -32,6 +33,22 @@ struct hws_vdone_toggle_sample {
 	bool post_ack_stable;
 	bool status_reasserted;
 };
+
+struct hws_vdone_copy_observation {
+	u64 started_ns;
+	u64 offset;
+	u64 length;
+	u8 toggle_before;
+	u8 toggle_after;
+	bool toggle_before_valid;
+	bool toggle_after_valid;
+	bool guard_checked;
+	bool guard_ok;
+};
+
+#define HWS_RECOVERY_NOTICE_DUPLICATE BIT(0)
+#define HWS_RECOVERY_NOTICE_OVERLAP   BIT(1)
+#define HWS_RECOVERY_NOTICE_RESYNC    BIT(2)
 
 struct hws_adone_toggle_sample {
 	u8 before_ack;
@@ -140,6 +157,7 @@ static bool hws_irq_recover_phase_locked(struct hws_video *v, u64 generation,
 		 */
 		list_add(&v->active->list, &v->capture_queue);
 		v->queued_count++;
+		v->evidence_partial_recycles++;
 	}
 	v->active = NULL;
 	v->frame_generation = 0;
@@ -206,7 +224,8 @@ hws_irq_take_queued_buffer_locked(struct hws_video *v)
 static int hws_video_copy_completed_half(struct hws_video *v,
 					 const struct hws_vdone_event *event,
 					 struct hwsvideo_buffer **done,
-					 bool *frame_complete)
+					 bool *frame_complete,
+					 struct hws_vdone_copy_observation *observation)
 {
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
@@ -226,6 +245,8 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 
 	*done = NULL;
 	*frame_complete = false;
+	memset(observation, 0, sizeof(*observation));
+	observation->started_ns = ktime_get_mono_fast_ns();
 	if (hws_video_deadline_expired(event->deadline_ns, event->timestamp_ns,
 				       ktime_get_mono_fast_ns()))
 		return -ETIME;
@@ -235,6 +256,8 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		return -ENODEV;
 
 	live_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	observation->toggle_before = live_toggle;
+	observation->toggle_before_valid = true;
 	if (live_toggle != event->toggle)
 		return -EOVERFLOW;
 
@@ -318,12 +341,16 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	offset = completed_half ? v->ring_split : 0;
 	length = completed_half ? v->pix.sizeimage - v->ring_split :
 				  v->ring_split;
+	observation->offset = offset;
+	observation->length = length;
 
 	dma_rmb();
 	memcpy((u8 *)dst + offset, (u8 *)ring + offset, length);
 	dma_rmb();
 	toggle_after_copy = readl(hws->bar0_base +
 				  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	observation->toggle_after = toggle_after_copy;
+	observation->toggle_after_valid = true;
 	verify_ns = ktime_get_mono_fast_ns();
 	if (toggle_after_copy != event->toggle)
 		return -EOVERFLOW;
@@ -334,12 +361,17 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 verify_phase:
 	verify_ns = ktime_get_mono_fast_ns();
 	live_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	observation->toggle_after = live_toggle;
+	observation->toggle_after_valid = true;
 	if (live_toggle != event->toggle)
 		return -EOVERFLOW;
 	if (hws_video_deadline_expired(event->deadline_ns,
 				       event->timestamp_ns, verify_ns))
 		return -ETIME;
-	if (!hws_video_ring_guards_ok(hws, ch, v->ring_extent))
+	observation->guard_checked = true;
+	observation->guard_ok =
+		hws_video_ring_guards_ok(hws, ch, v->ring_extent);
+	if (!observation->guard_ok)
 		return -EUCLEAN;
 	if (skip_copy) {
 		*frame_complete = completes_frame;
@@ -384,11 +416,14 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	struct hws_pcie_dev *hws = v->parent;
 	unsigned int ch = v->channel_index;
 	struct hws_vdone_event event = { };
+	struct hws_vdone_copy_observation copy_observation;
 	struct hwsvideo_buffer *done = NULL;
 	unsigned long flags;
 	u64 recovery_generation = 0;
 	u64 recovery_timestamp_ns = 0;
 	u64 recovery_interval_us = 0;
+	u64 copy_finished_ns;
+	u64 frame_first_generation = 0;
 	u32 recovery_reports = 0;
 	u32 frame_sequence = 0;
 	u8 recovery_toggle = 0;
@@ -459,7 +494,25 @@ static void hws_video_handle_vdone(struct hws_video *v)
 	}
 
 	ret = hws_video_copy_completed_half(v, &event, &done,
-					    &frame_complete);
+					    &frame_complete,
+					    &copy_observation);
+	copy_finished_ns = ktime_get_mono_fast_ns();
+	trace_hws_vdone_copy(pci_name(hws->pdev), ch,
+			     READ_ONCE(v->evidence_stream_epoch),
+			     event.generation, copy_observation.offset,
+			     copy_observation.length,
+			     copy_finished_ns >= copy_observation.started_ns ?
+				copy_finished_ns -
+				copy_observation.started_ns : 0,
+			     (event.toggle & 0x01) |
+				((event.toggle ^ 1) << 1) |
+				((copy_observation.toggle_before_valid ?
+				  copy_observation.toggle_before : U8_MAX) << 2) |
+				((copy_observation.toggle_after_valid ?
+				  copy_observation.toggle_after : U8_MAX) << 10) |
+				(copy_observation.guard_checked << 18) |
+				(copy_observation.guard_ok << 19) |
+				(frame_complete << 20), ret);
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state == HWS_VIDEO_COMPLETION_OVERRUN) {
@@ -540,9 +593,12 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			hws_irq_mark_failure_locked(v, ret);
 			fail = true;
 		} else if (frame_complete) {
+			frame_first_generation = v->frame_generation;
 			frame_sequence =
 				(u32)atomic_fetch_inc(&v->sequence_number);
+			v->evidence_frames_completed++;
 			if (done) {
+				v->evidence_frames_delivered++;
 				v->active = NULL;
 				v->frame_generation = 0;
 				v->frame_half0_valid = false;
@@ -551,6 +607,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 						      v->pix.sizeimage);
 				done->vb.field = v->pix.field;
 				done->vb.sequence = frame_sequence;
+			} else {
+				v->evidence_frames_no_buffer++;
 			}
 		}
 		if (!fail && !recovered)
@@ -566,19 +624,15 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		schedule_work(&v->recovery_work);
 		return;
 	}
+	if (frame_complete)
+		trace_hws_vdone_frame(pci_name(hws->pdev), ch,
+				      READ_ONCE(v->evidence_stream_epoch),
+				      frame_first_generation, event.generation,
+				      frame_sequence, event.timestamp_ns, !!done,
+				      !done, false);
 
-	if (done) {
-		dev_dbg(&hws->pdev->dev,
-			"bh_video(ch=%u): assembled buf=%p generation=%llu toggle=%u seq=%u\n",
-			ch, done, (unsigned long long)event.generation,
-			event.toggle, done->vb.sequence);
+	if (done)
 		vb2_buffer_done(&done->vb.vb2_buf, VB2_BUF_STATE_DONE);
-	} else if (frame_complete) {
-		dev_dbg(&hws->pdev->dev,
-			"bh_video(ch=%u): dropped complete frame generation=%llu seq=%u (no queued VB2 buffer)\n",
-			ch, (unsigned long long)event.generation,
-			frame_sequence);
-	}
 	return;
 
 fail_queue:
@@ -624,6 +678,8 @@ static void hws_video_recovery_work(struct work_struct *work)
 	enum hws_vdone_ambiguity reason;
 	bool dropped_partial;
 	bool steady;
+	bool first_notice;
+	u32 notice_bit;
 
 	spin_lock_irqsave(&v->irq_lock, flags);
 	reports = v->recovery_reports_pending;
@@ -635,30 +691,38 @@ static void hws_video_recovery_work(struct work_struct *work)
 	reason = v->recovery_report_reason;
 	dropped_partial = v->recovery_report_dropped_partial;
 	steady = v->recovery_report_steady;
+	if (!steady)
+		notice_bit = HWS_RECOVERY_NOTICE_RESYNC;
+	else if (reason == HWS_VDONE_AMBIG_DUPLICATE)
+		notice_bit = HWS_RECOVERY_NOTICE_DUPLICATE;
+	else
+		notice_bit = HWS_RECOVERY_NOTICE_OVERLAP;
+	first_notice = !(v->recovery_notice_mask & notice_bit);
+	v->recovery_notice_mask |= notice_bit;
 	spin_unlock_irqrestore(&v->irq_lock, flags);
-	if (!reports)
+	if (!reports || !first_notice)
 		return;
 
 	if (steady) {
 		if (reason == HWS_VDONE_AMBIG_DUPLICATE)
-			dev_warn_ratelimited(&hws->pdev->dev,
-					     "VDONE duplicate recovered ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u streak=%u reports=%u\n",
+			dev_warn(&hws->pdev->dev,
+				 "VDONE duplicate recovery first occurrence ch=%u generation=%llu toggle=%u interval=%lluus dropped_partial=%u streak=%u reports=%u; further occurrences counted in debugfs/trace\n",
 					     v->channel_index,
 					     (unsigned long long)generation,
 					     toggle,
 					     (unsigned long long)interval_us,
 					     dropped_partial, attempt, reports);
 		else
-			dev_warn_ratelimited(&hws->pdev->dev,
-					     "VDONE overlap recovered ch=%u generation=%llu toggle=%u elapsed=%lluus dropped_partial=%u reports=%u\n",
+			dev_warn(&hws->pdev->dev,
+				 "VDONE overlap recovery first occurrence ch=%u generation=%llu toggle=%u elapsed=%lluus dropped_partial=%u reports=%u; further occurrences counted in debugfs/trace\n",
 					     v->channel_index,
 					     (unsigned long long)generation,
 					     toggle,
 					     (unsigned long long)interval_us,
 					     dropped_partial, reports);
 	} else {
-		dev_info_ratelimited(&hws->pdev->dev,
-				     "VDONE phase resync ch=%u generation=%llu toggle=%u interval=%lluus reason=%s streak=%u reports=%u\n",
+		dev_info(&hws->pdev->dev,
+			 "VDONE phase resync first occurrence ch=%u generation=%llu toggle=%u interval=%lluus reason=%s streak=%u reports=%u; further occurrences counted in debugfs/trace\n",
 				     v->channel_index,
 				     (unsigned long long)generation, toggle,
 				     (unsigned long long)interval_us,
@@ -740,12 +804,24 @@ hws_vdone_note_recovery_locked(struct hws_video *v, u64 generation,
 	v->recovery_report_reason = reason;
 	v->recovery_report_dropped_partial = dropped_partial;
 	v->recovery_report_steady = steady;
+	v->evidence_recovery_reports += reports;
+	if (!steady)
+		v->evidence_resync_reports += reports;
+	else if (reason == HWS_VDONE_AMBIG_DUPLICATE)
+		v->evidence_duplicate_reports += reports;
+	else
+		v->evidence_overlap_reports += reports;
+	trace_hws_vdone_recovery(pci_name(v->parent->pdev), v->channel_index,
+				 v->evidence_stream_epoch, generation,
+				 interval_us, toggle, attempt, reason,
+				 dropped_partial, steady, reports);
 }
 
 static enum hws_vdone_record_result
 hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     const struct hws_vdone_toggle_sample *sample,
-		     u64 timestamp_ns)
+		     u64 timestamp_ns, u32 int_status,
+		     u32 status_after_ack)
 {
 	struct hws_video *v;
 	unsigned long flags;
@@ -755,6 +831,10 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	u64 previous_ns = 0;
 	u64 interval_us = 0;
 	u8 sync_attempt = 0;
+	u8 completed_half = U8_MAX;
+	u8 previous_toggle = 0;
+	u8 phase = HWS_VIDEO_PHASE_SYNC;
+	u64 epoch = 0;
 	bool dropped_partial = false;
 	bool report_recovery = false;
 	u8 toggle;
@@ -765,6 +845,10 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	toggle = sample->after_ack;
 	v = &pdx->video[ch];
 	spin_lock_irqsave(&v->irq_lock, flags);
+	v->evidence_vdone_observed++;
+	epoch = v->evidence_stream_epoch;
+	previous_toggle = v->last_buf_half_toggle;
+	phase = v->half_phase;
 	if (!READ_ONCE(v->cap_active) || READ_ONCE(v->stop_requested)) {
 		result = HWS_VDONE_IGNORED;
 	} else {
@@ -895,7 +979,40 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 			result = HWS_VDONE_QUEUED;
 		}
 	}
+	switch (result) {
+	case HWS_VDONE_IGNORED:
+		v->evidence_vdone_ignored++;
+		break;
+	case HWS_VDONE_QUEUED:
+		completed_half = toggle ^ 1;
+		v->evidence_vdone_accepted++;
+		v->evidence_completed_half[completed_half]++;
+		break;
+	case HWS_VDONE_DEFERRED:
+		v->evidence_vdone_deferred++;
+		break;
+	case HWS_VDONE_RESYNCED:
+		v->evidence_vdone_resynced++;
+		break;
+	case HWS_VDONE_RECOVERED:
+		v->evidence_vdone_recovered++;
+		break;
+	case HWS_VDONE_OVERRUN:
+		v->evidence_vdone_fatal++;
+		break;
+	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
+	trace_hws_vdone_irq(pci_name(pdx->pdev), ch, epoch, timestamp_ns,
+			    generation, int_status, status_after_ack,
+			    (sample->before_ack & 0x01) |
+				((sample->after_ack & 0x01) << 1) |
+				(sample->post_ack_stable << 2) |
+				(sample->status_reasserted << 3) |
+				((previous_toggle & 0x01) << 4),
+			    interval_us, (result & 0xff) |
+				((ambiguity & 0xff) << 8) |
+				((phase & 0xff) << 16) |
+				((u32)completed_half << 24));
 	if (report_recovery)
 		hws_irq_queue_recovery_work(pdx, ch);
 
@@ -952,30 +1069,13 @@ hws_irq_record_video(struct hws_pcie_dev *pdx, u32 int_state,
 			samples[ch].after_ack = second;
 			samples[ch].post_ack_stable = first == second;
 			samples[ch].status_reasserted = status_after_ack & vbit;
-			result = hws_irq_record_vdone(pdx, ch, &samples[ch],
-						      timestamp_ns);
-			if (result == HWS_VDONE_QUEUED ||
-			    result == HWS_VDONE_OVERRUN)
-				work_mask |= BIT(ch);
-			if (result == HWS_VDONE_QUEUED &&
-			    samples[ch].before_ack != samples[ch].after_ack)
-				dev_info_ratelimited(&pdx->pdev->dev,
-						     "VDONE toggle resampled ch=%u pre_ack=%u post_ack=%u total=%u\n",
-						     ch, samples[ch].before_ack,
-						     samples[ch].after_ack,
-						     READ_ONCE(pdx->video[ch].toggle_resamples));
-			else if (result == HWS_VDONE_QUEUED)
-				dev_dbg(&pdx->pdev->dev,
-					"irq: VDONE ch=%u queued pre_ack=%u post_ack=%u\n",
-					ch, samples[ch].before_ack,
-					samples[ch].after_ack);
-		} else {
-			dev_dbg(&pdx->pdev->dev,
-				"irq: VDONE ch=%u ignored (cap=%d stop=%d)\n",
-				ch,
-				READ_ONCE(pdx->video[ch].cap_active),
-				READ_ONCE(pdx->video[ch].stop_requested));
 		}
+		result = hws_irq_record_vdone(pdx, ch, &samples[ch],
+					      timestamp_ns, int_state,
+					      status_after_ack);
+		if (result == HWS_VDONE_QUEUED ||
+		    result == HWS_VDONE_OVERRUN)
+			work_mask |= BIT(ch);
 	}
 
 	return work_mask;
@@ -1100,20 +1200,10 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 		return IRQ_HANDLED;
 	}
 
-	dev_dbg(&pdx->pdev->dev, "irq: entry\n");
-	dev_dbg(&pdx->pdev->dev,
-		"irq: INT_EN=0x%08x INT_STATUS=0x%08x\n",
-		readl(pdx->bar0_base + INT_EN_REG_BASE),
-		readl(pdx->bar0_base + HWS_REG_INT_STATUS));
 	int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
-	if (!int_state || int_state == 0xFFFFFFFF) {
-		dev_dbg(&pdx->pdev->dev,
-			"irq: spurious or device-gone int_state=0x%08x\n",
-			int_state);
+	if (!int_state || int_state == 0xFFFFFFFF)
 		return IRQ_NONE;
-	}
 	timestamp_ns = ktime_get_mono_fast_ns();
-	dev_dbg(&pdx->pdev->dev, "irq: entry INT_STATUS=0x%08x\n", int_state);
 
 	hws_irq_sample_video_before_ack(pdx, int_state, video_samples);
 	hws_irq_sample_audio_before_ack(pdx, int_state, audio_samples);

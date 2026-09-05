@@ -23,6 +23,7 @@
 
 #include "hws.h"
 #include "hws_audio.h"
+#include "hws_debugfs.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws_irq.h"
@@ -1299,6 +1300,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		dev_err(&pdev->dev, "video_register: %d\n", ret);
 		goto err_stop_private;
 	}
+	hws_debugfs_init(hws);
 
 	/* 13) Final: show the line is armed */
 	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
@@ -1781,6 +1783,7 @@ static void hws_remove(struct pci_dev *pdev)
 			 ret);
 
 	/* Disconnect user interfaces only after IRQ, work, and DMA are stopped. */
+	hws_debugfs_cleanup(hws);
 	hws_audio_unregister(hws);
 	hws_video_unregister(hws);
 	hws_destroy_audio_workqueue(hws);

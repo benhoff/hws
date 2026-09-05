@@ -1,6 +1,6 @@
 # Linux inclusion gaps
 
-Reviewed on March 9, 2026.
+Reviewed on September 5, 2026.
 
 This file tracks the blockers found during a kernel-readiness review of
 `src/`. The focus here is upstream inclusion, not just "builds as an
@@ -48,95 +48,32 @@ out-of-tree module".
   4. Survive suspend/resume and shutdown/reboot.
   5. Match the documented product identity and feature set.
 
-## [medium] Build setup hides compiler diagnostics with `-w`
+## [high] Native-split VDONE content semantics matrix is incomplete
 
 - Where:
-  `src/Makefile:15`
+  `doc/vdone-semantics.md`, `doc/evidence/vdone-matrix.csv`
 - What:
-  The out-of-tree module makefile adds `ccflags-y += -fno-ipa-icf -w`.
-  `-w` suppresses warnings globally.
+  The driver consistently rounds the midpoint down to the native 2 KiB
+  boundary and programs that value. Channel 1 has rate/toggle evidence at
+  1920x1080p60, but not yet a preserved native-split content-proof artifact.
+  The equivalent matrix is also incomplete for channels 0 and 2, supported
+  modes, and the relevant PCI IDs.
 - Why it matters:
-  Upstream will reject warning suppression instead of fixes, and it makes the
-  local build result much less meaningful.
+  The implementation assumes that each accepted boundary identifies
+  `toggle ^ 1` as complete and that two complementary segments form one source
+  frame. Rate and toggle evidence alone cannot prove the latter.
 - Current status:
-  Still present in current `master`.
+  Instrumentation and a bounded evidence harness are present. The required
+  hardware runs remain open and must be recorded in the canonical matrix.
 - Baseline branch status:
-  Already present in `baseline`, and worse there. The old makefile used `-w`
-  as well, plus GCC dump flags (`baseline:src/Makefile:8`).
+  `baseline` also rounded the split to `16 * 128` bytes. Historical exact-
+  midpoint and native-split tests produced different VDONE rates, which is why
+  neither result may be generalized without its full configuration.
 - Fix direction:
-  Remove `-w` and make the code warning-clean with the compilers the kernel
-  cares about.
-- How to test the current bug:
-  1. Remove `-w`.
-  2. Rebuild with:
-     `make -C /lib/modules/$(uname -r)/build M=$PWD/src W=1 modules`
-  3. If available, also build with Clang:
-     `make -C /lib/modules/$(uname -r)/build M=$PWD/src LLVM=1 W=1 modules`
-  4. Run `scripts/checkpatch.pl --no-tree --file --strict` on the source
-     files.
+  Execute `doc/vdone-evidence-runbook.md`, retain each immutable evidence
+  bundle, and add only validator-passing rows as `validated`.
 - How to verify the fix:
-  1. GCC and Clang builds should be warning-clean, or have only narrowly
-     justified warnings.
-  2. `checkpatch.pl` should stay clean apart from any intentional exceptions.
-
-## [low] Default half-size alignment still needs confirmation
-
-- Where:
-  `src/hws_video.c:377`, `src/hws_pci.c:324`, `src/hws_video.c:947`
-- What:
-  The default `pix.half_size` is derived from `sizeimage / 2`. If the
-  hardware really requires a stricter half-buffer alignment than that, the
-  seed and mode-change paths may still program an invalid value before userspace
-  negotiates a format.
-- Why it matters:
-  This may be harmless if the hardware accepts the current programming, but if
-  the alignment contract is real it can cause subtle DMA or frame-splitting
-  errors.
-- Current status:
-  Still open. Current `master` still programs `pix.half_size / 16` from values
-  derived as `sizeimage / 2`, so the alignment concern remains unresolved
-  unless hardware evidence shows that is acceptable.
-- Baseline branch status:
-  Likely introduced later. `baseline` explicitly rounded `HLAF_SIZE` to a
-  multiple of `16 * 128` bytes in `SetVideoFormteSize()`
-  (`baseline:src/hws_video.c:3660`) and programmed that value in both
-  `SetDMAAddress()` and `ChangeVideoSize()`
-  (`baseline:src/hws_video.c:5058`, `baseline:src/hws_video.c:5106`).
-- Fix direction:
-  Confirm the hardware requirement and encode it in one helper used by every
-  place that computes or programs half-size.
-- How to test the current bug:
-  1. Check vendor documentation or the known-good Windows driver behavior.
-  2. If the requirement is known, log the programmed half-size during probe
-     and mode changes and compare it against the expected alignment.
-- How to verify the fix:
-  1. All half-size programming should use the same aligned calculation.
-  2. Probe, initial stream-on, and live mode changes should program identical
-     values for the same format.
-
-## [low] Interrupt mode is fixed to legacy INTx
-
-- Where:
-  `src/hws_pci.c:454`, `src/hws_pci.c:459`, `src/hws_pci.c:467`
-- What:
-  Probe forces legacy shared INTx and never attempts MSI or MSI-X.
-- Why it matters:
-  This is not always a hard blocker, but upstream reviewers often ask why a
-  PCIe device does not use MSI when the hardware supports it.
-- Current status:
-  Still present in current `master`.
-- Baseline branch status:
-  Introduced later. `baseline` attempted to enable MSI in
-  `probe_scan_for_msi()` (`baseline:src/hws_video.c:5385`) and used the result
-  in `irq_setup()` (`baseline:src/hws_video.c:5428`). The old code still needs
-  review, but it was not hard-wired to INTx only.
-- Fix direction:
-  Validate what the hardware supports. If MSI/MSI-X works, prefer it and keep
-  INTx as fallback. If the hardware only supports INTx, document that clearly.
-- How to test the current gap:
-  1. Check the PCI capabilities for MSI/MSI-X support.
-  2. If supported, add an MSI path and test interrupt delivery under load.
-- How to verify the fix:
-  1. The preferred interrupt mode should probe cleanly.
-  2. Buffer completion and suspend/resume behavior should remain correct in
-     both the preferred mode and fallback mode.
+  A passing run has matching independently decoded upper/lower IDs, stable
+  `toggle ^ 1` mapping, consecutive complementary generations, complete
+  poison replacement, unchanged guards, no fatal ambiguity, no unrecovered
+  queue failure, and no trace loss.

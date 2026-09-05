@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/hws/vdone-result.schema.json",
+  "title": "HWS VDONE evidence summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "result", "run_id", "channel", "stream_epoch",
+    "vdone_observed", "irq_trace_records", "copy_trace_records",
+    "frame_trace_records", "recovery_trace_records", "captured_frames",
+    "frame_id_summary", "failures"
+  ],
+  "properties": {
+    "schema": { "const": 1 },
+    "result": { "enum": ["pass", "fail"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "channel": { "type": "integer", "minimum": 0, "maximum": 3 },
+    "stream_epoch": { "type": "integer", "minimum": 1 },
+    "vdone_observed": { "type": "integer", "minimum": 0 },
+    "vdone_rate_hz": { "type": ["number", "null"], "minimum": 0 },
+    "irq_trace_records": { "type": "integer", "minimum": 0 },
+    "copy_trace_records": { "type": "integer", "minimum": 0 },
+    "frame_trace_records": { "type": "integer", "minimum": 0 },
+    "recovery_trace_records": { "type": "integer", "minimum": 0 },
+    "captured_frames": { "type": "integer", "minimum": 0 },
+    "frame_id_summary": { "type": "object" },
+    "failures": { "type": "array", "items": { "type": "string" } }
+  }
+}

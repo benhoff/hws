@@ -108,6 +108,10 @@
 /* Per-channel audio DMA address window. */
 #define HWS_REG_AUD_DMA_ADDR(ch)      (CVBS_IN_BUF_BASE + ((8 + (ch)) * PCIE_BARADDROFSIZE))
 
+/* Video DMA base and programmed split, where the split register is in units of 16 bytes. */
+#define HWS_REG_VIDEO_DMA_ADDR(ch)     (CVBS_IN_BUF_BASE + ((ch) * PCIE_BARADDROFSIZE))
+#define HWS_REG_VIDEO_HALF_SIZE(ch)    (CVBS_IN_BUF_BASE2 + ((ch) * PCIE_BARADDROFSIZE))
+
 #define HWS_VIDEO_REMAP_SLOT_OFF(ch)  (0x208 + ((ch) * 8))
 
 /*

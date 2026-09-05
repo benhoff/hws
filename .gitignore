@@ -53,3 +53,9 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Local userspace test builds and Python bytecode
+tools/hws_frame_id_capture
+tools/hws_vdone_sampler
+__pycache__/
+*.py[cod]

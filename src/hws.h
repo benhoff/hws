@@ -26,6 +26,7 @@
 #include "hws_reg.h"
 
 struct snd_pcm_substream;
+struct dentry;
 
 struct hwsmem_param {
 	u32 index;
@@ -226,6 +227,27 @@ struct hws_video {
 	u32 deadline_misses;
 	u32 guard_errors;
 
+	/* Per-stream, self-accounting VDONE evidence (protected by irq_lock). */
+	u64 evidence_stream_epoch;
+	u64 evidence_vdone_observed;
+	u64 evidence_vdone_ignored;
+	u64 evidence_vdone_accepted;
+	u64 evidence_vdone_deferred;
+	u64 evidence_vdone_resynced;
+	u64 evidence_vdone_recovered;
+	u64 evidence_vdone_fatal;
+	u64 evidence_completed_half[2];
+	u64 evidence_frames_completed;
+	u64 evidence_frames_delivered;
+	u64 evidence_frames_no_buffer;
+	u64 evidence_partial_recycles;
+	u64 evidence_recovery_reports;
+	u64 evidence_duplicate_reports;
+	u64 evidence_overlap_reports;
+	u64 evidence_resync_reports;
+	u64 evidence_queue_failures;
+	u32 recovery_notice_mask;
+
 	bool window_valid;
 	u32 last_dma_hi;
 	u32 last_dma_page;
@@ -381,6 +403,7 @@ struct hws_pcie_dev {
 
 	bool suspended;
 	int irq;
+	struct dentry *debugfs_root;
 	spinlock_t capture_lock; /* serializes capture-enable register updates */
 
 	/* Error flags */

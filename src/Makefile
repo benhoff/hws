@@ -5,7 +5,9 @@ HwsCapture-objs := \
 	 hws_irq.o \
 	 hws_video.o \
 	 hws_v4l2_ioctl.o \
-	 hws_audio.o
+	 hws_audio.o \
+	 hws_debugfs.o \
+	 hws_trace.o
 
 src := $(CURDIR)
 

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HWS two-region frame-ID source</title>
+<style>
+html, body, canvas { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #555; }
+#status { position: fixed; left: 1rem; top: 1rem; color: #0f0; background: #000b;
+          padding: .5rem; font: 16px monospace; }
+</style>
+</head>
+<body>
+<canvas id="frame"></canvas><div id="status">Click for fullscreen</div>
+<script>
+"use strict";
+const canvas = document.getElementById("frame");
+const context = canvas.getContext("2d", {alpha: false});
+const status = document.getElementById("status");
+let frameId = 0;
+
+function crc8(id) {
+  let crc = 0;
+  for (let shift = 24; shift >= 0; shift -= 8) {
+    crc ^= (id >>> shift) & 0xff;
+    for (let bit = 0; bit < 8; bit++)
+      crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xff : (crc << 1) & 0xff;
+  }
+  return crc;
+}
+
+function codeBits(id) {
+  const values = [[0xa5, 8], [id >>> 0, 32], [(~id) & 0xffff, 16], [crc8(id), 8]];
+  const bits = [];
+  for (const [value, width] of values)
+    for (let bit = width - 1; bit >= 0; bit--)
+      bits.push((value >>> bit) & 1);
+  return bits;
+}
+
+function drawBarcode(id, yFraction) {
+  const bits = codeBits(id);
+  const x0 = canvas.width * .05;
+  const width = canvas.width * .90;
+  const height = Math.max(24, canvas.height * .08);
+  const y = canvas.height * yFraction - height / 2;
+  for (let i = 0; i < bits.length; i++) {
+    context.fillStyle = bits[i] ? "#fff" : "#000";
+    const left = x0 + i * width / bits.length;
+    const right = x0 + (i + 1) * width / bits.length;
+    context.fillRect(Math.floor(left), Math.floor(y), Math.ceil(right - left), Math.ceil(height));
+  }
+}
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+  context.imageSmoothingEnabled = false;
+}
+
+function render() {
+  frameId = (frameId + 1) >>> 0;
+  context.fillStyle = "#555";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  drawBarcode(frameId, .20);
+  drawBarcode(frameId, .80);
+  context.fillStyle = "#ddd";
+  context.font = `${Math.max(20, canvas.height * .035)}px monospace`;
+  context.textAlign = "center";
+  context.fillText(`HWS FRAME ${frameId}`, canvas.width / 2, canvas.height / 2);
+  status.textContent = `frame=${frameId} ${canvas.width}x${canvas.height} ${Math.round(performance.now())}ms`;
+  requestAnimationFrame(render);
+}
+
+window.addEventListener("resize", resize);
+document.body.addEventListener("click", async () => {
+  try { await document.documentElement.requestFullscreen(); } catch (_) {}
+});
+resize();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
