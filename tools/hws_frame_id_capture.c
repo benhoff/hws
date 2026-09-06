@@ -22,6 +22,10 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include "hws_frame_pattern.h"
+#ifndef HWS_CAPTURE_SHA256
+#define HWS_CAPTURE_SHA256 "unrecorded"
+#endif
 
 #define DEFAULT_DEVICE "/dev/video1"
 #define DEFAULT_OUTPUT "captured-frames.jsonl"
@@ -78,7 +82,35 @@ struct counters {
 	uint64_t poison_errors;
 	uint64_t anomaly_dumps;
 	uint64_t anomaly_dumps_suppressed;
+	uint64_t content_errors;
 };
+
+/* Every active YUYV byte is tested; no sparse hash is treated as proof of a
+ * complete copy. Black accepts 0..24 and white 227..255 (full/limited range,
+ * eight levels of tolerance). Neutral chroma accepts 120..136. No pixels,
+ * edges, or rows are masked. Padding is rejected by capture preflight. */
+static uint64_t content_bad_bytes(const uint8_t *frame, uint32_t width,
+		uint32_t height, uint32_t stride, uint32_t id)
+{
+	uint64_t bad = 0, code = hws_pattern_code(id);
+	uint32_t x, y;
+	for (y = 0; y < height; y++) {
+		for (x = 0; x < width; x++) {
+			const uint8_t *p = frame + (size_t)y * stride + x * 2;
+			bool white = hws_pattern_white(id, code, x, y, width, height);
+			bad += white ? p[0] < 227 : p[0] > 24;
+			bad += p[1] < 120 || p[1] > 136;
+		}
+	}
+	return bad;
+}
+
+/* Count successful QBUFs, not DQBUFs, to stop replenishing early enough to
+ * drain every completion even if the consumer falls behind the device. */
+static bool queue_budget_available(uint64_t submitted, uint64_t target)
+{
+	return submitted < target;
+}
 
 static volatile sig_atomic_t stop_requested;
 
@@ -550,6 +582,7 @@ int main(int argc, char **argv)
 	uint32_t split;
 	uint32_t i;
 	bool have_previous = false;
+	uint64_t submitted = 0;
 	bool streaming = false;
 	bool capture_failed = false;
 	int fd = -1;
@@ -585,8 +618,11 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	if (format.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV ||
-	    !format.fmt.pix.sizeimage ||
-	    format.fmt.pix.bytesperline < format.fmt.pix.width * 2) {
+	    format.fmt.pix.width < 640 || format.fmt.pix.height < 480 ||
+	    format.fmt.pix.width > 4096 || format.fmt.pix.height > 2160 ||
+	    (format.fmt.pix.width & 1) ||
+	    format.fmt.pix.bytesperline != format.fmt.pix.width * 2 ||
+	    format.fmt.pix.sizeimage != format.fmt.pix.bytesperline * format.fmt.pix.height) {
 		fprintf(stderr, "unsupported capture layout\n");
 		goto out;
 	}
@@ -626,11 +662,17 @@ int main(int argc, char **argv)
 			perror("mmap");
 			goto out;
 		}
-		if (mapped[i].length < format.fmt.pix.sizeimage ||
-		    queue_buffer(fd, mapped, i, format.fmt.pix.sizeimage, split)) {
+		if (mapped[i].length < format.fmt.pix.sizeimage) {
+			fprintf(stderr, "mapped buffer is shorter than sizeimage\n");
+			goto out;
+		}
+		if (!queue_budget_available(submitted, options.frames))
+			continue;
+		if (queue_buffer(fd, mapped, i, format.fmt.pix.sizeimage, split)) {
 			perror("initial VIDIOC_QBUF");
 			goto out;
 		}
+		submitted++;
 	}
 	if (ioctl_retry(fd, VIDIOC_STREAMON, &type)) {
 		perror("VIDIOC_STREAMON");
@@ -638,7 +680,7 @@ int main(int argc, char **argv)
 	}
 	streaming = true;
 	fprintf(output,
-		"{\"type\":\"config\",\"device\":\"%s\",\"width\":%u,\"height\":%u,\"fourcc\":%u,\"bytesperline\":%u,\"sizeimage\":%u,\"split\":%u,\"buffers\":%u,\"target_frames\":%u}\n",
+		"{\"type\":\"config\",\"capture_source_sha256\":\"" HWS_CAPTURE_SHA256 "\",\"pattern\":\"" HWS_PATTERN_VERSION "\",\"pattern_sha256\":\"" HWS_PATTERN_SHA256 "\",\"device\":\"%s\",\"width\":%u,\"height\":%u,\"fourcc\":%u,\"bytesperline\":%u,\"sizeimage\":%u,\"split\":%u,\"buffers\":%u,\"target_frames\":%u}\n",
 		options.device, format.fmt.pix.width, format.fmt.pix.height,
 		format.fmt.pix.pixelformat, format.fmt.pix.bytesperline,
 		format.fmt.pix.sizeimage, split, request.count, options.frames);
@@ -665,6 +707,7 @@ int main(int argc, char **argv)
 		bool payload_ok;
 		bool flags_ok;
 		bool frame_ok;
+		uint64_t bad_bytes;
 		int ready;
 
 		ready = poll(&pollfd, 1, options.timeout_ms);
@@ -708,6 +751,11 @@ int main(int argc, char **argv)
 				       format.fmt.pix.bytesperline,
 				       LOWER_Y_PERCENT);
 		ids_match = upper.valid && lower.valid && upper.id == lower.id;
+		bad_bytes = ids_match ? content_bad_bytes(mapped[buffer.index].addr,
+			format.fmt.pix.width, format.fmt.pix.height,
+			format.fmt.pix.bytesperline, upper.id) : format.fmt.pix.sizeimage;
+		if (bad_bytes)
+			counters.content_errors++;
 		payload_ok = buffer.bytesused == format.fmt.pix.sizeimage;
 		flags_ok = !(buffer.flags & V4L2_BUF_FLAG_ERROR);
 		if (have_previous && ids_match) {
@@ -735,12 +783,13 @@ int main(int argc, char **argv)
 		if (poison_half0 || poison_half1)
 			counters.poison_errors++;
 		frame_ok = ids_match && monotonic && sequence_ok && payload_ok &&
-			   flags_ok && !poison_half0 && !poison_half1;
+			   flags_ok && !poison_half0 && !poison_half1 && !bad_bytes;
 		if (frame_ok)
 			counters.valid++;
 
 		fprintf(output,
-			"{\"type\":\"frame\",\"capture_index\":%" PRIu64 ",\"buffer_index\":%u,\"v4l2_sequence\":%u,\"timestamp_ns\":%" PRIu64 ",\"flags\":%u,\"bytesused\":%u,\"upper_valid\":%s,\"lower_valid\":%s,\"upper_id\":%u,\"lower_id\":%u,\"upper_contrast\":%u,\"lower_contrast\":%u,\"ids_match\":%s,\"monotonic\":%s,\"sequence_ok\":%s,\"payload_ok\":%s,\"poison_half0\":%s,\"poison_half1\":%s,\"poison_half0_blocks\":%u,\"poison_half1_blocks\":%u,\"half0_hash\":\"%016" PRIx64 "\",\"half1_hash\":\"%016" PRIx64 "\"}\n",
+			"{\"type\":\"frame\",\"content_bad_bytes\":%" PRIu64 ",\"content_checked_bytes\":%u,\"capture_index\":%" PRIu64 ",\"buffer_index\":%u,\"v4l2_sequence\":%u,\"timestamp_ns\":%" PRIu64 ",\"flags\":%u,\"bytesused\":%u,\"upper_valid\":%s,\"lower_valid\":%s,\"upper_id\":%u,\"lower_id\":%u,\"upper_contrast\":%u,\"lower_contrast\":%u,\"ids_match\":%s,\"monotonic\":%s,\"sequence_ok\":%s,\"payload_ok\":%s,\"poison_half0\":%s,\"poison_half1\":%s,\"poison_half0_blocks\":%u,\"poison_half1_blocks\":%u,\"half0_hash\":\"%016" PRIx64 "\",\"half1_hash\":\"%016" PRIx64 "\"}\n",
+			bad_bytes, ids_match ? format.fmt.pix.sizeimage : 0,
 			counters.captured - 1, buffer.index, buffer.sequence,
 			timeval_ns(&buffer.timestamp), buffer.flags, buffer.bytesused,
 			upper.valid ? "true" : "false",
@@ -784,13 +833,14 @@ int main(int argc, char **argv)
 			previous_sequence = buffer.sequence;
 			have_previous = true;
 		}
-		if (counters.captured < options.frames) {
+		if (queue_budget_available(submitted, options.frames)) {
 			if (queue_buffer(fd, mapped, buffer.index,
 					 format.fmt.pix.sizeimage, split)) {
 				perror("VIDIOC_QBUF");
 				capture_failed = true;
 				break;
 			}
+			submitted++;
 		}
 		now_ns = monotonic_ns();
 		if (now_ns - previous_progress_ns >= UINT64_C(30000000000)) {
@@ -811,10 +861,12 @@ int main(int argc, char **argv)
 	}
 	if (fflush(output))
 		capture_failed = true;
-	result = !capture_failed && counters.captured == options.frames &&
+	result = !capture_failed && submitted == counters.captured &&
+		 counters.captured == options.frames &&
 		 counters.valid == counters.captured ? 0 : 1;
 	fprintf(output,
-		"{\"type\":\"summary\",\"result\":\"%s\",\"captured\":%" PRIu64 ",\"valid\":%" PRIu64 ",\"decode_errors\":%" PRIu64 ",\"id_mismatches\":%" PRIu64 ",\"backwards_ids\":%" PRIu64 ",\"repeated_ids\":%" PRIu64 ",\"sequence_errors\":%" PRIu64 ",\"payload_errors\":%" PRIu64 ",\"flagged_errors\":%" PRIu64 ",\"poison_errors\":%" PRIu64 ",\"anomaly_dumps\":%" PRIu64 ",\"anomaly_dumps_suppressed\":%" PRIu64 "}\n",
+		"{\"type\":\"summary\",\"submitted\":%" PRIu64 ",\"outstanding\":%" PRIu64 ",\"content_errors\":%" PRIu64 ",\"result\":\"%s\",\"captured\":%" PRIu64 ",\"valid\":%" PRIu64 ",\"decode_errors\":%" PRIu64 ",\"id_mismatches\":%" PRIu64 ",\"backwards_ids\":%" PRIu64 ",\"repeated_ids\":%" PRIu64 ",\"sequence_errors\":%" PRIu64 ",\"payload_errors\":%" PRIu64 ",\"flagged_errors\":%" PRIu64 ",\"poison_errors\":%" PRIu64 ",\"anomaly_dumps\":%" PRIu64 ",\"anomaly_dumps_suppressed\":%" PRIu64 "}\n",
+		submitted, submitted - counters.captured, counters.content_errors,
 		result ? "fail" : "pass", counters.captured, counters.valid,
 		counters.decode_errors, counters.id_mismatches,
 		counters.backwards_ids, counters.repeated_ids,

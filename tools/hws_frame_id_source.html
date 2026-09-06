@@ -17,6 +17,11 @@ const canvas = document.getElementById("frame");
 const context = canvas.getContext("2d", {alpha: false});
 const status = document.getElementById("status");
 let frameId = 0;
+const telemetry = [{type: "source_config", schema: 1, backend: "browser-raf",
+  clock: "performance.now", time_origin_ms: performance.timeOrigin,
+  scanout_proven: false}];
+const maxRecords = 100000;
+let telemetryDropped = 0;
 
 function crc8(id) {
   let crc = 0;
@@ -57,7 +62,7 @@ function resize() {
   context.imageSmoothingEnabled = false;
 }
 
-function render() {
+function render(rafTimestamp) {
   frameId = (frameId + 1) >>> 0;
   context.fillStyle = "#555";
   context.fillRect(0, 0, canvas.width, canvas.height);
@@ -68,8 +73,30 @@ function render() {
   context.textAlign = "center";
   context.fillText(`HWS FRAME ${frameId}`, canvas.width / 2, canvas.height / 2);
   status.textContent = `frame=${frameId} ${canvas.width}x${canvas.height} ${Math.round(performance.now())}ms`;
+  if (telemetry.length < maxRecords)
+    telemetry.push({type: "render", id: frameId, raf_ms: rafTimestamp,
+      draw_done_ms: performance.now(), width: canvas.width, height: canvas.height,
+      visible: document.visibilityState, fullscreen: !!document.fullscreenElement});
+  else
+    telemetryDropped++;
   requestAnimationFrame(render);
 }
+
+// Press E to export bounded application-render telemetry. rAF timestamps are
+// NOT page-flip completions; use the KMS source for physical presentation proof.
+window.addEventListener("keydown", event => {
+  if (event.key.toLowerCase() !== "e" || event.repeat) return;
+  const records = [...telemetry, {type: "source_summary", backend: "browser-raf",
+    scanout_proven: false, dropped: telemetryDropped}];
+  const url = URL.createObjectURL(new Blob(
+    [records.map(record => JSON.stringify(record)).join("\n") + "\n"],
+    {type: "application/x-ndjson"}));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "hws-browser-render.jsonl";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 
 window.addEventListener("resize", resize);
 document.body.addEventListener("click", async () => {

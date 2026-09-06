@@ -405,6 +405,8 @@ static void hws_video_reset_evidence_locked(struct hws_video *vid)
 	vid->evidence_overlap_reports = 0;
 	vid->evidence_resync_reports = 0;
 	vid->evidence_queue_failures = 0;
+	vid->evidence_probe_count = 0;
+	memset(&vid->evidence_probe, 0, sizeof(vid->evidence_probe));
 	vid->recovery_notice_mask = 0;
 }
 

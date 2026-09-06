@@ -24,6 +24,7 @@
 #include <media/videobuf2-dma-sg.h>
 
 #include "hws_reg.h"
+#include "hws_probe.h"
 
 struct snd_pcm_substream;
 struct dentry;
@@ -246,6 +247,8 @@ struct hws_video {
 	u64 evidence_overlap_reports;
 	u64 evidence_resync_reports;
 	u64 evidence_queue_failures;
+	u32 evidence_probe_count;
+	struct hws_dma_probe_state evidence_probe;
 	u32 recovery_notice_mask;
 
 	bool window_valid;

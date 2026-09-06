@@ -6,6 +6,62 @@
 #define _HWS_TRACE_H
 
 #include <linux/tracepoint.h>
+#include "hws_probe.h"
+
+TRACE_EVENT(hws_vdone_probe,
+	TP_PROTO(const char *device, u32 channel, u64 epoch, u64 generation,
+		 u32 index, const struct hws_dma_probe *p),
+	TP_ARGS(device, channel, epoch, generation, index, p),
+	TP_STRUCT__entry(
+		__string(device, device)
+		__field(u32, channel)
+		__field(u64, epoch)
+		__field(u64, generation)
+		__field(u32, index)
+		__field(u32, window)
+		__field(u8, position)
+		__field(u64, started_ns)
+		__field(u64, duration_ns)
+		__field(u32, status)
+		__field(u8, before)
+		__field(u8, after)
+		__array(u64, code, 4)
+		__array(u32, offset, 2)
+		__array(u8, contrast, 4)
+	),
+	TP_fast_assign(
+		__assign_str(device);
+		__entry->channel = channel;
+		__entry->epoch = epoch;
+		__entry->generation = generation;
+		__entry->index = index;
+		__entry->window = p->window;
+		__entry->position = p->position;
+		__entry->started_ns = p->started_ns;
+		__entry->duration_ns = p->duration_ns;
+		__entry->status = p->status;
+		__entry->before = p->before;
+		__entry->after = p->after;
+		memcpy(__entry->code, p->code, sizeof(p->code));
+		memcpy(__entry->offset, p->offset, sizeof(p->offset));
+		memcpy(__entry->contrast, p->contrast, sizeof(p->contrast));
+	),
+	TP_printk("device=%s ch=%u epoch=%llu generation=%llu index=%u window=%u position=%u started_ns=%llu duration_ns=%llu before=%u after=%u status=0x%08x offset0=%u offset1=%u code0=0x%016llx code1=0x%016llx code2=0x%016llx code3=0x%016llx contrast0=%u contrast1=%u contrast2=%u contrast3=%u",
+		  __get_str(device), __entry->channel,
+		  (unsigned long long)__entry->epoch,
+		  (unsigned long long)__entry->generation, __entry->index,
+		  __entry->window, __entry->position,
+		  (unsigned long long)__entry->started_ns,
+		  (unsigned long long)__entry->duration_ns,
+		  __entry->before, __entry->after, __entry->status,
+		  __entry->offset[0], __entry->offset[1],
+		  (unsigned long long)__entry->code[0],
+		  (unsigned long long)__entry->code[1],
+		  (unsigned long long)__entry->code[2],
+		  (unsigned long long)__entry->code[3],
+		  __entry->contrast[0], __entry->contrast[1],
+		  __entry->contrast[2], __entry->contrast[3])
+);
 
 TRACE_EVENT(hws_vdone_stream,
 	TP_PROTO(const char *device, u32 channel, u64 epoch, u8 action,

@@ -817,6 +817,107 @@ hws_vdone_note_recovery_locked(struct hws_video *v, u64 generation,
 				 dropped_partial, steady, reports);
 }
 
+/*
+ * Observe BOTH physical regions, before the driver's completion decision.
+ * Never select a source using toggle/completed_half. Each pass reads only
+ * 128 Y samples per two-region read; thresholded records and contrast are
+ * preserved for offline preamble/complement/CRC decoding. These are sparse
+ * content observations,
+ * not an assertion that an entire DMA region was stationary.
+ */
+static void hws_irq_probe_emit(struct hws_video *v, u64 generation,
+			       const struct hws_dma_probe *sample,
+			       u32 window, u8 position)
+{
+	struct hws_dma_probe p = *sample;
+	u32 index;
+
+	p.window = window;
+	p.position = position;
+	index = window ? ++v->evidence_probe.records : ++v->evidence_probe_count;
+	trace_hws_vdone_probe(pci_name(v->parent->pdev), v->channel_index,
+			      v->evidence_stream_epoch, generation, index, &p);
+}
+
+static void hws_irq_probe_ring(struct hws_video *v, u64 generation)
+{
+	struct hws_pcie_dev *hws = v->parent;
+	struct hws_dma_probe_state *state = &v->evidence_probe;
+	struct hws_dma_probe p = { };
+	u8 values[HWS_DMA_PROBE_BITS];
+	u8 *ring;
+	u32 width = v->pix.width, stride = v->pix.bytesperline;
+	u32 x0 = width * 5 / 100, span = width * 90 / 100;
+	u32 pass, cell;
+
+	lockdep_assert_held(&v->irq_lock);
+	if (!trace_hws_vdone_probe_enabled() ||
+	    state->reads >= HWS_DMA_PROBE_READ_LIMIT)
+		return;
+	ring = hws_video_ring_cpu(hws, v->channel_index);
+	if (!ring || !hws_yuyv_layout_valid(&v->pix) ||
+	    v->ring_extent < v->pix.sizeimage)
+		return;
+	p.offset[0] = (v->pix.height * 20 / 100) * stride;
+	p.offset[1] = (v->pix.height * 80 / 100) * stride;
+	if (p.offset[0] + stride > v->ring_split ||
+	    p.offset[1] < v->ring_split ||
+	    p.offset[1] + stride > v->pix.sizeimage)
+		return;
+	p.started_ns = ktime_get_mono_fast_ns();
+	p.before = readl(hws->bar0_base +
+			 HWS_REG_VBUF_TOGGLE(v->channel_index)) & 1;
+	for (pass = 0; pass < 4; pass++) {
+		u8 low = 255, high = 0, threshold;
+
+		dma_rmb();
+		for (cell = 0; cell < HWS_DMA_PROBE_BITS; cell++) {
+			u32 x = x0 + (2 * cell + 1) * span / 128;
+
+			values[cell] = READ_ONCE(ring[p.offset[pass & 1] + x * 2]);
+			low = min(low, values[cell]);
+			high = max(high, values[cell]);
+		}
+		p.contrast[pass] = high - low;
+		threshold = low + (high - low) / 2;
+		for (cell = 0; cell < HWS_DMA_PROBE_BITS; cell++)
+			p.code[pass] = (p.code[pass] << 1) |
+				      (values[cell] > threshold);
+	}
+	dma_rmb();
+	p.after = readl(hws->bar0_base +
+			HWS_REG_VBUF_TOGGLE(v->channel_index)) & 1;
+	p.status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	p.duration_ns = ktime_get_mono_fast_ns() - p.started_ns;
+	state->reads++;
+	if (state->reads <= HWS_DMA_PROBE_LIMIT)
+		hws_irq_probe_emit(v, generation, &p, 0, 0);
+	/* Keep just one previous observation in preallocated storage. Later
+	 * same-toggle events preserve it plus the trigger and two following
+	 * samples. Both total DMA reads and trace records have hard caps. */
+	if (state->previous_generation + 1 == generation &&
+	    state->previous_generation && p.before == state->previous.before) {
+		state->triggers++;
+		if (!state->remaining && state->windows < HWS_DMA_ANOMALY_WINDOWS) {
+			state->windows++;
+			hws_irq_probe_emit(v, state->previous_generation,
+					   &state->previous, state->windows, 0);
+			hws_irq_probe_emit(v, generation, &p, state->windows, 1);
+			state->remaining = HWS_DMA_ANOMALY_POST;
+			goto remember;
+		}
+		state->suppressed++;
+	}
+	if (state->remaining) {
+		hws_irq_probe_emit(v, generation, &p, state->windows,
+				   2 + HWS_DMA_ANOMALY_POST - state->remaining);
+		state->remaining--;
+	}
+remember:
+	state->previous = p;
+	state->previous_generation = generation;
+}
+
 static enum hws_vdone_record_result
 hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     const struct hws_vdone_toggle_sample *sample,
@@ -856,6 +957,8 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		if (!v->next_completion_generation)
 			v->next_completion_generation++;
 		generation = v->next_completion_generation;
+		if (trace_hws_vdone_probe_enabled())
+			hws_irq_probe_ring(v, generation);
 		previous_ns = v->last_vdone_timestamp_ns;
 		if (timestamp_ns > previous_ns)
 			interval_us = div_u64(timestamp_ns - previous_ns,

@@ -24,6 +24,10 @@ import tempfile
 import time
 from typing import Any
 
+from hws_vdone_observers import (
+    measure_vdone, validate_anomalies, validate_content, validate_mapping, validate_source,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CAPTURE = ROOT / "tools" / "hws_frame_id_capture"
@@ -34,6 +38,7 @@ TRACE_EVENTS = (
     "hws:hws_vdone_copy",
     "hws:hws_vdone_frame",
     "hws:hws_vdone_recovery",
+    "hws:hws_vdone_probe",
 )
 FAILURE_PATTERNS = (
     "VDONE ambiguity",
@@ -47,9 +52,13 @@ REPRODUCIBLE_INPUTS = (
     "src/hws_debugfs.h",
     "src/hws_trace.c",
     "src/hws_trace.h",
+    "src/hws_probe.h",
     "tools/hws_frame_id_capture.c",
     "tools/hws_frame_id_source.html",
     "tools/hws_vdone_evidence.py",
+    "tools/hws_vdone_observers.py",
+    "tools/hws_frame_id_kms.c",
+    "tools/hws_frame_pattern.h",
 )
 
 
@@ -262,12 +271,20 @@ def parse_frame_file(
                 record = json.loads(line)
             except json.JSONDecodeError as error:
                 raise EvidenceError(f"invalid JSONL at {path}:{line_number}") from error
+            if summary is not None:
+                raise EvidenceError("capture JSONL contains records after its terminal summary")
             if record.get("type") == "config":
+                if configs or frames:
+                    raise EvidenceError("capture configuration must be the first record")
                 configs.append(record)
             elif record.get("type") == "frame":
+                if not configs:
+                    raise EvidenceError("capture frame precedes configuration")
                 frames.append(record)
             elif record.get("type") == "summary":
                 summary = record
+            else:
+                raise EvidenceError("capture JSONL contains an unsupported record")
     if summary is None:
         raise EvidenceError("capture JSONL has no terminal summary")
     if len(configs) != 1:
@@ -279,10 +296,10 @@ def trace_fields(line: str) -> dict[str, str]:
     return dict(re.findall(r"([a-zA-Z0-9_]+)=([^\s]+)", line))
 
 
-def trace_records(trace_path: Path, channel: int, epoch: int) -> dict[str, list[dict[str, str]]]:
+def trace_records(trace_path: Path, channel: int, epoch: int, device: str) -> dict[str, list[dict[str, str]]]:
     records: dict[str, list[dict[str, str]]] = {
         "irq": [], "copy": [], "frame": [], "recovery": [], "stream": [],
-        "loss": [],
+        "loss": [], "probe": [],
     }
     process = subprocess.Popen(
         ["trace-cmd", "report", "-i", str(trace_path)],
@@ -296,13 +313,15 @@ def trace_records(trace_path: Path, channel: int, epoch: int) -> dict[str, list[
             records["loss"].append({"line": line.strip()})
             continue
         event = None
-        for name in ("irq", "copy", "frame", "recovery", "stream"):
+        for name in ("irq", "copy", "frame", "recovery", "stream", "probe"):
             if f"hws_vdone_{name}:" in line:
                 event = name
                 break
         if event is None:
             continue
         fields = trace_fields(line)
+        if fields.get("device") != device:
+            continue
         try:
             if int(fields.get("ch", "-1"), 0) != channel:
                 continue
@@ -349,8 +368,12 @@ def validate_bundle(
         bundle / "captured-frames.jsonl"
     )
     epoch = integer(after, "stream_epoch")
-    trace = trace_records(bundle / "kernel-trace.dat", selected_channel, epoch)
+    trace = trace_records(bundle / "kernel-trace.dat", selected_channel, epoch, manifest["pci_bdf"])
     failures: list[str] = []
+
+    if manifest.get("schema") != 3:
+        failures.append("bundle predates full-frame content and queue/timing evidence")
+    failures.extend(validate_content(frames, capture_config, frame_summary, manifest))
 
     if manifest.get("tracked_status"):
         failures.append("driver evidence was captured from a dirty tracked tree")
@@ -716,24 +739,63 @@ def validate_bundle(
     if manifest.get("capture_exit_code"):
         failures.append(f"frame-ID capture exited with status {manifest['capture_exit_code']}")
 
+    mapping, mapping_failures = validate_mapping(
+        [p for p in trace["probe"] if int(p.get("window", "0"), 0) == 0],
+        trace["irq"], trace["frame"], frames, config_after,
+        int(after.get("probe_count", "0"), 0),
+    )
+    failures.extend(mapping_failures)
+    source_path = bundle / "source-presentation.jsonl"
+    source_records = (
+        [json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()]
+        if source_path.exists() else []
+    )
+    presentation, presentation_failures = validate_source(
+        source_records, frames, config_after, manifest.get("boot_id"),
+    )
+    source_configs = [r for r in source_records if r.get("type") == "source_config"]
+    if source_configs and (
+        source_configs[0].get("pattern") != capture_config.get("pattern")
+        or source_configs[0].get("pattern_sha256") != manifest.get("pattern_sha256")
+    ):
+        presentation["result"] = "fail"
+        presentation_failures.append("source and capture full-frame patterns differ")
+    if source_configs and (
+        not manifest.get("kms_source_sha256")
+        or source_configs[0].get("source_sha256") != manifest["kms_source_sha256"]
+    ):
+        presentation["result"] = "fail"
+        presentation["repeat_attribution"] = "unresolved"
+        presentation_failures.append("source binary build digest differs from the recorded source code")
+    failures.extend(presentation_failures)
+
+    anomalies, anomaly_failures = validate_anomalies(
+        trace["probe"], trace["irq"], config_after, after,
+        source_records, presentation["result"] == "pass",
+    )
+    failures.extend(anomaly_failures)
+
+    timing, timing_failures = measure_vdone(trace["irq"])
+    failures.extend(timing_failures)
+
     summary = {
-        "schema": 1,
+        "schema": 3,
         "result": "pass" if not failures else "fail",
         "run_id": manifest["run_id"],
         "channel": selected_channel,
         "stream_epoch": epoch,
         "vdone_observed": observed,
-        "vdone_rate_hz": (
-            observed / manifest["elapsed_seconds"]
-            if manifest.get("elapsed_seconds")
-            else None
-        ),
+        "vdone_rate_hz": timing["rate_hz"],
+        "vdone_timing": timing,
         "irq_trace_records": len(trace["irq"]),
         "copy_trace_records": len(trace["copy"]),
         "frame_trace_records": len(trace["frame"]),
         "recovery_trace_records": len(trace["recovery"]),
         "captured_frames": len(frames),
         "frame_id_summary": frame_summary,
+        "independent_mapping": mapping,
+        "source_presentation": presentation,
+        "anomaly_observation": anomalies,
         "failures": failures,
     }
     if write_summary:
@@ -755,12 +817,17 @@ def capture_file(command: list[str], path: Path, *, privileged: bool = False) ->
 def build_manifest(args: argparse.Namespace, run_id: str, bdf: str) -> dict[str, Any]:
     module = args.module.resolve()
     return {
-        "schema": 1,
+        "schema": 3,
         "run_id": run_id,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "device": str(args.device),
         "pci_bdf": bdf,
         "channel": args.channel,
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "source_telemetry_path": str(args.source_telemetry) if args.source_telemetry else None,
+        "kms_source_sha256": sha256(ROOT / "tools" / "hws_frame_id_kms.c"),
+        "pattern_sha256": sha256(ROOT / "tools" / "hws_frame_pattern.h"),
+        "observer_validator_sha256": sha256(ROOT / "tools" / "hws_vdone_observers.py"),
         "target_frames": args.frames,
         "label": args.label,
         "git_head": run(["git", "rev-parse", "HEAD"], cwd=ROOT).stdout.strip(),
@@ -774,6 +841,7 @@ def build_manifest(args: argparse.Namespace, run_id: str, bdf: str) -> dict[str,
         "loaded_srcversion": Path("/sys/module/HwsCapture/srcversion").read_text().strip(),
         "frame_source_sha256": sha256(ROOT / "tools" / "hws_frame_id_source.html"),
         "capture_tool_sha256": sha256(args.capture.resolve()),
+        "capture_source_sha256": sha256(ROOT / "tools" / "hws_frame_id_capture.c"),
         "evidence_runner_sha256": sha256(Path(__file__).resolve()),
         "kernel": os.uname().release,
         "trace_events": list(TRACE_EVENTS),
@@ -793,6 +861,11 @@ def run_capture(args: argparse.Namespace) -> int:
         raise EvidenceError(f"capture tool is missing or not executable: {args.capture}")
     if not args.module.is_file():
         raise EvidenceError(f"module is missing: {args.module}")
+    if args.source_telemetry:
+        if not args.source_telemetry.is_file():
+            raise EvidenceError("--source-telemetry must name the running source's JSONL file")
+        if args.source_telemetry.stat().st_size > 128 * 1024 * 1024:
+            raise EvidenceError("source telemetry exceeds the 128 MiB evidence bound")
     if not Path("/sys/module/HwsCapture/srcversion").exists():
         raise EvidenceError("HwsCapture is not loaded")
     dirty_tracked = tracked_status()
@@ -901,6 +974,21 @@ def run_capture(args: argparse.Namespace) -> int:
         bundle / "trace-stat.txt",
     )
 
+    if args.source_telemetry:
+        # A source may still be running. Preserve only a complete, bounded
+        # JSONL prefix; never alter its file or include a torn final record.
+        with args.source_telemetry.open("rb") as source:
+            payload = source.read(128 * 1024 * 1024 + 1)
+        if len(payload) > 128 * 1024 * 1024:
+            raise EvidenceError("source telemetry exceeds the 128 MiB evidence bound")
+        last_newline = payload.rfind(b"\n")
+        if last_newline < 0:
+            raise EvidenceError("source telemetry has no complete records")
+        write_text_exclusive(
+            bundle / "source-presentation.jsonl",
+            payload[:last_newline + 1].decode("utf-8"),
+        )
+
     summary = validate_bundle(bundle, args.channel, write_summary=True)
     write_bundle_checksums(bundle)
     seal_bundle(bundle)
@@ -923,6 +1011,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--label", default="native-split-frame-id")
     result.add_argument("--capture", type=Path, default=DEFAULT_CAPTURE)
     result.add_argument("--module", type=Path, default=DEFAULT_MODULE)
+    result.add_argument(
+        "--source-telemetry", type=Path,
+        help="KMS source JSONL on the same host/boot; absence makes mapping validation non-passing",
+    )
     result.add_argument("--keep-timings", action="store_true")
     result.add_argument(
         "--allow-dirty",

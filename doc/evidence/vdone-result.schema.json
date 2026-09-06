@@ -8,22 +8,52 @@
     "schema", "result", "run_id", "channel", "stream_epoch",
     "vdone_observed", "irq_trace_records", "copy_trace_records",
     "frame_trace_records", "recovery_trace_records", "captured_frames",
-    "frame_id_summary", "failures"
+    "frame_id_summary", "independent_mapping", "source_presentation", "vdone_timing", "anomaly_observation", "failures"
   ],
   "properties": {
-    "schema": { "const": 1 },
+    "schema": { "const": 3 },
     "result": { "enum": ["pass", "fail"] },
     "run_id": { "type": "string", "minLength": 1 },
     "channel": { "type": "integer", "minimum": 0, "maximum": 3 },
     "stream_epoch": { "type": "integer", "minimum": 1 },
     "vdone_observed": { "type": "integer", "minimum": 0 },
     "vdone_rate_hz": { "type": ["number", "null"], "minimum": 0 },
+    "vdone_timing": {
+      "type": "object",
+      "required": ["basis", "events", "interval_count", "elapsed_seconds", "rate_hz", "interval_ns"],
+      "properties": { "basis": { "const": "active-irq-first-last-intervals" } }
+    },
     "irq_trace_records": { "type": "integer", "minimum": 0 },
     "copy_trace_records": { "type": "integer", "minimum": 0 },
     "frame_trace_records": { "type": "integer", "minimum": 0 },
     "recovery_trace_records": { "type": "integer", "minimum": 0 },
     "captured_frames": { "type": "integer", "minimum": 0 },
     "frame_id_summary": { "type": "object" },
+    "independent_mapping": {
+      "type": "object",
+      "required": ["result", "method", "limit", "records", "counts", "mapping"],
+      "properties": {
+        "result": { "enum": ["pass", "fail"] },
+        "mapping": { "enum": ["toggle_xor_1", "unproven"] },
+        "limit": { "const": 4096 },
+        "records": { "type": "integer", "minimum": 0, "maximum": 4096 }
+      }
+    },
+    "source_presentation": {
+      "type": "object",
+      "required": ["result", "repeat_attribution"],
+      "properties": { "result": { "enum": ["pass", "fail"] } }
+    },
+    "anomaly_observation": {
+      "type": "object",
+      "required": ["result", "read_limit", "reads", "window_limit", "windows", "counts", "unobserved_same_toggle_irq_pairs"],
+      "properties": {
+        "read_limit": { "const": 131072 },
+        "window_limit": { "const": 16 },
+        "records": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "windows": { "type": "array", "maxItems": 16 }
+      }
+    },
     "failures": { "type": "array", "items": { "type": "string" } }
   }
 }

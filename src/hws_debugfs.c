@@ -10,6 +10,7 @@
 #include "hws.h"
 #include "hws_debugfs.h"
 #include "hws_reg.h"
+#include "hws_probe.h"
 
 struct hws_video_evidence_snapshot {
 	u64 stream_epoch;
@@ -32,6 +33,9 @@ struct hws_video_evidence_snapshot {
 	u64 resync_reports;
 	u64 queue_failures;
 	u64 generation;
+	u32 probe_count;
+	u32 probe_reads, anomaly_windows, anomaly_records, anomaly_triggers;
+	u32 anomaly_suppressed;
 	u32 sequence;
 	u32 completion_overruns;
 	u32 w1c_ambiguities;
@@ -77,6 +81,12 @@ static void hws_debugfs_snapshot(struct hws_video *v,
 	s->resync_reports = v->evidence_resync_reports;
 	s->queue_failures = v->evidence_queue_failures;
 	s->generation = v->next_completion_generation;
+	s->probe_count = v->evidence_probe_count;
+	s->probe_reads = v->evidence_probe.reads;
+	s->anomaly_windows = v->evidence_probe.windows;
+	s->anomaly_records = v->evidence_probe.records;
+	s->anomaly_triggers = v->evidence_probe.triggers;
+	s->anomaly_suppressed = v->evidence_probe.suppressed;
 	s->sequence = (u32)atomic_read(&v->sequence_number);
 	s->completion_overruns = v->completion_overruns;
 	s->w1c_ambiguities = v->w1c_ambiguities;
@@ -179,6 +189,13 @@ static int hws_debugfs_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "stop_requested=%u\n", s.stop_requested);
 	seq_printf(m, "phase=%u\n", s.phase);
 	seq_printf(m, "generation=%llu\n", (unsigned long long)s.generation);
+	seq_printf(m, "probe_count=%u\n", s.probe_count);
+	seq_printf(m, "probe_limit=%u\n", HWS_DMA_PROBE_LIMIT);
+	seq_printf(m, "probe_reads=%u\nprobe_read_limit=%u\n",
+		   s.probe_reads, HWS_DMA_PROBE_READ_LIMIT);
+	seq_printf(m, "anomaly_windows=%u\nanomaly_records=%u\nanomaly_triggers=%u\nanomaly_suppressed=%u\nanomaly_window_limit=%u\n",
+		   s.anomaly_windows, s.anomaly_records, s.anomaly_triggers,
+		   s.anomaly_suppressed, HWS_DMA_ANOMALY_WINDOWS);
 	seq_printf(m, "sequence=%u\n", s.sequence);
 	seq_printf(m, "vdone_observed=%llu\n",
 		   (unsigned long long)s.vdone_observed);

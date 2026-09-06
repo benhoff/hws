@@ -57,5 +57,7 @@ dkms.conf
 # Local userspace test builds and Python bytecode
 tools/hws_frame_id_capture
 tools/hws_vdone_sampler
+tools/hws_frame_id_kms
+tools/test_frame_id_kms
 __pycache__/
 *.py[cod]

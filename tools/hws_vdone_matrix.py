@@ -52,8 +52,12 @@ def fourcc(value: int) -> str:
 
 
 def load_frame_summary(path: Path) -> dict[str, object]:
+    summaries = []
     with path.open(encoding="utf-8") as stream:
-        summaries = [json.loads(line) for line in stream if '"type":"summary"' in line]
+        for line in stream:
+            record = json.loads(line)
+            if record.get("type") == "summary":
+                summaries.append(record)
     if len(summaries) != 1:
         raise ValueError("captured-frames.jsonl must contain exactly one summary")
     return summaries[0]
@@ -98,10 +102,14 @@ def make_row(args: argparse.Namespace, header: list[str]) -> list[str]:
         "split_register_16": config["split16_cached"],
         "split_readback_16": config["split16_readback"],
         "irq_mode": config["irq_mode"],
-        "vdone_count": str(summary["vdone_observed"]),
-        "elapsed_seconds": f"{manifest['elapsed_seconds']:.6f}",
-        "vdone_rate_hz": f"{summary['vdone_rate_hz']:.6f}",
-        "toggle_mapping": "toggle_xor_1",
+        "vdone_count": str(summary["vdone_timing"]["events"]),
+        "elapsed_seconds": (
+            f"{summary['vdone_timing']['elapsed_seconds']:.9f}"
+            if summary['vdone_timing']['elapsed_seconds'] is not None else "unknown"
+        ),
+        "vdone_rate_hz": (f"{summary['vdone_rate_hz']:.6f}"
+                          if summary['vdone_rate_hz'] is not None else "unknown"),
+        "toggle_mapping": summary["independent_mapping"]["mapping"],
         "frame_id_frames": str(frame["captured"]),
         "frame_id_mismatches": str(frame["id_mismatches"]),
         "backwards_ids": str(frame["backwards_ids"]),
@@ -114,7 +122,18 @@ def make_row(args: argparse.Namespace, header: list[str]) -> list[str]:
         "source_commit": args.source_commit or manifest["git_head"],
         "artifact_uri": args.artifact_uri,
         "artifact_sha256": sha256(bundle / "SHA256SUMS"),
-        "notes": args.notes,
+        "notes": (
+            f"independent_probe={summary['independent_mapping']['result']}; "
+            f"probe_records={summary['independent_mapping']['records']}; "
+            f"source_presentation={summary['source_presentation']['result']}; "
+            f"content_errors={frame.get('content_errors', 'unknown')}; "
+            f"payload_pattern=hws-bw-tiles-v1; "
+            f"rate_basis=active-irq-first-last-intervals; "
+            f"rate_intervals={summary['vdone_timing']['interval_count']}; "
+            f"anomaly_windows={len(summary['anomaly_observation']['windows'])}; "
+            f"unobserved_same_toggle_pairs={summary['anomaly_observation']['unobserved_same_toggle_irq_pairs']}; "
+            + args.notes
+        ),
     }
     missing = [field for field in header if field not in values]
     if missing:

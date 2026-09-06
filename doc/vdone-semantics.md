@@ -72,6 +72,14 @@ A run passes only when all of the following hold:
 - The trace contains no lost records and the configured split remains stable.
 - Every observed VDONE has exactly one recorded disposition.
 - Every accepted VDONE records `completed_half == stable_toggle ^ 1`.
+- The bounded independent probe reads both physical private-ring regions before
+  the completion decision. Raw barcode changes support `toggle ^ 1` for at
+  least 32 unambiguous intervals per region, with no opposing observations.
+  Driver-reported `completed_half` is not used to infer the changed region.
+- Every delivered frame within the independent observation window matches the
+  ring IDs at its two generations; at least 16 such deliveries are tested.
+- Source KMS page-flip evidence identifies the presented IDs, mode, clock
+  domain, and refresh occupancy. rAF callbacks alone do not satisfy this gate.
 - Every successful copy links to exactly one accepted IRQ with the same stable
   toggle and completed half.
 - Every delivered frame links to consecutive half-0 and half-1 generations,
@@ -81,6 +89,11 @@ A run passes only when all of the following hold:
 - Both independently decoded frame IDs are valid and equal.
 - Captured IDs never move backward.
 - No delivered buffer retains its pre-QBUF poison or has a short/error payload.
+- Every active YUYV byte matches the versioned whole-frame KMS pattern within
+  the runbook's explicit luminance/chroma tolerances. Poison-block hashes alone
+  do not establish complete payload coverage.
+- Successful QBUF submissions equal captured/target frames, with no outstanding
+  buffers at normal completion. Every traced delivery remains accounted for.
 - Guard errors, fatal VDONE dispositions, and unrecovered queue failures are
   zero.
 - Final configuration and guard evidence is preserved with the run.
@@ -90,6 +103,23 @@ A run passes only when all of the following hold:
 
 Repeated source IDs are measurements, not failures. They must not be described
 as DMA repetition unless source-side evidence rules out display repetition.
+The validator separately reports repetitions supported by source refresh
+occupancy and those exceeding it. Missing presentation telemetry or independent
+content evidence leaves the overall result non-passing.
+
+The continuous mapping trace is capped at 4,096 observations per stream. Its result applies
+to the recorded generation window and sampled barcode positions; it is not a
+whole-region write monitor or an independent mapping observation of the entire
+soak. A bounded rolling observer may additionally preserve 16 same-toggle
+windows (at most 64 records); total read observations are capped at 131,072.
+This adds diagnostic overhead but no continuous printk stream. Unobserved,
+suppressed, truncated, and inconclusive anomalies remain explicit, and no
+anomaly classification is a device-wide claim about interrupt loss.
+
+Summary schema 3 preserves those limits alongside full-frame content, queue
+drain, delivery, and guard checks. VDONE rate uses N−1 intervals over first/last
+active-IRQ timestamps, not orchestration wall time. No hardware result is implied by implementing this harness;
+channel 1 still requires the native-split run described in the runbook.
 
 ## Claim levels
 
