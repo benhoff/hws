@@ -954,6 +954,20 @@ static void hws_free_irq_vectors(void *data)
 	pci_free_irq_vectors(pdev);
 }
 
+static void hws_release_irq(void *data)
+{
+	struct hws_pcie_dev *hws = data;
+
+	/* Registered after BAR/vector resources: runs before they disappear. */
+	mutex_lock(&hws->irq_lifetime_lock);
+	if (hws->irq_registered) {
+		free_irq(hws->irq, hws);
+		hws->irq_registered = false;
+	}
+	WRITE_ONCE(hws->irq, -1);
+	mutex_unlock(&hws->irq_lifetime_lock);
+}
+
 static int hws_alloc_irq(struct hws_pcie_dev *hws, unsigned long *irq_flags)
 {
 	struct pci_dev *pdev = hws->pdev;
@@ -1096,6 +1110,7 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		return ret;
 
 	hws->irq = -1;
+	mutex_init(&hws->irq_lifetime_lock);
 	hws->suspended = false;
 	mutex_init(&hws->monitor_lock);
 	mutex_init(&hws->dma_lock);
@@ -1235,14 +1250,19 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 	}
 
 	/* D) The hard handler demultiplexes causes into per-channel workers. */
-	ret = devm_request_irq(&pdev->dev, irq, hws_irq_handler, irqf,
-			       dev_name(&pdev->dev), hws);
+	ret = request_irq(irq, hws_irq_handler, irqf, dev_name(&pdev->dev), hws);
 	if (ret) {
 		dev_err(&pdev->dev, "request_irq(%d) failed: %d\n",
 			irq, ret);
 		hws->irq = -1;
 		goto err_unwind_channels;
 	}
+	mutex_lock(&hws->irq_lifetime_lock);
+	hws->irq_registered = true;
+	mutex_unlock(&hws->irq_lifetime_lock);
+	ret = devm_add_action_or_reset(&pdev->dev, hws_release_irq, hws);
+	if (ret)
+		goto err_unwind_channels;
 
 	/* E) Initialize the idle core while PCI bus mastering remains disabled. */
 	ret = hws_init_video_sys(hws);

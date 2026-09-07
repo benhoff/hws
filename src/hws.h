@@ -332,6 +332,7 @@ struct hws_audio {
 	/* minimal HW packet tracking */
 	struct work_struct deliver_work;
 	spinlock_t pending_lock; /* protects packet/cadence/generation state */
+	bool work_enabled; /* pending_lock: closes all enqueue paths before drain */
 	enum hws_audio_packet_state packet_state;
 	u8 pending_toggle;
 	bool pending_publish;
@@ -418,6 +419,9 @@ struct hws_pcie_dev {
 	struct hws_scratch_dma scratch_aud[MAX_VID_CHANNELS];
 
 	bool suspended;
+	/* ALSA callbacks can outlive devres IRQ/BAR teardown. */
+	struct mutex irq_lifetime_lock;
+	bool irq_registered; /* protected by irq_lifetime_lock */
 	int irq;
 	struct dentry *debugfs_root;
 	spinlock_t capture_lock; /* serializes capture-enable register updates */

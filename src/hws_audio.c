@@ -80,13 +80,16 @@ static bool hws_audio_publish_stopped(struct hws_audio *a)
 	if (!a)
 		return false;
 
-	spin_lock_irqsave(&a->ring_lock, flags);
+	spin_lock_irqsave(&a->pending_lock, flags);
+	a->work_enabled = false;
+	spin_lock(&a->ring_lock);
 	was_running = READ_ONCE(a->stream_running) ||
 		      READ_ONCE(a->cap_active);
 	WRITE_ONCE(a->stream_running, false);
 	WRITE_ONCE(a->cap_active, false);
 	WRITE_ONCE(a->stop_requested, true);
-	spin_unlock_irqrestore(&a->ring_lock, flags);
+	spin_unlock(&a->ring_lock);
+	spin_unlock_irqrestore(&a->pending_lock, flags);
 	/*
 	 * IRQ handlers test these flags before touching scratch buffers or
 	 * ALSA pointers. Publish the no-stream state before ACAP is disabled
@@ -97,7 +100,7 @@ static bool hws_audio_publish_stopped(struct hws_audio *a)
 }
 
 static void hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
-				      unsigned int ch, bool sync_irq)
+				      unsigned int ch)
 {
 	struct hws_audio *a;
 
@@ -105,17 +108,24 @@ static void hws_audio_quiesce_capture(struct hws_pcie_dev *hws,
 		return;
 
 	a = &hws->audio[ch];
+	might_sleep();
 	hws_audio_publish_stopped(a);
 
-	hws_audio_disable_capture_and_ack(hws, ch);
-
-	if (sync_irq && hws->irq >= 0 && !in_interrupt())
+	/*
+	 * No ALSA stream/ring/pending/scratch lock may be held while draining.
+	 * Flags forbid MMIO, not software synchronization. The lifetime lock
+	 * prevents late close from synchronizing a freed/reassigned IRQ or
+	 * racing BAR teardown through the normal-hardware branch.
+	 */
+	mutex_lock(&hws->irq_lifetime_lock);
+	if (hws->irq_registered && hws->bar0_base &&
+	    !READ_ONCE(hws->suspended) && !READ_ONCE(hws->pci_lost) &&
+	    !READ_ONCE(hws->dma_quiesced) && !READ_ONCE(hws->dma_failed))
+		hws_audio_disable_capture_and_ack(hws, ch);
+	if (hws->irq_registered)
 		synchronize_irq(hws->irq);
-
-	if (!in_interrupt())
-		hws_audio_drain_channel_work(a);
-
-	hws_audio_reset_runtime_state(a);
+	mutex_unlock(&hws->irq_lifetime_lock);
+	hws_audio_drain_channel_work(a);
 }
 
 #define HWS_AUDIO_PACKET_BYTES      MAX_DMA_AUDIO_PK_SIZE
@@ -575,8 +585,8 @@ static void hws_audio_drain_channel_work(struct hws_audio *a)
 	if (!a)
 		return;
 
-	if (!in_interrupt())
-		cancel_work_sync(&a->deliver_work);
+	might_sleep();
+	cancel_work_sync(&a->deliver_work);
 	hws_audio_clear_pending(a);
 }
 
@@ -790,9 +800,8 @@ static bool hws_audio_deliver_packet(struct hws_audio *a, const void *src,
 
 	/*
 	 * Keep lifecycle invalidation and a new ADONE generation out of the
-	 * userspace-visible copy. Trigger-stop never nests these locks in the
-	 * opposite order: it publishes ring state, drops ring_lock, then clears
-	 * pending state.
+	 * userspace-visible copy. Trigger-stop uses the same pending -> ring
+	 * order to close the work gate and publish stopped state.
 	 */
 	spin_lock_irqsave(&a->pending_lock, flags);
 	if (a->packet_state != HWS_AUDIO_PACKET_COPYING ||
@@ -1166,6 +1175,10 @@ bool hws_audio_record_interrupt(struct hws_pcie_dev *hws, unsigned int ch,
 	period_ns = hws_audio_packet_period_ns(a);
 
 	spin_lock(&a->pending_lock);
+	if (!a->work_enabled || READ_ONCE(a->stop_requested)) {
+		spin_unlock(&a->pending_lock);
+		return false;
+	}
 	state = a->packet_state;
 	last_toggle = a->last_irq_toggle;
 	a->irq_count++;
@@ -1243,9 +1256,13 @@ void hws_audio_queue_work(struct hws_pcie_dev *hws, unsigned int ch)
 		return;
 
 	a = &hws->audio[ch];
+	spin_lock(&a->pending_lock);
+	if (!a->work_enabled) {
+		spin_unlock(&a->pending_lock);
+		return;
+	}
 	wq = READ_ONCE(hws->audio_wq);
 	if (!wq) {
-		spin_lock(&a->pending_lock);
 		if (a->packet_state != HWS_AUDIO_PACKET_XRUN)
 			a->dropped_packets++;
 		a->packet_state = HWS_AUDIO_PACKET_XRUN;
@@ -1259,6 +1276,7 @@ void hws_audio_queue_work(struct hws_pcie_dev *hws, unsigned int ch)
 	}
 
 	queue_work(wq, &a->deliver_work);
+	spin_unlock(&a->pending_lock);
 }
 
 static void hws_audio_free_staging(struct hws_audio *a)
@@ -1332,7 +1350,8 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 		return;
 
 	aud = &pdev->audio[ch];
-	hws_audio_quiesce_capture(pdev, ch, true);
+	hws_audio_quiesce_capture(pdev, ch);
+	hws_audio_reset_runtime_state(aud);
 
 	/* If device is going away and stream was open, tell ALSA. */
 	ss = READ_ONCE(aud->pcm_substream);
@@ -1388,6 +1407,7 @@ static int hws_audio_hw_ready(struct hws_pcie_dev *hws)
 static int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
 	struct hws_audio *a;
+	unsigned long flags;
 	int ret;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
@@ -1446,9 +1466,12 @@ static int hws_start_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 	 * latched before this start, then publish the stream state before
 	 * ACAP_ENABLE so the IRQ path accepts the first fresh packet.
 	 */
+	spin_lock_irqsave(&a->pending_lock, flags);
+	a->work_enabled = true;
 	WRITE_ONCE(a->stop_requested, false);
 	WRITE_ONCE(a->stream_running, true);
 	WRITE_ONCE(a->cap_active, true);
+	spin_unlock_irqrestore(&a->pending_lock, flags);
 	smp_wmb(); /* publish start state before ACAP_ENABLE */
 
 	/* Kick HW */
@@ -1634,19 +1657,9 @@ static void hws_pcie_audio_release_stream(struct hws_audio *a)
 {
 	struct hws_pcie_dev *hws = a->parent;
 
-	/*
-	 * snd_card_disconnect() preserves the original release callback. A late
-	 * ALSA close may therefore arrive after PCI remove has released BAR/IRQ
-	 * resources. Removal publishes suspended before disconnecting the card;
-	 * in that state only unwind software ownership retained by the card ref.
-	 */
-	if (hws && !READ_ONCE(hws->suspended) &&
-	    !READ_ONCE(hws->pci_lost) && !READ_ONCE(hws->dma_quiesced)) {
-		hws_audio_quiesce_capture(hws, a->channel_index, true);
-	} else {
-		hws_audio_publish_stopped(a);
-		hws_audio_reset_runtime_state(a);
-	}
+	/* Always drain software, including close after PCI resources are gone. */
+	hws_audio_quiesce_capture(hws, a->channel_index);
+	hws_audio_reset_runtime_state(a);
 	hws_audio_release_scratch(a,
 				  hws && READ_ONCE(hws->dma_quiesced));
 }
@@ -1657,6 +1670,18 @@ static int hws_pcie_audio_close(struct snd_pcm_substream *substream)
 
 	hws_pcie_audio_release_stream(a);
 	WRITE_ONCE(a->pcm_substream, NULL);
+	return 0;
+}
+
+static int hws_pcie_audio_sync_stop(struct snd_pcm_substream *substream)
+{
+	struct hws_audio *a = snd_pcm_substream_chip(substream);
+
+	/*
+	 * Sleepable ALSA boundary; never called by our delivery/XRUN worker.
+	 * Preserve ring geometry/position for SUSPEND -> RESUME without prepare.
+	 */
+	hws_audio_quiesce_capture(a->parent, a->channel_index);
 	return 0;
 }
 
@@ -1672,6 +1697,7 @@ static int hws_pcie_audio_hw_params(struct snd_pcm_substream *substream,
 		return -ENODEV;
 	if (READ_ONCE(hws->suspended))
 		return -EBUSY;
+	hws_pcie_audio_sync_stop(substream);
 
 	ret = hws_check_card_status(hws);
 	if (ret)
@@ -1706,6 +1732,8 @@ static int hws_pcie_audio_prepare(struct snd_pcm_substream *substream)
 	size_t frame_bytes;
 	int ret;
 
+	/* Also cover prepare retries without a preceding trigger-stop. */
+	hws_pcie_audio_sync_stop(substream);
 	ret = hws_audio_prepare_scratch(a, "audio prepare");
 	if (ret)
 		return ret;
@@ -1760,6 +1788,7 @@ static const struct snd_pcm_ops hws_pcie_pcm_ops = {
 	.hw_free   = hws_pcie_audio_hw_free,
 	.prepare   = hws_pcie_audio_prepare,
 	.trigger   = hws_pcie_audio_trigger,
+	.sync_stop = hws_pcie_audio_sync_stop,
 	.pointer   = hws_pcie_audio_pointer,
 };
 
@@ -2011,11 +2040,22 @@ void hws_audio_dma_fault_all(struct hws_pcie_dev *hws)
 
 	for (ch = 0; ch < hws->cur_max_audio_ch; ch++) {
 		struct hws_audio *a = &hws->audio[ch];
-		struct snd_pcm_substream *ss = READ_ONCE(a->pcm_substream);
+		unsigned long flags;
 
-		hws_audio_publish_stopped(a);
-		hws_audio_clear_pending(a);
-		if (ss && READ_ONCE(a->pcm_substream) == ss)
-			snd_pcm_stop_xrun(ss);
+		/*
+		 * Never retain an ALSA pointer outside the drainable worker. Enqueue
+		 * under the same gate close uses before cancel_work_sync(). A stream
+		 * already stopping needs no later notification of this device fault.
+		 */
+		spin_lock_irqsave(&a->pending_lock, flags);
+		WRITE_ONCE(a->stream_running, false);
+		WRITE_ONCE(a->cap_active, false);
+		WRITE_ONCE(a->stop_requested, true);
+		if (a->work_enabled && hws->audio_wq) {
+			a->packet_state = HWS_AUDIO_PACKET_XRUN;
+			a->xrun_reason = HWS_AUDIO_XRUN_STREAM_STATE;
+			queue_work(hws->audio_wq, &a->deliver_work);
+		}
+		spin_unlock_irqrestore(&a->pending_lock, flags);
 	}
 }

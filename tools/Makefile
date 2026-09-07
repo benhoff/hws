@@ -5,6 +5,13 @@ CFLAGS += -DHWS_PATTERN_SHA256='"$(shell sha256sum hws_frame_pattern.h | cut -c1
 
 .PHONY: all clean check
 
+.PHONY: check-audio check-audio-sanitize
+check-audio:
+	python3 -m unittest test_audio_lifetime -v
+
+check-audio-sanitize:
+	HWS_AUDIO_SANITIZE=1 python3 -m unittest test_audio_lifetime.AudioLifetimeTests.test_paused_worker_lifetime -v
+
 # Optional physical presentation source (requires libdrm development files).
 hws_frame_id_kms: hws_frame_id_kms.c hws_frame_pattern.h Makefile
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -DHWS_SOURCE_SHA256='"$(shell sha256sum hws_frame_id_kms.c | cut -c1-64)"' -o $@ $< $(shell pkg-config --libs libdrm)
@@ -14,7 +21,7 @@ hws_frame_id_kms: hws_frame_id_kms.c hws_frame_pattern.h Makefile
 test_frame_id_kms: test_frame_id_kms.c hws_frame_id_kms.c hws_frame_id_capture.c hws_frame_pattern.h Makefile
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< $(shell pkg-config --libs libdrm)
 
-check: all hws_frame_id_kms test_frame_id_kms
+check: check-audio all hws_frame_id_kms test_frame_id_kms
 	./hws_frame_id_capture --self-test
 	./test_frame_id_kms
 	python3 -m unittest discover -s . -p 'test_vdone*.py' -v
