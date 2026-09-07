@@ -48,8 +48,8 @@ def mapping_fixture(reverse=False, repeats=False, events=180):
     return probes, irqs, deliveries, frames
 
 
-def mapping_result(data):
-    return validate_mapping(*data, CONFIG, len(data[0]))
+def mapping_result(data, source_ids=None):
+    return validate_mapping(*data, CONFIG, len(data[0]), source_ids=source_ids)
 
 
 def source_fixture(held=False):
@@ -84,6 +84,79 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertEqual(result["mapping"], "toggle_xor_1")
         self.assertEqual(result["linked_deliveries"], 90)
+
+    def test_initial_retained_id_replacement_is_not_mapping_evidence(self):
+        for old_id in (99, 999):
+            with self.subTest(old_id=old_id):
+                data = mapping_fixture()
+                for i in (1, 3):
+                    data[0][0][f"code{i}"] = str(code(old_id))
+                result, failures = mapping_result(data, set(range(100, 193)))
+                self.assertEqual(failures, [])
+                self.assertEqual(result["counts"]["startup_out_of_source_regions"], 1)
+                self.assertEqual(result["counts"]["startup_replacements"], 1)
+                self.assertEqual(result["counts"]["half1_supports_xor1"], 89)
+                self.assertEqual(result["linked_deliveries"], 90)
+
+    def test_retained_id_needs_source_provenance(self):
+        data = mapping_fixture()
+        for i in (1, 3):
+            data[0][0][f"code{i}"] = str(code(999))
+        for source_ids in (None, set()):
+            with self.subTest(source_ids=source_ids):
+                result, failures = mapping_result(data, source_ids)
+                self.assertIn("private-ring ID moved backward at generation 2", failures)
+                self.assertEqual(result["counts"]["startup_replacements"], 0)
+
+    def test_early_current_source_regression_remains_fatal(self):
+        data = mapping_fixture()
+        for i in (1, 3):
+            data[0][0][f"code{i}"] = str(code(105))
+        _, failures = mapping_result(data, set(range(100, 193)))
+        self.assertIn("private-ring ID moved backward at generation 2", failures)
+
+    def test_return_to_retained_id_is_not_exempted_again(self):
+        data = mapping_fixture()
+        for gen in (1, 4):
+            for i in (1, 3):
+                data[0][gen - 1][f"code{i}"] = str(code(999))
+        result, failures = mapping_result(data, set(range(100, 193)))
+        self.assertEqual(result["counts"]["startup_replacements"], 1)
+        self.assertIn("private-ring ID moved backward at generation 5", failures)
+
+    def test_retained_id_exception_does_not_cross_unstable_observation(self):
+        data = mapping_fixture()
+        for gen in (1, 3):
+            for i in (1, 3):
+                data[0][gen - 1][f"code{i}"] = str(code(999))
+        data[0][1]["code3"] = str(code(998))
+        result, failures = mapping_result(data, set(range(100, 193)))
+        self.assertEqual(result["counts"]["startup_replacements"], 0)
+        self.assertIn("private-ring ID moved backward at generation 4", failures)
+
+    def test_retained_id_does_not_hide_reversed_hardware(self):
+        data = mapping_fixture(reverse=True)
+        for i in (0, 2):
+            data[0][0][f"code{i}"] = str(code(999))
+        result, failures = mapping_result(data, set(range(100, 193)))
+        self.assertEqual(result["counts"]["startup_replacements"], 1)
+        self.assertGreater(result["counts"]["contradictions"], 32)
+        self.assertTrue(failures)
+
+    def test_retained_content_cannot_be_delivered(self):
+        data = mapping_fixture()
+        for i in (0, 2):
+            data[0][0][f"code{i}"] = str(code(999))
+        _, failures = mapping_result(data, set(range(100, 193)))
+        self.assertIn("delivered frame lacks matching independent ring IDs at generations 1/2", failures)
+
+    def test_startup_replacement_cannot_satisfy_transition_threshold(self):
+        data = mapping_fixture(events=64)
+        for i in (1, 3):
+            data[0][0][f"code{i}"] = str(code(999))
+        result, failures = mapping_result(data, set(range(100, 193)))
+        self.assertEqual(result["counts"]["half1_supports_xor1"], 31)
+        self.assertIn("insufficient independent mapping transitions for physical half 1", failures)
 
     def test_reverse_hardware_rejects_self_consistent_driver(self):
         result, failures = mapping_result(mapping_fixture(reverse=True))

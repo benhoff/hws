@@ -4,6 +4,8 @@
 from collections import Counter
 from typing import Any
 
+from hws_clock_mapping import ClockError, presentation_bounds
+
 
 PROBE_LIMIT = 4096
 MIN_MAPPING_TRANSITIONS = 32
@@ -101,6 +103,8 @@ def validate_mapping(
     frames: list[dict[str, Any]],
     config: dict[str, str],
     probe_count: int,
+    *,
+    source_ids: set[int] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     failures: list[str] = []
     num, den = (int(config[k], 0) for k in ("refresh_num", "refresh_den"))
@@ -123,9 +127,11 @@ def validate_mapping(
         "half0_supports_xor1", "half1_supports_xor1", "contradictions",
         "unchanged", "both_regions_changed", "ambiguous_interval",
         "unstable_or_undecodable",
+        "startup_out_of_source_regions", "startup_replacements",
     )})
     valid_by_gen: dict[int, tuple[int, int]] = {}
     previous = None
+    retained: list[int | None] = [None, None]
     max_duration = max_latency = 0
     for index, p in enumerate(probes, 1):
         n = lambda key: int(p[key], 0)
@@ -160,19 +166,32 @@ def validate_mapping(
         if not stable:
             counts["unstable_or_undecodable"] += 1
             previous = None
+            # An observation gap cannot establish that an initial value was
+            # continuously retained, rather than reintroduced later.
+            retained = [None, None]
             continue
         pair = (ids[0], ids[1])
         valid_by_gen[generation] = pair
+        if index == 1 and generation == 1 and source_ids:
+            retained = [value if value not in source_ids else None for value in pair]
+            counts["startup_out_of_source_regions"] = sum(v is not None for v in retained)
         if previous:
             old, old_pair = previous
             interval = n("started_ns") - int(old["started_ns"], 0)
-            if any(pair[i] < old_pair[i] for i in (0, 1)):
+            startup_replacements = {
+                i for i in (0, 1) if retained[i] is not None
+                and old_pair[i] == retained[i] and source_ids and pair[i] in source_ids
+            }
+            counts["startup_replacements"] += len(startup_replacements)
+            if any(pair[i] < old_pair[i] and i not in startup_replacements for i in (0, 1)):
                 failures.append(f"private-ring ID moved backward at generation {generation}")
             if (generation != int(old["generation"], 0) + 1
                     or n("before") == int(old["before"], 0)
                     or not half_ns * .65 <= interval <= half_ns * 1.35):
                 counts["ambiguous_interval"] += 1
-            else:
+            elif not startup_replacements:
+                # Initial out-of-source replacements are recorded but cannot
+                # support mapping, regardless of their numeric direction.
                 changed = [i for i in (0, 1) if pair[i] != old_pair[i]]
                 if not changed:
                     counts["unchanged"] += 1
@@ -187,6 +206,9 @@ def validate_mapping(
                     else:
                         counts["contradictions"] += 1
                         failures.append(f"independent content contradicts toggle^1 at generation {generation}")
+        for i in (0, 1):
+            if pair[i] != retained[i]:
+                retained[i] = None
         previous = p, pair
     for half in (0, 1):
         if counts[f"half{half}_supports_xor1"] < MIN_MAPPING_TRANSITIONS:
@@ -221,7 +243,8 @@ def validate_mapping(
 
 def validate_anomalies(probes: list[dict[str, str]], irqs: list[dict[str, str]],
                        config: dict[str, str], stats: dict[str, str],
-                       source: list[dict[str, Any]], source_valid: bool) -> tuple[dict[str, Any], list[str]]:
+                       source: list[dict[str, Any]], source_valid: bool,
+                       *, clock_mapping=None) -> tuple[dict[str, Any], list[str]]:
     """Bounded classifications: consistency evidence, never a claimed cause."""
     failures: list[str] = []
     active = [r for r in irqs if int(r["generation"], 0) > 0]
@@ -267,11 +290,22 @@ def validate_anomalies(probes: list[dict[str, str]], irqs: list[dict[str, str]],
         return tuple(ids[:2])
 
     def source_bounds(ids, stamp):
-        return source_valid and all(
-            i in presents and i + 1 in presents
-            and presents[i]["presented_ns"] <= stamp <= presents[i + 1]["presented_ns"] + half_ns * 4
-            for i in ids
-        )
+        if not source_valid:
+            return False
+        for i in ids:
+            if i not in presents or i + 1 not in presents:
+                return False
+            try:
+                start = presentation_bounds(presents[i], clock_mapping)
+                end = presentation_bounds(presents[i + 1], clock_mapping)
+            except ClockError as exc:
+                failures.append(f"anomaly clock mapping: {exc}")
+                return False
+            if not start[1] <= stamp <= end[0] + half_ns * 4:
+                if clock_mapping and start[0] <= stamp <= end[1] + half_ns * 4:
+                    failures.append("anomaly source association ambiguous within clock uncertainty")
+                return False
+        return True
 
     results = []
     previous_trigger = 0
@@ -311,8 +345,8 @@ def validate_anomalies(probes: list[dict[str, str]], irqs: list[dict[str, str]],
                 category = "unchanged_content_unresolved"
                 i = current[0]
                 if (source_ok and current[0] == current[1]
-                        and presents[i]["presented_ns"] <= int(samples[0]["started_ns"], 0)
-                        and int(trigger["started_ns"], 0) <= presents[i + 1]["presented_ns"]):
+                        and presentation_bounds(presents[i], clock_mapping)[1] <= int(samples[0]["started_ns"], 0)
+                        and int(trigger["started_ns"], 0) <= presentation_bounds(presents[i + 1], clock_mapping)[0]):
                     category = "unchanged_content_source_held"
             elif (same_toggle and following and source_ok
                     and half_ns * 1.65 <= delta <= half_ns * 2.35
@@ -344,6 +378,7 @@ def validate_anomalies(probes: list[dict[str, str]], irqs: list[dict[str, str]],
 def validate_source(
     records: list[dict[str, Any]], frames: list[dict[str, Any]],
     config: dict[str, str], boot_id: str | None,
+    *, clock_mapping=None,
 ) -> tuple[dict[str, Any], list[str]]:
     failures: list[str] = []
     configs = [r for r in records if r.get("type") == "source_config"]
@@ -366,7 +401,12 @@ def validate_source(
             or source.get("async_flip") is not False):
         failures.append("source telemetry is not synchronous monotonic KMS presentation evidence")
     same_clock = bool(boot_id) and source.get("boot_id") == boot_id
-    if not same_clock:
+    if clock_mapping and (clock_mapping.config.get("source_boot_id") != source.get("boot_id")
+                          or clock_mapping.config.get("capture_boot_id") != boot_id
+                          or clock_mapping.config.get("run_id") != source.get("run_id")):
+        failures.append("source and clock mapping identities differ")
+        clock_mapping = None
+    if not same_clock and clock_mapping is None:
         failures.append("source/capture clock domains differ; calibrated cross-host timing is required")
     for key in ("width", "height", "htotal", "vtotal"):
         if source.get(key) != int(config[key], 0):
@@ -382,14 +422,32 @@ def validate_source(
     if num <= 0 or den <= 0:
         return {"result": "fail", "repeat_attribution": "unknown"}, ["invalid timing for source presentation observation"]
     nominal_ns = 1e9 * den / num
+    # DRM's get_vblank_timestamp contract uses the end of vblank/start of
+    # active scanout, which can still be in the future when an event arrives.
+    # Bound that lead by the recorded progressive mode's blanking duration,
+    # plus one microsecond for the legacy page-flip timestamp representation.
+    # https://www.kernel.org/doc/html/v6.17/gpu/drm-kms.html#c.drm_crtc_funcs
+    blank_lines = int(config["vtotal"], 0) - int(config["height"], 0)
+    pixelclock, htotal = int(config["pixelclock"], 0), int(config["htotal"], 0)
+    if blank_lines <= 0 or pixelclock <= 0 or htotal <= 0:
+        return {"result": "fail", "repeat_attribution": "unknown"}, ["invalid source blanking timing"]
+    blanking_ns = (blank_lines * htotal * 1_000_000_000 + pixelclock - 1) // pixelclock
+    callback_lead_limit_ns = blanking_ns + 1000
+    callback_offsets = []
+    invalid_timestamps = 0
     for r in presents:
         frame_id = int(r["id"])
         if not 0 <= r["sequence"] <= 0xFFFFFFFF:
             failures.append("invalid source vblank sequence")
         if frame_id in by_id or not 0 <= frame_id <= 0xFFFFFFFF:
             failures.append("source has duplicate or invalid presentation IDs")
-        if not (0 < r["submitted_ns"] <= r["presented_ns"] <= r["callback_ns"]):
-            failures.append("invalid source submission/presentation/callback timestamps")
+        submitted, presented, callback = (r[k] for k in ("submitted_ns", "presented_ns", "callback_ns"))
+        if (not all(type(t) is int and 0 < t < 1 << 63 for t in (submitted, presented, callback))
+                or submitted > presented or submitted > callback
+                or presented - callback > callback_lead_limit_ns):
+            invalid_timestamps += 1
+        if all(type(t) is int for t in (presented, callback)):
+            callback_offsets.append(callback - presented)
         if previous:
             delta = (r["sequence"] - previous["sequence"]) & 0xFFFFFFFF
             elapsed = r["presented_ns"] - previous["presented_ns"]
@@ -400,6 +458,8 @@ def validate_source(
             spans[previous["id"]] = delta
         by_id[frame_id] = r
         previous = r
+    if invalid_timestamps:
+        failures.append("invalid source submission/presentation/callback timestamps")
     captured_counts = Counter(int(f["upper_id"]) for f in frames)
     held_repeats = excess_repeats = 0
     for frame_id, count in captured_counts.items():
@@ -408,18 +468,40 @@ def validate_source(
             continue
         held_repeats += min(max(0, count - 1), max(0, spans[frame_id] - 1))
         excess_repeats += max(0, count - spans[frame_id])
+    temporal_counts = Counter(inside=0, outside=0, ambiguous=0, unavailable=0)
+    latency_bounds = []
     for f in frames:
         if f.get("flags", 0) & 0x7E000 != 0x2000:
             failures.append("capture timestamps are not marked monotonic EOF")
         r = by_id.get(int(f["upper_id"]))
-        if not r or not same_clock:
+        if not r or not (same_clock or clock_mapping):
+            temporal_counts["unavailable"] += 1
             continue
         # Capture timestamps describe received EOF, so a frame must have
         # started presentation earlier; use a deliberately bounded allowance
         # of two refresh periods for receiver/IRQ latency after replacement.
         end = by_id.get(r["id"] + 1)
-        if not end or not r["presented_ns"] <= f["timestamp_ns"] <= end["presented_ns"] + nominal_ns * 2:
+        if not end:
             failures.append(f"captured ID {r['id']} falls outside its source presentation window")
+            temporal_counts["unavailable"] += 1
+            continue
+        try:
+            start_lo, start_hi = presentation_bounds(r, clock_mapping)
+            end_lo, end_hi = presentation_bounds(end, clock_mapping)
+        except ClockError as exc:
+            failures.append(f"captured ID {r['id']} clock mapping: {exc}")
+            temporal_counts["unavailable"] += 1
+            continue
+        stamp = f["timestamp_ns"]
+        if start_hi <= stamp <= end_lo + nominal_ns * 2:
+            temporal_counts["inside"] += 1
+            latency_bounds.append((stamp - start_hi, stamp - start_lo))
+        elif stamp < start_lo or stamp > end_hi + nominal_ns * 2:
+            temporal_counts["outside"] += 1
+            failures.append(f"captured ID {r['id']} falls outside its source presentation window")
+        else:
+            temporal_counts["ambiguous"] += 1
+            failures.append(f"captured ID {r['id']} timing ambiguous within clock uncertainty")
     if excess_repeats:
         failures.append("captured repetition exceeds source-observed refresh occupancy")
     if any(r.get("type") == "source_summary" and r.get("result") != "pass" for r in records):
@@ -427,6 +509,22 @@ def validate_source(
     return {
         "result": "pass" if not failures else "fail", "backend": source.get("backend"),
         "presentations": len(presents), "same_clock": same_clock,
+        "callback_timing": {
+            "model": "drm-vblank-end-v1", "blanking_ns": blanking_ns,
+            "maximum_allowed_lead_ns": callback_lead_limit_ns,
+            "before_scanout_count": sum(offset < 0 for offset in callback_offsets),
+            "minimum_callback_minus_scanout_ns": min(callback_offsets, default=None),
+            "maximum_callback_minus_scanout_ns": max(callback_offsets, default=None),
+            "invalid_records": invalid_timestamps,
+        },
+        "clock_mapping": clock_mapping.report() if clock_mapping else None,
+        "temporal_association": dict(temporal_counts),
+        "source_to_capture_ns": {
+            "endpoint": "source-scanout-to-capture-completion-irq",
+            "samples": len(latency_bounds),
+            "minimum_lower_bound": min((lo for lo, hi in latency_bounds), default=None),
+            "maximum_upper_bound": max((hi for lo, hi in latency_bounds), default=None),
+        },
         "source_held_refreshes": sum(max(0, n - 1) for n in spans.values()),
         "captured_repeats_supported_by_source": held_repeats,
         "captured_repeats_exceeding_source": excess_repeats,

@@ -27,6 +27,7 @@ from typing import Any
 from hws_vdone_observers import (
     measure_vdone, validate_anomalies, validate_content, validate_mapping, validate_source,
 )
+from hws_clock_mapping import ClockError, ClockMap, read_records as read_clock_records
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,7 @@ TRACE_EVENTS = (
     "hws:hws_vdone_frame",
     "hws:hws_vdone_recovery",
     "hws:hws_vdone_probe",
+    "hws:hws_vdone_late_toggle",
 )
 FAILURE_PATTERNS = (
     "VDONE ambiguity",
@@ -53,12 +55,18 @@ REPRODUCIBLE_INPUTS = (
     "src/hws_trace.c",
     "src/hws_trace.h",
     "src/hws_probe.h",
+    "src/hws_diag.h",
+    "src/hws_late_toggle.h",
+    "tools/hws_vdone_diagnostics.py",
     "tools/hws_frame_id_capture.c",
     "tools/hws_frame_id_source.html",
     "tools/hws_vdone_evidence.py",
     "tools/hws_vdone_observers.py",
     "tools/hws_frame_id_kms.c",
     "tools/hws_frame_pattern.h",
+    "tools/hws_clock_mapping.py",
+    "tools/hws_clock_probe.py",
+    "tools/hws_headless_source.py",
 )
 
 
@@ -245,9 +253,22 @@ def find_video_channel(device: Path) -> tuple[int, str]:
 
 def tracefs_path() -> Path:
     for candidate in (Path("/sys/kernel/tracing"), Path("/sys/kernel/debug/tracing")):
-        if candidate.exists():
+        # Mount-point existence alone also matches an unmounted tracefs. Probe
+        # its interface with the same credentials used during collection.
+        probe = sudo(["cat", str(candidate / "current_tracer")], check=False)
+        if probe.returncode == 0:
             return candidate
-    raise EvidenceError("tracefs is not mounted")
+    raise EvidenceError("tracefs is not mounted or its interface cannot be read with sudo")
+
+
+def check_driver_evidence(config_path: Path, stats_path: Path) -> None:
+    # Path.exists() cannot distinguish absent files from a root-only parent on
+    # all supported Python versions. Read through sudo, as the snapshots do.
+    for path in (config_path, stats_path):
+        probe = sudo(["cat", str(path)], check=False)
+        if probe.returncode:
+            detail = probe.stderr.strip() or f"exit status {probe.returncode}"
+            raise EvidenceError(f"cannot read driver evidence {path} with sudo: {detail}")
 
 
 def ensure_trace_idle(tracefs: Path) -> None:
@@ -299,7 +320,7 @@ def trace_fields(line: str) -> dict[str, str]:
 def trace_records(trace_path: Path, channel: int, epoch: int, device: str) -> dict[str, list[dict[str, str]]]:
     records: dict[str, list[dict[str, str]]] = {
         "irq": [], "copy": [], "frame": [], "recovery": [], "stream": [],
-        "loss": [], "probe": [],
+        "loss": [], "probe": [], "diag": [], "late_toggle": [],
     }
     process = subprocess.Popen(
         ["trace-cmd", "report", "-i", str(trace_path)],
@@ -312,8 +333,8 @@ def trace_records(trace_path: Path, channel: int, epoch: int, device: str) -> di
         if re.search(r"\b(?:LOST|MISSED)\s+[0-9]+\s+EVENTS?\b", line, re.I):
             records["loss"].append({"line": line.strip()})
             continue
-        event = None
-        for name in ("irq", "copy", "frame", "recovery", "stream", "probe"):
+        event = "diag" if "hws_video_diag:" in line else None
+        for name in ("irq", "copy", "frame", "recovery", "stream", "probe", "late_toggle"):
             if f"hws_vdone_{name}:" in line:
                 event = name
                 break
@@ -375,10 +396,11 @@ def validate_bundle(
         failures.append("bundle predates full-frame content and queue/timing evidence")
     failures.extend(validate_content(frames, capture_config, frame_summary, manifest))
 
+    provenance_failures: list[str] = []
     if manifest.get("tracked_status"):
-        failures.append("driver evidence was captured from a dirty tracked tree")
+        provenance_failures.append("driver evidence was captured from a dirty tracked tree")
     if manifest.get("untracked_reproducible_inputs"):
-        failures.append("evidence inputs were not committed at capture time")
+        provenance_failures.append("evidence inputs were not committed at capture time")
 
     stable_config_keys = (
         "pci_bdf", "vendor", "device", "subsystem_vendor",
@@ -386,7 +408,7 @@ def validate_bundle(
         "port_id", "irq", "irq_mode", "channel", "width", "height",
         "fourcc", "bytesperline", "sizeimage", "fps", "interlaced",
         "pixelclock", "htotal", "vtotal", "refresh_num", "refresh_den",
-        "dma_extent", "split_bytes", "split16_cached", "split16_readback",
+        "dma_extent", "split_bytes", "split16_readback",
     )
     for key in stable_config_keys:
         if config_before.get(key) != config_after.get(key):
@@ -413,6 +435,20 @@ def validate_bundle(
                 f"capture {capture_key} does not match debugfs {config_key}"
             )
     native_split = (integer(config_after, "sizeimage") // 2) & ~2047
+    # The software cache is populated when the DMA window is first armed.
+    # Zero before an inactive stream is not a change to the programmed split.
+    # Hardware readbacks remain stable, and both stream traces are checked
+    # against the initialized cache below.
+    expected_split16 = native_split // 16
+    cached_before = integer(config_before, "split16_cached")
+    if cached_before != expected_split16 and not (
+        cached_before == 0
+        and not integer(before, "streaming")
+        and not integer(before, "cap_active")
+    ):
+        failures.append("split cache before capture is neither native nor uninitialized while inactive")
+    if integer(config_after, "split16_cached") != expected_split16:
+        failures.append("split cache after capture does not match the native split")
     if integer(config_after, "split_bytes") != native_split:
         failures.append(
             f"programmed split is not native: expected={native_split} "
@@ -695,12 +731,25 @@ def validate_bundle(
         ),
         "overlap_reports": lambda record: (
             int(record.get("steady", "0"), 0)
-            and int(record.get("reason", "-1"), 0) != 2
+            and int(record.get("reason", "-1"), 0) not in (2, 6)
         ),
         "resync_reports": lambda record: not int(
             record.get("steady", "0"), 0
         ),
     }
+    # Older sealed bundles predate reason 6. Require both new counters when
+    # either is advertised or a continuity recovery is present; never reclassify
+    # it as overlap or silently accept a missing counter as zero.
+    has_continuity = any(int(r.get("reason", "-1"), 0) == 6 for r in trace["recovery"])
+    if has_continuity or "continuity_reports" in after or "continuity_gaps" in after:
+        if "continuity_reports" in after:
+            recovery_classes["continuity_reports"] = lambda record: (
+                int(record.get("steady", "0"), 0) and int(record.get("reason", "-1"), 0) == 6
+            )
+        if "continuity_reports" not in after or "continuity_gaps" not in after:
+            failures.append("missing continuity recovery counters")
+        elif integer(after, "continuity_reports") != integer(after, "continuity_gaps"):
+            failures.append("continuity gap/report counters disagree")
     for key, predicate in recovery_classes.items():
         traced = sum(
             int(record.get("reports", "0"), 0)
@@ -739,20 +788,33 @@ def validate_bundle(
     if manifest.get("capture_exit_code"):
         failures.append(f"frame-ID capture exited with status {manifest['capture_exit_code']}")
 
-    mapping, mapping_failures = validate_mapping(
-        [p for p in trace["probe"] if int(p.get("window", "0"), 0) == 0],
-        trace["irq"], trace["frame"], frames, config_after,
-        int(after.get("probe_count", "0"), 0),
-    )
-    failures.extend(mapping_failures)
     source_path = bundle / "source-presentation.jsonl"
     source_records = (
         [json.loads(line) for line in source_path.read_text(encoding="utf-8").splitlines()]
         if source_path.exists() else []
     )
+    clock_mapping = None
+    clock_failures = []
+    clock_path = bundle / "clock-exchanges.jsonl"
+    if clock_path.exists():
+        try:
+            source_config = next(r for r in source_records if r.get("type") == "source_config")
+            if source_config.get("run_id") != manifest["run_id"]:
+                raise ClockError("source/capture run identity mismatch")
+            clock_mapping = ClockMap(read_clock_records(clock_path), source_config.get("boot_id"),
+                                     manifest.get("boot_id"), manifest["run_id"])
+        except (ClockError, OSError, StopIteration) as exc:
+            clock_failures.append(f"clock evidence invalid: {exc}")
+    elif manifest.get("clock_evidence_schema"):
+        clock_failures.append("declared clock evidence is missing")
     presentation, presentation_failures = validate_source(
         source_records, frames, config_after, manifest.get("boot_id"),
+        clock_mapping=clock_mapping,
     )
+    if clock_failures:
+        presentation_failures.extend(clock_failures)
+        presentation["result"] = "fail"
+        presentation["repeat_attribution"] = "unresolved"
     source_configs = [r for r in source_records if r.get("type") == "source_config"]
     if source_configs and (
         source_configs[0].get("pattern") != capture_config.get("pattern")
@@ -767,16 +829,46 @@ def validate_bundle(
         presentation["result"] = "fail"
         presentation["repeat_attribution"] = "unresolved"
         presentation_failures.append("source binary build digest differs from the recorded source code")
-    failures.extend(presentation_failures)
+
+    # Startup provenance uses the source's IDs, not the driver's selected half
+    # or delivered frames. Identity must match, but broken presentation timing
+    # remains a separate failing gate and does not make old ring content new.
+    source_ids = None
+    if len(source_configs) == 1:
+        source = source_configs[0]
+        if (source.get("schema") == 1 and source.get("backend") == "drm-kms"
+                and source.get("clock") == "CLOCK_MONOTONIC"
+                and manifest.get("boot_id") and (source.get("boot_id") == manifest["boot_id"]
+                    or clock_mapping is not None)
+                and manifest.get("kms_source_sha256")
+                and source.get("source_sha256") == manifest["kms_source_sha256"]
+                and manifest.get("pattern_sha256")
+                and source.get("pattern_sha256") == manifest["pattern_sha256"]
+                and source.get("pattern") == capture_config.get("pattern")):
+            source_ids = {r["id"] for r in source_records if r.get("type") == "present"}
+    mapping, mapping_failures = validate_mapping(
+        [p for p in trace["probe"] if int(p.get("window", "0"), 0) == 0],
+        trace["irq"], trace["frame"], frames, config_after,
+        int(after.get("probe_count", "0"), 0), source_ids=source_ids,
+    )
+    failures.extend(mapping_failures)
 
     anomalies, anomaly_failures = validate_anomalies(
         trace["probe"], trace["irq"], config_after, after,
         source_records, presentation["result"] == "pass",
+        clock_mapping=clock_mapping,
     )
     failures.extend(anomaly_failures)
 
     timing, timing_failures = measure_vdone(trace["irq"])
     failures.extend(timing_failures)
+
+    # Diagnostic scope only: do not relax the definitive result. Presentation
+    # timing/attribution and committed-input provenance remain required gates.
+    capture_checks = {"result": "fail" if failures else "pass",
+                      "failures": list(failures)}
+    failures.extend(provenance_failures)
+    failures.extend(presentation_failures)
 
     summary = {
         "schema": 3,
@@ -796,6 +888,10 @@ def validate_bundle(
         "independent_mapping": mapping,
         "source_presentation": presentation,
         "anomaly_observation": anomalies,
+        "capture_checks": capture_checks,
+        "provenance": {"result": "fail" if provenance_failures else "pass",
+                       "failures": provenance_failures},
+        "presentation_failures": presentation_failures,
         "failures": failures,
     }
     if write_summary:
@@ -825,6 +921,7 @@ def build_manifest(args: argparse.Namespace, run_id: str, bdf: str) -> dict[str,
         "channel": args.channel,
         "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
         "source_telemetry_path": str(args.source_telemetry) if args.source_telemetry else None,
+        "clock_evidence_schema": 1 if getattr(args, "clock_evidence", None) else None,
         "kms_source_sha256": sha256(ROOT / "tools" / "hws_frame_id_kms.c"),
         "pattern_sha256": sha256(ROOT / "tools" / "hws_frame_pattern.h"),
         "observer_validator_sha256": sha256(ROOT / "tools" / "hws_vdone_observers.py"),
@@ -844,11 +941,50 @@ def build_manifest(args: argparse.Namespace, run_id: str, bdf: str) -> dict[str,
         "capture_source_sha256": sha256(ROOT / "tools" / "hws_frame_id_capture.c"),
         "evidence_runner_sha256": sha256(Path(__file__).resolve()),
         "kernel": os.uname().release,
-        "trace_events": list(TRACE_EVENTS),
+        "trace_events": capture_trace_events(args),
+        "buffers_requested": args.buffers,
+        "queue_diagnostics": args.queue_diagnostics,
+        "requeue_delay_ms": args.requeue_delay_ms,
+        "requeue_delay_every_frames": 60,
+        "nvidia_vblank": nvidia_vblank_state(),
+        "late_toggle_probe": module_parameter_state("late_toggle_probe"),
+        "source_transition_checks": module_parameter_state("source_transition_checks"),
+        "require_vblank_off": args.require_vblank_off,
+        "probe_mode": args.probe_mode,
+        "irq_latency": args.irq_latency,
     }
 
 
+def capture_trace_events(args: argparse.Namespace) -> list[str]:
+    events = [e for e in TRACE_EVENTS if args.probe_mode != "off" or e != "hws:hws_vdone_probe"]
+    if args.queue_diagnostics:
+        events.append("hws:hws_video_diag")
+    return events
+
+
+def nvidia_vblank_state() -> str:
+    path = Path("/sys/module/nvidia_drm/parameters/vblank")
+    return read_text(path, privileged=True).strip() if path.exists() else "unavailable"
+
+
+def module_parameter_state(name: str) -> str:
+    path = Path("/sys/module/HwsCapture/parameters") / name
+    return read_text(path, privileged=True).strip() if path.exists() else "unavailable"
+
+
+def require_vblank_off(value: str) -> None:
+    if value != "N":
+        raise EvidenceError(f"--require-vblank-off needs loaded nvidia_drm.vblank=N, got {value!r}; "
+                            "remove the unsupported vblank=1 boot option and reboot manually")
+
+
 def run_capture(args: argparse.Namespace) -> int:
+    if args.clock_evidence and not args.source_telemetry:
+        raise EvidenceError("--clock-evidence requires --source-telemetry and matching --run-id")
+    if args.remote_ready and not (args.clock_evidence and args.source_telemetry and args.run_id):
+        raise EvidenceError("--remote-ready requires source telemetry, clock evidence and a shared run ID")
+    if args.requeue_delay_ms and not args.queue_diagnostics:
+        raise EvidenceError("--requeue-delay-ms requires --queue-diagnostics")
     for command in ("sudo", "trace-cmd", "modinfo", "v4l2-ctl", "journalctl", "lspci"):
         require_command(command)
     if os.geteuid() == 0:
@@ -877,6 +1013,11 @@ def run_capture(args: argparse.Namespace) -> int:
         )
 
     run(["sudo", "-v"], check=True, capture=False)
+    if args.require_vblank_off:
+        require_vblank_off(nvidia_vblank_state())
+    if args.irq_latency and "irqsoff" not in read_text(
+            Path("/sys/kernel/tracing/available_tracers"), privileged=True).split():
+        raise EvidenceError("irqsoff tracer unavailable on this kernel; run without --irq-latency")
     node_channel, video_name = find_video_channel(args.device)
     if node_channel != args.channel:
         raise EvidenceError(
@@ -887,15 +1028,23 @@ def run_capture(args: argparse.Namespace) -> int:
     debug_dir = Path(f"/sys/kernel/debug/hws-{bdf}/video{args.channel}")
     config_path = debug_dir / "config"
     stats_path = debug_dir / "stats"
-    if not config_path.exists() or not stats_path.exists():
-        raise EvidenceError(f"driver evidence files are missing under {debug_dir}")
+    check_driver_evidence(config_path, stats_path)
     tracefs = tracefs_path()
     ensure_trace_idle(tracefs)
+    old_function_trace = None
+    if args.irq_latency:
+        old_function_trace = read_text(tracefs / "options/function-trace", privileged=True).strip()
+        if old_function_trace not in ("0", "1"):
+            raise EvidenceError("unexpected function-trace option value")
 
     built_srcversion = run(["modinfo", "-F", "srcversion", str(args.module)]).stdout.strip()
     loaded_srcversion = Path("/sys/module/HwsCapture/srcversion").read_text().strip()
     if built_srcversion != loaded_srcversion:
         raise EvidenceError("loaded module does not match the in-tree module")
+
+    if args.preflight_only:
+        print(f"Capture preflight passed: {args.device} channel={args.channel} debugfs={debug_dir}")
+        return 0
 
     run_id = args.run_id or dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     bundle = args.bundle or Path(f"/tmp/hws-vdone-{run_id}")
@@ -934,6 +1083,10 @@ def run_capture(args: argparse.Namespace) -> int:
         parse_kv(read_text(config_path, privileged=True))["split_bytes"],
         "--anomaly-dir", str(anomaly_dir),
     ]
+    capture_command.extend(["--buffers", str(args.buffers)])
+    capture_command.extend(["--requeue-delay-ms", str(args.requeue_delay_ms)])
+    if args.queue_diagnostics:
+        capture_command.extend(["--queue-log", str(bundle / "queue-events.jsonl")])
     if args.keep_timings:
         capture_command.append("--keep-timings")
 
@@ -945,16 +1098,27 @@ def run_capture(args: argparse.Namespace) -> int:
             "trace-cmd", "record", "-q", "--date", "--user", username,
             "-b", "8192", "-o", str(trace_tmp),
         ]
-        for event in TRACE_EVENTS:
+        if args.irq_latency:
+            sudo(["sh", "-c", "echo 0 > /sys/kernel/tracing/tracing_max_latency"])
+            trace_record.extend(["-p", "irqsoff", "-O", "nofunction-trace"])
+        for event in capture_trace_events(args):
             trace_record.extend(["-e", event])
         trace_record.extend(capture_command)
         completed = sudo(trace_record, check=False, capture=False)
         capture_result = completed.returncode
     finally:
-        if trace_tmp.exists():
-            sudo(["chown", f"{os.getuid()}:{os.getgid()}", str(trace_tmp)], check=False)
-            shutil.move(str(trace_tmp), bundle / "kernel-trace.dat")
-        sudo(["trace-cmd", "reset"], check=False)
+        try:
+            if args.irq_latency:
+                capture_file(["cat", "/sys/kernel/tracing/tracing_max_latency"],
+                             bundle / "irqsoff-max-us.txt", privileged=True)
+            if trace_tmp.exists():
+                sudo(["chown", f"{os.getuid()}:{os.getgid()}", str(trace_tmp)], check=False)
+                shutil.move(str(trace_tmp), bundle / "kernel-trace.dat")
+        finally:
+            sudo(["trace-cmd", "reset"], check=False)
+            if old_function_trace is not None:
+                sudo(["sh", "-c", 'printf "%s\\n" "$1" > /sys/kernel/tracing/options/function-trace',
+                      "hws-restore", old_function_trace])
 
     manifest["elapsed_seconds"] = time.monotonic() - started
     manifest["capture_exit_code"] = capture_result
@@ -974,6 +1138,16 @@ def run_capture(args: argparse.Namespace) -> int:
         bundle / "trace-stat.txt",
     )
 
+    if args.remote_ready:
+        write_text_exclusive(bundle / "capture-complete.json",
+                             json.dumps({"run_id": run_id}) + "\n")
+        deadline = time.monotonic() + 120
+        while not args.remote_ready.exists() and time.monotonic() < deadline:
+            time.sleep(.1)
+        if not args.remote_ready.exists():
+            raise EvidenceError("timed out waiting for finalized remote source/clock evidence")
+        if args.remote_ready.read_text().strip() != run_id:
+            raise EvidenceError("remote readiness marker has the wrong run ID")
     if args.source_telemetry:
         # A source may still be running. Preserve only a complete, bounded
         # JSONL prefix; never alter its file or include a torn final record.
@@ -989,7 +1163,25 @@ def run_capture(args: argparse.Namespace) -> int:
             payload[:last_newline + 1].decode("utf-8"),
         )
 
+    if args.clock_evidence:
+        # The collector must have finished before sealing; a live prefix lacks
+        # the required acquisition summary and therefore cannot validate.
+        clock_records = read_clock_records(args.clock_evidence)
+        write_text_exclusive(bundle / "clock-exchanges.jsonl",
+                             "".join(json.dumps(r) + "\n" for r in clock_records))
     summary = validate_bundle(bundle, args.channel, write_summary=True)
+    if args.queue_diagnostics:
+        from hws_vdone_diagnostics import diagnose
+        stats = parse_kv((bundle / "stats-after.txt").read_text())
+        diag_trace = trace_records(bundle / "kernel-trace.dat", args.channel,
+                                   int(stats["stream_epoch"]), bdf)
+        diag_trace["loss"].extend({"line": line} for line in
+            trace_loss((bundle / "trace-stat.txt").read_text()))
+        queue_records = [json.loads(line) for line in
+                         (bundle / "queue-events.jsonl").read_text().splitlines()]
+        diagnosis = diagnose(diag_trace, queue_records, stats, args.frames,
+                             late_toggle_enabled=manifest.get("late_toggle_probe"))
+        write_text_exclusive(bundle / "diagnostics.json", json.dumps(diagnosis, indent=2) + "\n")
     write_bundle_checksums(bundle)
     seal_bundle(bundle)
     print(
@@ -1002,18 +1194,35 @@ def run_capture(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--run", action="store_true", help="perform a hardware capture")
+    result.add_argument("--preflight-only", action="store_true",
+                        help="check capture prerequisites without changing timings or starting capture")
     result.add_argument("--validate", type=Path, help="validate an existing evidence bundle")
     result.add_argument("--device", type=Path, default=Path("/dev/video1"))
     result.add_argument("--channel", type=int, choices=range(4))
     result.add_argument("--frames", type=int, default=36000)
+    result.add_argument("--buffers", type=int, choices=range(2, 33), default=4)
+    result.add_argument("--queue-diagnostics", action="store_true",
+                        help="bounded kernel queue/IRQ and userspace ioctl timing evidence")
+    result.add_argument("--requeue-delay-ms", type=int, choices=range(101), default=0,
+                        help="controlled delay every 60 frames before replenishment; requires queue diagnostics")
+    result.add_argument("--require-vblank-off", action="store_true",
+                        help="refuse capture unless the loaded NVIDIA vblank parameter is N")
+    result.add_argument("--irq-latency", action="store_true",
+                        help="separate irqsoff comparison; requires tracer support, adds overhead")
+    result.add_argument("--probe-mode", choices=("full", "off"), default="full",
+                        help="off is an overhead comparison only; mapping validation remains failing")
     result.add_argument("--bundle", type=Path)
     result.add_argument("--run-id")
+    result.add_argument("--clock-evidence", type=Path,
+                        help="completed clock-exchange JSONL with matching source/capture run and boots")
+    result.add_argument("--remote-ready", type=Path,
+                        help="wait up to 120 seconds after capture for source/clock transfer completion")
     result.add_argument("--label", default="native-split-frame-id")
     result.add_argument("--capture", type=Path, default=DEFAULT_CAPTURE)
     result.add_argument("--module", type=Path, default=DEFAULT_MODULE)
     result.add_argument(
         "--source-telemetry", type=Path,
-        help="KMS source JSONL on the same host/boot; absence makes mapping validation non-passing",
+        help="KMS source JSONL; cross-host timing additionally requires --clock-evidence",
     )
     result.add_argument("--keep-timings", action="store_true")
     result.add_argument(
@@ -1032,7 +1241,7 @@ def main() -> int:
             summary = validate_bundle(args.validate, args.channel)
             print(json.dumps(summary, indent=2))
             return 0 if summary["result"] == "pass" else 1
-        if not args.run:
+        if not args.run and not args.preflight_only:
             parser().print_help()
             return 2
         if args.channel is None:

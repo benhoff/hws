@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import hws_vdone_evidence as evidence
 import hws_vdone_matrix as matrix
 from hws_vdone_observers import PATTERN_VERSION, PROBE_READ_LIMIT
-from test_vdone_observers import CONFIG, PERIOD, mapping_fixture
+from test_vdone_observers import CONFIG, PERIOD, code, mapping_fixture
 
 
 class BundleTests(unittest.TestCase):
@@ -99,12 +99,170 @@ class BundleTests(unittest.TestCase):
         with patch.object(evidence, "trace_records", return_value=copy.deepcopy(self.trace)):
             return evidence.validate_bundle(self.bundle)
 
+    def change_snapshot(self, name, **changes):
+        path = self.bundle / (name + ".txt")
+        values = evidence.parse_kv(path.read_text())
+        values.update(changes)
+        path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+
     def test_complete_synthetic_bundle(self):
         summary = self.validate()
         self.assertEqual(summary["failures"], [])
         self.assertEqual(summary["schema"], 3)
         self.assertAlmostEqual(summary["vdone_rate_hz"], 120, places=5)
         self.assertLess(summary["vdone_timing"]["elapsed_seconds"], 2)
+
+    def test_continuity_counters_are_checked_separately(self):
+        self.change_snapshot("stats-after", continuity_reports="0", continuity_gaps="0")
+        self.assertEqual(self.validate()["failures"], [])
+        # Accounting-only fixture: don't claim this invented recovery proves
+        # anomaly/content attribution. Check the class counters independently.
+        self.trace["recovery"].append(dict(reason="6", steady="1", reports="1",
+            dropped_partial="0", generation="1", toggle="0", interval_us="25000"))
+        self.change_snapshot("stats-after", recovery_reports="1",
+                             continuity_reports="1", continuity_gaps="1")
+        failures = self.validate()["failures"]
+        self.assertFalse(any("recovery mismatch" in f or "continuity" in f for f in failures))
+        self.change_snapshot("stats-after", continuity_reports="0")
+        failures = self.validate()["failures"]
+        self.assertIn("continuity gap/report counters disagree", failures)
+        self.assertTrue(any("recovery mismatch for continuity_reports" in f for f in failures))
+
+    def test_missing_continuity_counter_fails_closed(self):
+        self.change_snapshot("stats-after", continuity_gaps="0")
+        self.assertIn("missing continuity recovery counters", self.validate()["failures"])
+
+    def add_cross_host_clock(self):
+        from test_clock_mapping import clock_fixture
+        path = self.bundle / "source-presentation.jsonl"
+        source = [json.loads(line) for line in path.read_text().splitlines()]
+        source[0].update(boot_id="source", run_id="run")
+        for r in source[1:]:
+            for key in ("submitted_ns", "presented_ns", "callback_ns"):
+                r[key] += 10_000_000_000
+        path.write_text("".join(json.dumps(r)+"\n" for r in source))
+        self.manifest.update(run_id="run", boot_id="capture", clock_evidence_schema=1)
+        self.save_manifest()
+        rows = clock_fixture(offset=-10_000_000_000, start=10_800_000_000)
+        (self.bundle / "clock-exchanges.jsonl").write_text("".join(json.dumps(r)+"\n" for r in rows))
+
+    def test_cross_host_bundle_and_missing_calibration(self):
+        self.add_cross_host_clock()
+        result = self.validate()
+        self.assertEqual(result["failures"], [])
+        self.assertEqual(result["source_presentation"]["temporal_association"]["inside"], 90)
+        (self.bundle / "clock-exchanges.jsonl").unlink()
+        self.assertEqual(self.validate()["result"], "fail")
+
+    def test_cross_host_retained_startup_requires_valid_clock_identity(self):
+        self.add_cross_host_clock()
+        for i in (1, 3):
+            self.trace["probe"][0][f"code{i}"] = str(code(999))
+        self.assertEqual(self.validate()["failures"], [])
+        path = self.bundle / "clock-exchanges.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]["source_boot_id"] = "wrong-boot"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        self.assertIn("private-ring ID moved backward at generation 2", self.validate()["failures"])
+
+    def test_cross_host_clock_file_in_checksum_inventory(self):
+        self.add_cross_host_clock()
+        evidence.write_bundle_checksums(self.bundle)
+        evidence.verify_bundle_checksums(self.bundle)
+        with (self.bundle / "clock-exchanges.jsonl").open("a") as stream:
+            stream.write('{}\n')
+        with self.assertRaises(evidence.EvidenceError): evidence.verify_bundle_checksums(self.bundle)
+
+    def test_cross_host_malformed_calibration_fails_closed(self):
+        self.add_cross_host_clock()
+        (self.bundle / "clock-exchanges.jsonl").write_text('{}\n')
+        self.assertIn("clock evidence invalid", " ".join(self.validate()["failures"]))
+    def test_split_cache_can_initialize_before_first_stream(self):
+        self.change_snapshot("config-before", split16_cached="0")
+        self.assertEqual(self.validate()["failures"], [])
+
+    def test_diagnostic_scope_does_not_promote_dirty_evidence(self):
+        self.manifest["tracked_status"] = [" M tools/hws_vdone_evidence.py"]
+        self.save_manifest()
+        summary = self.validate()
+        self.assertEqual(summary["capture_checks"]["result"], "pass")
+        self.assertEqual(summary["provenance"]["result"], "fail")
+        self.assertEqual(summary["result"], "fail")
+
+    def test_diagnostic_scope_does_not_promote_broken_source_timing(self):
+        path = self.bundle / "source-presentation.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        for record in records[1:]:
+            record["sequence"] = 0
+        path.write_text("".join(json.dumps(r) + "\n" for r in records))
+        summary = self.validate()
+        self.assertEqual(summary["capture_checks"]["result"], "pass")
+        self.assertTrue(summary["presentation_failures"])
+        self.assertEqual(summary["result"], "fail")
+
+    def test_diagnostic_scope_retains_integrity_failures(self):
+        self.capture[1]["content_bad_bytes"] = 1
+        self.capture[-1]["outstanding"] = 1
+        self.trace["copy"][0]["guard_ok"] = "0"
+        self.trace["loss"].append({"line": "LOST 1 EVENTS"})
+        self.save_capture()
+        summary = self.validate()
+        errors = " ".join(summary["capture_checks"]["failures"])
+        for fragment in ("content", "drained", "guard", "trace loss"):
+            self.assertIn(fragment, errors)
+        self.assertEqual(summary["capture_checks"]["result"], "fail")
+        self.assertEqual(summary["result"], "fail")
+
+    def test_disabled_probes_never_pass_mapping(self):
+        self.trace["probe"] = []
+        summary = self.validate()
+        self.assertEqual(summary["independent_mapping"]["result"], "fail")
+        self.assertEqual(summary["capture_checks"]["result"], "fail")
+        self.assertEqual(summary["result"], "fail")
+
+    def test_split_cache_initialization_requires_inactive_channel(self):
+        self.change_snapshot("config-before", split16_cached="0")
+        for field in ("streaming", "cap_active"):
+            with self.subTest(field=field):
+                self.change_snapshot("stats-before", **{field: "1"})
+                self.assertIn("split cache before capture", " ".join(self.validate()["failures"]))
+                self.change_snapshot("stats-before", **{field: "0"})
+
+    def test_split_cache_must_finish_native_and_cannot_change_from_wrong_value(self):
+        for before, after in (("129535", "129536"), ("0", "0"),
+                              ("0", "129535"), ("129535", "129535")):
+            with self.subTest(before=before, after=after):
+                self.change_snapshot("config-before", split16_cached=before)
+                self.change_snapshot("config-after", split16_cached=after)
+                self.assertIn("split cache", " ".join(self.validate()["failures"]))
+
+    def test_cache_initialization_does_not_hide_register_or_trace_changes(self):
+        self.change_snapshot("config-before", split16_cached="0")
+        for snapshot in ("config-before", "config-after"):
+            with self.subTest(snapshot=snapshot):
+                self.change_snapshot(snapshot, split16_readback="129535")
+                self.assertIn("split16_readback", " ".join(self.validate()["failures"]))
+                self.change_snapshot(snapshot, split16_readback="129536")
+        for event in self.trace["stream"]:
+            with self.subTest(action=event["action"]):
+                event["split16"] = "0"
+                self.assertIn("does not match split16_cached", " ".join(self.validate()["failures"]))
+                event["split16"] = "129536"
+
+    def test_retained_startup_ring_id_uses_matching_source_identity(self):
+        for i in (1, 3):
+            self.trace["probe"][0][f"code{i}"] = str(code(999))
+        summary = self.validate()
+        self.assertEqual(summary["failures"], [])
+        self.assertEqual(summary["independent_mapping"]["counts"]["startup_replacements"], 1)
+        path = self.bundle / "source-presentation.jsonl"
+        records = [json.loads(line) for line in path.read_text().splitlines()]
+        for field in ("boot_id", "source_sha256", "pattern_sha256"):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(records)
+                changed[0][field] = "unrelated-source"
+                path.write_text("".join(json.dumps(r) + "\n" for r in changed))
+                self.assertIn("private-ring ID moved backward at generation 2", self.validate()["failures"])
 
     def test_old_bundle_fails_closed(self):
         self.manifest["schema"] = 2

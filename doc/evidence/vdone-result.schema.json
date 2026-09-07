@@ -13,6 +13,9 @@
   "properties": {
     "schema": { "const": 3 },
     "result": { "enum": ["pass", "fail"] },
+    "capture_checks": { "$ref": "#/$defs/checkResult" },
+    "provenance": { "$ref": "#/$defs/checkResult" },
+    "presentation_failures": { "type": "array", "items": { "type": "string" } },
     "run_id": { "type": "string", "minLength": 1 },
     "channel": { "type": "integer", "minimum": 0, "maximum": 3 },
     "stream_epoch": { "type": "integer", "minimum": 1 },
@@ -55,5 +58,16 @@
       }
     },
     "failures": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "checkResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result", "failures"],
+      "properties": {
+        "result": { "enum": ["pass", "fail"] },
+        "failures": { "type": "array", "items": { "type": "string" } }
+      }
+    }
   }
 }
