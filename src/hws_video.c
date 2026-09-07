@@ -241,6 +241,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	}
 	vid->detected_dv_status = -ENOLINK;
 	vid->source_state_initialized = false;
+	vid->source_change_pending = false;
 	vid->current_fps = 60;
 
 	/* color controls default (mid-scale) */
@@ -1069,6 +1070,8 @@ static void hws_video_update_source_state(struct hws_pcie_dev *pdx,
 	};
 	bool changed;
 	bool initialized;
+	bool notify;
+	unsigned long flags;
 
 	if (!pdx || !pdx->bar0_base || !timings)
 		return;
@@ -1088,8 +1091,16 @@ static void hws_video_update_source_state(struct hws_pcie_dev *pdx,
 	v->detected_fps = fps;
 	v->detected_dv_timings = *timings;
 	v->source_state_initialized = true;
+	/* The worker may have caught a brief transition which returned before
+	 * this monitor sample. Consume only while state_lock is owned, so a
+	 * skipped monitor iteration cannot lose the notification.
+	 */
+	spin_lock_irqsave(&v->irq_lock, flags);
+	notify = changed || v->source_change_pending;
+	v->source_change_pending = false;
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 
-	if (!changed)
+	if (!notify)
 		goto out_unlock;
 
 	/*
@@ -1097,7 +1108,10 @@ static void hws_video_update_source_state(struct hws_pcie_dev *pdx,
 	 * Stop the private DMA producer, fail active dequeue operations, and
 	 * let userspace QUERY, STREAMOFF, S_DV_TIMINGS, and reallocate.
 	 */
-	if (READ_ONCE(v->cap_active)) {
+	/* A pending worker notification alone must not stop a new, valid stream
+	 * which userspace has already restarted since the worker's failure.
+	 */
+	if (changed && READ_ONCE(v->cap_active)) {
 		WRITE_ONCE(v->stop_requested, true);
 		WRITE_ONCE(v->cap_active, false);
 		/* Publish the stop state before disabling the producer in MMIO. */

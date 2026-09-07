@@ -196,6 +196,9 @@ struct hws_video {
 	int detected_dv_status;
 	u32 detected_fps;
 	bool source_state_initialized;
+	bool source_change_pending; /* irq_lock; monitor notification survives return */
+	u64 source_check_count, source_check_ns, source_check_max_ns;
+	u64 source_check_failures; /* lifetime counters, under irq_lock */
 	u32 current_fps; /* nominal integer mode label, not an exact frame period */
 
 	/* Per-channel capture state */

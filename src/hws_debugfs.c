@@ -33,6 +33,8 @@ struct hws_video_evidence_snapshot {
 	u64 overlap_reports;
 	u64 continuity_reports;
 	u64 continuity_gaps;
+	u64 source_check_count, source_check_ns, source_check_max_ns;
+	u64 source_check_failures;
 	u64 resync_reports;
 	u64 queue_failures;
 	u64 generation;
@@ -83,6 +85,10 @@ static void hws_debugfs_snapshot(struct hws_video *v,
 	s->overlap_reports = v->evidence_overlap_reports;
 	s->continuity_reports = v->evidence_continuity_reports;
 	s->continuity_gaps = v->continuity_gaps;
+	s->source_check_count = v->source_check_count;
+	s->source_check_ns = v->source_check_ns;
+	s->source_check_max_ns = v->source_check_max_ns;
+	s->source_check_failures = v->source_check_failures;
 	s->resync_reports = v->evidence_resync_reports;
 	s->queue_failures = v->evidence_queue_failures;
 	s->generation = v->next_completion_generation;
@@ -250,6 +256,11 @@ static int hws_debugfs_stats_show(struct seq_file *m, void *unused)
 		   (unsigned long long)s.continuity_gaps);
 	seq_printf(m, "resync_reports=%llu\n",
 		   (unsigned long long)s.resync_reports);
+	seq_printf(m, "source_check_count=%llu\nsource_check_ns=%llu\nsource_check_max_ns=%llu\nsource_check_failures=%llu\n",
+		   (unsigned long long)s.source_check_count,
+		   (unsigned long long)s.source_check_ns,
+		   (unsigned long long)s.source_check_max_ns,
+		   (unsigned long long)s.source_check_failures);
 	seq_printf(m, "queue_failures=%llu\n",
 		   (unsigned long long)s.queue_failures);
 	seq_printf(m, "completion_overruns=%u\n", s.completion_overruns);

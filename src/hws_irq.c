@@ -6,6 +6,7 @@
 #include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/minmax.h>
+#include <linux/moduleparam.h>
 #include <linux/string.h>
 
 #include "hws_irq.h"
@@ -16,6 +17,16 @@
 #include "hws_fault.h"
 #include "hws_audio.h"
 #include "hws_trace.h"
+#include "hws_source.h"
+
+/* Qualification switch: keep extra PCIe reads out of the default path until
+ * real worker/deadline overhead is measured. Immutable while loaded.
+ */
+static bool source_transition_checks;
+module_param(source_transition_checks, bool, 0444);
+MODULE_PARM_DESC(source_transition_checks,
+	"Experimental worker source checks; not DMA containment (default off)");
+
 
 /* Characterized minimum reuse was 7,950 us at 1080p60. */
 #define HWS_VIDEO_COPY_DEADLINE_NS (7500ULL * NSEC_PER_USEC)
@@ -462,6 +473,45 @@ verify_phase:
 	return 0;
 }
 
+static bool hws_video_check_source(struct hws_video *v)
+{
+	unsigned long flags;
+	u64 start, elapsed;
+	int ret;
+
+	if (!source_transition_checks)
+		return true;
+	start = ktime_get_mono_fast_ns();
+	ret = hws_video_source_matches(v);
+	elapsed = ktime_get_mono_fast_ns();
+	elapsed = elapsed >= start ? elapsed - start : 0;
+	spin_lock_irqsave(&v->irq_lock, flags);
+	v->source_check_count++;
+	v->source_check_ns += elapsed;
+	v->source_check_max_ns = max(v->source_check_max_ns, elapsed);
+	if (ret) {
+		if (ret != -ECANCELED)
+			v->source_check_failures++;
+		if (ret == -EPIPE)
+			v->source_change_pending = true;
+		hws_video_clear_frame_continuity(v);
+		v->frame_half0_valid = false;
+		hws_irq_clear_overlap_locked(v);
+		hws_irq_reset_completion_locked(v);
+	}
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+	if (ret == -ECANCELED)
+		return false; /* ordinary STREAMOFF/suspend owns the drain and returns */
+	if (ret) {
+		/* No state_lock or self-drain here: STREAMOFF may be waiting for us.
+		 * Keep all destinations attached until that drain completes.
+		 */
+		hws_video_fail_queue(v, "capture source changed or became unavailable");
+		return false;
+	}
+	return true;
+}
+
 static void hws_video_handle_vdone(struct hws_video *v)
 {
 	struct hws_pcie_dev *hws = v->parent;
@@ -545,6 +595,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		return;
 	}
 
+	if (!hws_video_check_source(v))
+		return;
 	ret = hws_video_copy_completed_half(v, &event, &done,
 					    &frame_complete,
 					    &copy_observation);
@@ -566,6 +618,9 @@ static void hws_video_handle_vdone(struct hws_video *v)
 				(copy_observation.guard_ok << 19) |
 				(frame_complete << 20), ret);
 
+	/* Recheck after the copy, before detaching or publishing a destination. */
+	if (!hws_video_check_source(v))
+		return;
 	spin_lock_irqsave(&v->irq_lock, flags);
 	if (v->completion_state == HWS_VIDEO_COMPLETION_OVERRUN) {
 		hws_irq_clear_overlap_locked(v);

@@ -35,7 +35,14 @@ check-config:
 check-config-sanitize:
 	HWS_CONFIG_SANITIZE=1 python3 -m unittest test_configuration.ConfigurationTests.test_dma_transaction test_configuration.ConfigurationTests.test_timing_contract -v
 
-check: check-config check-failure check-audio all hws_frame_id_kms test_frame_id_kms
+.PHONY: check-transitions check-transitions-sanitize
+check-transitions:
+	python3 -m unittest test_transitions -v
+
+check-transitions-sanitize:
+	HWS_TRANSITION_SANITIZE=1 python3 -m unittest test_transitions.TransitionTests.test_restart_and_notification_contract -v
+
+check: check-transitions check-config check-failure check-audio all hws_frame_id_kms test_frame_id_kms
 	./hws_frame_id_capture --self-test
 	./test_frame_id_kms
 	python3 -m unittest discover -s . -p 'test_vdone*.py' -v
