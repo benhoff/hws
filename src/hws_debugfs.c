@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 
 #include "hws.h"
+#include "hws_timing.h"
 #include "hws_debugfs.h"
 #include "hws_reg.h"
 #include "hws_probe.h"
@@ -116,6 +117,8 @@ static int hws_debugfs_config_show(struct seq_file *m, void *unused)
 	struct hws_pcie_dev *hws = v->parent;
 	struct pci_dev *pdev = hws->pdev;
 	const struct v4l2_bt_timings *bt = &v->cur_dv_timings.bt;
+	struct v4l2_fract period;
+	int timing_status;
 	u32 htotal;
 	u32 vtotal;
 	u32 split16_readback = U32_MAX;
@@ -123,6 +126,9 @@ static int hws_debugfs_config_show(struct seq_file *m, void *unused)
 	u32 int_status = U32_MAX;
 
 	(void)unused;
+	/* Match ioctl/monitor configuration publication; no mixed timing/layout. */
+	mutex_lock(&v->state_lock);
+	timing_status = hws_dv_frame_period(&v->cur_dv_timings, &period);
 	if (hws->bar0_base && !READ_ONCE(hws->suspended) &&
 	    !READ_ONCE(hws->pci_lost)) {
 		split16_readback = readl(hws->bar0_base +
@@ -161,16 +167,20 @@ static int hws_debugfs_config_show(struct seq_file *m, void *unused)
 		   (unsigned long long)READ_ONCE(bt->pixelclock));
 	seq_printf(m, "htotal=%u\n", htotal);
 	seq_printf(m, "vtotal=%u\n", vtotal);
-	seq_printf(m, "refresh_num=%llu\n",
-		   (unsigned long long)READ_ONCE(bt->pixelclock));
-	seq_printf(m, "refresh_den=%llu\n",
-		   (unsigned long long)htotal * vtotal);
+	/* Preserve the evidence ABI's pixelclock/total-pixels representation. */
+	seq_printf(m, "refresh_num=%llu\n", (unsigned long long)bt->pixelclock);
+	seq_printf(m, "refresh_den=%llu\n", (unsigned long long)htotal * vtotal);
+	seq_printf(m, "frame_period_num=%u\n", period.numerator);
+	seq_printf(m, "frame_period_den=%u\n", period.denominator);
+	seq_printf(m, "timing_status=%d\n", timing_status);
+	seq_puts(m, "timing_basis=configured-mode; receiver query is table-inferred\n");
 	seq_printf(m, "dma_extent=%zu\n", READ_ONCE(v->ring_extent));
 	seq_printf(m, "split_bytes=%zu\n", READ_ONCE(v->ring_split));
 	seq_printf(m, "split16_cached=%u\n", READ_ONCE(v->last_half16));
 	seq_printf(m, "split16_readback=%u\n", split16_readback);
 	seq_printf(m, "toggle_readback=%u\n", toggle);
 	seq_printf(m, "int_status_readback=0x%08x\n", int_status);
+	mutex_unlock(&v->state_lock);
 	return 0;
 }
 

@@ -28,7 +28,14 @@ check-failure:
 check-failure-sanitize:
 	HWS_FAILURE_SANITIZE=1 python3 -m unittest test_device_failure.DeviceFailureTests.test_production_failure_transaction -v
 
-check: check-failure check-audio all hws_frame_id_kms test_frame_id_kms
+.PHONY: check-config check-config-sanitize
+check-config:
+	python3 -m unittest test_configuration -v
+
+check-config-sanitize:
+	HWS_CONFIG_SANITIZE=1 python3 -m unittest test_configuration.ConfigurationTests.test_dma_transaction test_configuration.ConfigurationTests.test_timing_contract -v
+
+check: check-config check-failure check-audio all hws_frame_id_kms test_frame_id_kms
 	./hws_frame_id_capture --self-test
 	./test_frame_id_kms
 	python3 -m unittest discover -s . -p 'test_vdone*.py' -v

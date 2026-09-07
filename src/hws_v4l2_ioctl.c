@@ -14,6 +14,7 @@
 #include <media/videobuf2-v4l2.h>
 
 #include "hws.h"
+#include "hws_timing.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws_v4l2_ioctl.h"
@@ -162,7 +163,7 @@ int hws_detect_dv_timings(struct hws_video *vid,
 {
 	struct hws_pcie_dev *pdx;
 	const struct hws_dv_mode *m;
-	u32 active0, active1, res0, res1, live_fps;
+	u32 active0, active1, res0, res1, live_fps, fps1;
 	u32 channel_mask;
 	u32 width, height;
 	bool interlaced;
@@ -199,9 +200,10 @@ int hws_detect_dv_timings(struct hws_video *vid,
 	live_fps = readl(pdx->bar0_base +
 			 HWS_REG_FRAME_RATE(vid->channel_index));
 	res1 = readl(pdx->bar0_base + HWS_REG_IN_RES(vid->channel_index));
+	fps1 = readl(pdx->bar0_base + HWS_REG_FRAME_RATE(vid->channel_index));
 	active1 = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
 	if (res0 == U32_MAX || res1 == U32_MAX || active1 == U32_MAX ||
-	    live_fps == U32_MAX) {
+	    live_fps == U32_MAX || fps1 == U32_MAX) {
 		hws_device_lost(pdx, "all-ones receiver timing snapshot");
 		return -ENODEV;
 	}
@@ -224,7 +226,8 @@ int hws_detect_dv_timings(struct hws_video *vid,
 
 	/* A mode transition between the paired samples is not a stable lock. */
 	if ((active0 & channel_mask) != (active1 & channel_mask) ||
-	    res0 != res1 || !width || !height || !live_fps || live_fps > 240)
+	    res0 != res1 || live_fps != fps1 ||
+	    !width || !height || !live_fps || live_fps > 240)
 		return -ENOLCK;
 
 	m = hws_find_dv_by_wh_fps(width, height, interlaced, live_fps);
@@ -630,19 +633,24 @@ int hws_vidioc_g_parm(struct file *file, void *fh, struct v4l2_streamparm *param
 {
 	struct hws_video *vid = video_drvdata(file);
 	struct v4l2_dv_timings detected;
-	u32 fps;
+	struct v4l2_fract period;
+	int ret;
 
 	if (param->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	if (hws_detect_dv_timings(vid, &detected, &fps))
-		fps = vid->current_fps ? vid->current_fps : 60;
+	memset(&param->parm.capture, 0, sizeof(param->parm.capture));
+	ret = hws_detect_dv_timings(vid, &detected, NULL);
+	if (ret)
+		return ret;
+	ret = hws_dv_frame_period(&detected, &period);
+	if (ret)
+		return ret;
 
-	/* HDMI receivers report the detected frame period, they don't set it. */
+	/* Same inferred mode as QUERY_DV_TIMINGS, not a writable frame period. */
 	param->parm.capture.capability           = 0;
 	param->parm.capture.capturemode          = 0;
-	param->parm.capture.timeperframe.numerator   = 1;
-	param->parm.capture.timeperframe.denominator = fps;
+	param->parm.capture.timeperframe = period;
 	param->parm.capture.extendedmode         = 0;
 	param->parm.capture.readbuffers          = 0;
 

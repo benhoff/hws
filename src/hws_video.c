@@ -24,6 +24,7 @@
 #include <media/videobuf2-dma-contig.h>
 
 #include "hws.h"
+#include "hws_dma_config.h"
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws_audio.h"
@@ -61,7 +62,7 @@ static inline bool list_node_unlinked(const struct list_head *n)
 static bool dma_window_verify;
 module_param_named(dma_window_verify, dma_window_verify, bool, 0644);
 MODULE_PARM_DESC(dma_window_verify,
-		 "Read back DMA window registers after programming (debug)");
+		 "Compatibility option; DMA window readback checks are always enabled");
 
 static size_t hws_video_dma_extent(size_t frame_size)
 {
@@ -81,24 +82,21 @@ static void hws_ack_video_pending(struct hws_pcie_dev *hws, unsigned int ch)
 
 static int hws_program_video_ring_locked(struct hws_video *vid)
 {
-	const u32 addr_mask = PCI_E_BAR_ADD_MASK;
-	const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;
 	struct hws_pcie_dev *hws = vid->parent;
 	unsigned int ch = vid->channel_index;
-	u32 table_off = HWS_VIDEO_REMAP_SLOT_OFF(ch);
 	dma_addr_t dma;
-	size_t extent;
-	size_t split;
-	u32 lo;
-	u32 hi;
-	u32 pci_addr;
-	u32 page_lo;
-	bool wrote = false;
+	size_t extent, split;
+	int ret;
 
 	lockdep_assert_held(&vid->irq_lock);
+	/* Do not invalidate a live mapping or retarget an engine still in use. */
+	if (READ_ONCE(vid->cap_active))
+		return -EBUSY;
+	vid->window_valid = false;
+	if (READ_ONCE(vid->dma_needs_idle))
+		return -EBUSY;
 	if (!hws_yuyv_layout_valid(&vid->pix))
 		return -EINVAL;
-
 	dma = hws_video_ring_dma(hws, ch);
 	extent = hws_video_dma_extent(vid->pix.sizeimage);
 	split = hws_video_native_split(vid->pix.sizeimage);
@@ -107,71 +105,18 @@ static int hws_program_video_ring_locked(struct hws_video *vid)
 	    !hws_dma_fits_remap_window(dma, extent + PAGE_SIZE))
 		return -ERANGE;
 
-	lo = lower_32_bits(dma);
-	hi = upper_32_bits(dma);
-	pci_addr = lo & addr_low_mask;
-	page_lo = lo & addr_mask;
-
-	/* Never retarget the video engine while its VCAP bit is live. */
-	if (READ_ONCE(vid->cap_active) &&
-	    (!vid->window_valid || vid->last_dma_hi != hi ||
-	     vid->last_dma_page != page_lo ||
-	     vid->last_pci_addr != pci_addr ||
-	     vid->last_half16 != split / 16))
-		return -EBUSY;
-
-	/* Remap entry only when DMA crosses into a new 512 MB page */
-	if (!vid->window_valid || vid->last_dma_hi != hi ||
-	    vid->last_dma_page != page_lo) {
-		writel(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-		writel(page_lo,
-		       hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-		       PCIE_BARADDROFSIZE);
-		vid->last_dma_hi = hi;
-		vid->last_dma_page = page_lo;
-		wrote = true;
-	}
-
-	/* Base pointer only needs low 29 bits */
-	if (!vid->window_valid || vid->last_pci_addr != pci_addr) {
-		writel((ch + 1) * PCIEBAR_AXI_BASE + pci_addr,
-		       hws->bar0_base + HWS_BUF_BASE_OFF(ch));
-		vid->last_pci_addr = pci_addr;
-		wrote = true;
-	}
-
-	/* Half-size only changes when resolution changes */
-	if (!vid->window_valid || vid->last_half16 != split / 16) {
-		writel(split / 16,
-		       hws->bar0_base + HWS_HALF_SZ_OFF(ch));
-		vid->last_half16 = split / 16;
-		wrote = true;
-	}
-
+	ret = hws_program_dma_window(hws, ch, dma, split / 16, false, true);
+	if (ret)
+		return ret;
+	/* Commit only after all readable fields match, including cached windows. */
+	vid->last_dma_hi = upper_32_bits(dma);
+	vid->last_dma_page = lower_32_bits(dma) & PCI_E_BAR_ADD_MASK;
+	vid->last_pci_addr = lower_32_bits(dma) & PCI_E_BAR_ADD_LOWMASK;
+	vid->last_half16 = split / 16;
 	vid->pix.half_size = split;
 	vid->ring_extent = extent;
 	vid->ring_split = split;
 	vid->window_valid = true;
-
-	if (dma_window_verify && wrote) {
-		u32 r_hi =
-		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-		u32 r_lo =
-		    readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-			  PCIE_BARADDROFSIZE);
-		u32 r_base = readl(hws->bar0_base + HWS_BUF_BASE_OFF(ch));
-		u32 r_half = readl(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
-
-		dev_dbg(&hws->pdev->dev,
-			"ch%u remap verify: hi=0x%08x page_lo=0x%08x exp_page=0x%08x base=0x%08x exp_base=0x%08x half16B=0x%08x exp_half=0x%08zx\n",
-			ch, r_hi, r_lo, page_lo, r_base,
-			(ch + 1) * PCIEBAR_AXI_BASE + pci_addr, r_half,
-			split / 16);
-	} else if (wrote) {
-		/* Flush posted writes before arming DMA */
-		readl_relaxed(hws->bar0_base + HWS_HALF_SZ_OFF(ch));
-	}
-
 	return 0;
 }
 
@@ -639,6 +584,11 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 		return;
 
 	spin_lock_irqsave(&hws->capture_lock, flags);
+	if (on && !READ_ONCE(hws->video[chan].window_valid)) {
+		WRITE_ONCE(hws->video[chan].cap_active, false);
+		spin_unlock_irqrestore(&hws->capture_lock, flags);
+		return;
+	}
 	if (READ_ONCE(hws->dma_quiesced) || READ_ONCE(hws->dma_failed) ||
 	    READ_ONCE(hws->pci_lost) || READ_ONCE(hws->suspended)) {
 		WRITE_ONCE(hws->video[chan].cap_active, false);
@@ -675,90 +625,30 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 
 static int hws_seed_dma_windows(struct hws_pcie_dev *hws)
 {
-	const u32 addr_mask = PCI_E_BAR_ADD_MASK;
-	const u32 addr_low_mask = PCI_E_BAR_ADD_LOWMASK;
 	unsigned long flags;
 	unsigned int ch;
-	u32 readback;
+	int ret = 0;
 
-	if (!hws || !hws->bar0_base)
-		return -ENODEV;
-
-	/* Keep arena DMA addresses stable while taking each channel IRQ lock. */
 	mutex_lock(&hws->scratch_lock);
-
-	/* If cur_max_video_ch is not set yet, default to max_channels. */
 	if (!hws->cur_max_video_ch || hws->cur_max_video_ch > hws->max_channels)
 		hws->cur_max_video_ch = hws->max_channels;
-
 	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
 		struct hws_video *vid = &hws->video[ch];
-		dma_addr_t p;
-		u32 half_bytes;
-		u32 hi, lo;
-		u32 pci_addr_low;
-		u32 ring_size;
-		u32 table;
+		u32 size = vid->pix.sizeimage ?: MAX_VIDEO_SCALER_SIZE;
 
 		if (!hws->scratch_vid[ch].cpu)
 			continue;
-
-		/* Serialize the shared remap slot with runtime video and audio. */
 		spin_lock_irqsave(&vid->irq_lock, flags);
-
-		p = hws_video_ring_dma(hws, ch);
-		lo = lower_32_bits(p) & addr_mask;
-		hi = upper_32_bits(p);
-		pci_addr_low = lower_32_bits(p) & addr_low_mask;
-		table = HWS_VIDEO_REMAP_SLOT_OFF(ch);
-		ring_size = vid->pix.sizeimage ?
-			vid->pix.sizeimage : MAX_VIDEO_SCALER_SIZE;
-		half_bytes = hws_video_native_split(ring_size);
-
-		/* Program and verify the complete fixed DMA window. */
-		writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table);
-		writel_relaxed(lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + table +
-			       PCIE_BARADDROFSIZE);
-		writel_relaxed((ch + 1) * PCIEBAR_AXI_BASE + pci_addr_low,
-			       hws->bar0_base + CVBS_IN_BUF_BASE +
-			       ch * PCIE_BARADDROFSIZE);
-		writel_relaxed(half_bytes / 16,
-			       hws->bar0_base + CVBS_IN_BUF_BASE2 +
-			       ch * PCIE_BARADDROFSIZE);
-
-		readback = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table);
-		if (readback != hi)
-			goto err_unlock_channel;
-		readback = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE + table +
-				 PCIE_BARADDROFSIZE);
-		if (readback != lo)
-			goto err_unlock_channel;
-		readback = readl(hws->bar0_base + CVBS_IN_BUF_BASE +
-				 ch * PCIE_BARADDROFSIZE);
-		if (readback != (ch + 1) * PCIEBAR_AXI_BASE + pci_addr_low)
-			goto err_unlock_channel;
-		readback = readl(hws->bar0_base + CVBS_IN_BUF_BASE2 +
-				 ch * PCIE_BARADDROFSIZE);
-		if (readback != half_bytes / 16)
-			goto err_unlock_channel;
-
-		/* The next stream revalidates the fixed mapping and cached split. */
+		/* Probe/resume is globally quiesced; stream start commits the cache. */
 		vid->window_valid = false;
+		ret = hws_program_dma_window(hws, ch, hws_video_ring_dma(hws, ch),
+					    hws_video_native_split(size) / 16, false, true);
 		spin_unlock_irqrestore(&vid->irq_lock, flags);
-	}
-
-	/* Post writes so device sees them before we move on */
-	if (readl(hws->bar0_base + HWS_REG_INT_STATUS) == U32_MAX) {
-		mutex_unlock(&hws->scratch_lock);
-		return -ENODEV;
+		if (ret)
+			break;
 	}
 	mutex_unlock(&hws->scratch_lock);
-	return 0;
-
-err_unlock_channel:
-	spin_unlock_irqrestore(&hws->video[ch].irq_lock, flags);
-	mutex_unlock(&hws->scratch_lock);
-	return readback == U32_MAX ? -ENODEV : -EIO;
+	return ret;
 }
 
 static int hws_ack_all_irqs(struct hws_pcie_dev *hws)

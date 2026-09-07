@@ -6,6 +6,7 @@
 #include <sound/pcm.h>
 
 #include "hws.h"
+#include "hws_dma_config.h"
 #include "hws_fault.h"
 #include "hws_audio.h"
 #include "hws_reg.h"
@@ -216,80 +217,19 @@ static int hws_guard_audio_video_remap_page_locked(struct hws_pcie_dev *hws,
 	return -EBUSY;
 }
 
-static void hws_audio_program_remap_slot(struct hws_pcie_dev *hws,
-					 u32 table_off, u32 hi, u32 page_lo)
-{
-	writel_relaxed(hi, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off);
-	writel_relaxed(page_lo, hws->bar0_base + PCI_ADDR_TABLE_BASE + table_off +
-		       PCIE_BARADDROFSIZE);
-}
-
 static int hws_audio_seed_capture_buffer_locked(struct hws_pcie_dev *hws,
 						unsigned int ch,
 						bool require_base_readback)
 {
-	struct hws_video *vid;
 	dma_addr_t dma;
-	u32 lo, hi, pci_addr;
-	u32 audio_table_off;
-	u32 readback;
 
 	if (!hws || ch >= hws->cur_max_audio_ch)
 		return -EINVAL;
-
-	vid = &hws->video[ch];
-	lockdep_assert_held(&vid->irq_lock);
-
+	lockdep_assert_held(&hws->video[ch].irq_lock);
 	if (!hws_audio_select_buffer(hws, ch, NULL, &dma, NULL))
 		return -ENOMEM;
-
-	lo = lower_32_bits(dma);
-	hi = upper_32_bits(dma);
-	pci_addr = lo & PCI_E_BAR_ADD_LOWMASK;
-	lo &= PCI_E_BAR_ADD_MASK;
-	audio_table_off = HWS_AUDIO_REMAP_SLOT_OFF(ch);
-	hws_audio_program_remap_slot(hws, audio_table_off, hi, lo);
-	writel_relaxed((ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
-		       hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
-	readback = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
-			 audio_table_off);
-	if (readback == U32_MAX)
-		return -ENODEV;
-	if (readback != hi) {
-		dev_err(&hws->pdev->dev,
-			"audio seed ch%u remap-hi mismatch: expected=0x%08x actual=0x%08x\n",
-			ch, hi, readback);
-		return -EIO;
-	}
-	readback = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
-			 audio_table_off + PCIE_BARADDROFSIZE);
-	if (readback == U32_MAX)
-		return -ENODEV;
-	if (readback != lo) {
-		dev_err(&hws->pdev->dev,
-			"audio seed ch%u remap-lo mismatch: expected=0x%08x actual=0x%08x\n",
-			ch, lo, readback);
-		return -EIO;
-	}
-	readback = readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
-	if (readback == U32_MAX)
-		return -ENODEV;
-	/*
-	 * Idle inputs on this hardware can read their audio DMA base back as
-	 * zero even though the write is accepted.  Probe and resume leave every
-	 * producer disabled, so the exact remap-table checks above are the
-	 * durable restoration proof there.  A stream start must still prove the
-	 * base register itself before ACAP_ENABLE can arm DMA.
-	 */
-	if (require_base_readback &&
-	    readback != (ch + 1u) * PCIEBAR_AXI_BASE + pci_addr) {
-		dev_err(&hws->pdev->dev,
-			"audio seed ch%u DMA-base mismatch: expected=0x%08x actual=0x%08x\n",
-			ch, (ch + 1u) * PCIEBAR_AXI_BASE + pci_addr,
-			readback);
-		return -EIO;
-	}
-	return 0;
+	return hws_program_dma_window(hws, ch, dma, 0, true,
+				      require_base_readback);
 }
 
 static int hws_guard_audio_video_remap_page(struct hws_pcie_dev *hws,
