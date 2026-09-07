@@ -7,6 +7,94 @@
 
 #include <linux/tracepoint.h>
 #include "hws_probe.h"
+#include "hws_late_toggle.h"
+
+TRACE_EVENT(hws_vdone_late_toggle,
+	TP_PROTO(const char *device, u32 channel, u64 epoch, u64 generation,
+		 const struct hws_late_toggle_observation *p),
+	TP_ARGS(device, channel, epoch, generation, p),
+	TP_STRUCT__entry(
+		__string(device, device)
+		__field(u32, channel)
+		__field(u64, epoch)
+		__field(u64, generation)
+		__field(u32, window)
+		__field(u32, count)
+		__field(u32, flags)
+		__field(u8, baseline)
+		__field(u64, irq_ns)
+		__field(u64, started_ns)
+		__field(u64, finished_ns)
+		__array(u64, start, HWS_LATE_TOGGLE_SAMPLES)
+		__array(u64, end, HWS_LATE_TOGGLE_SAMPLES)
+		__array(u32, toggle, HWS_LATE_TOGGLE_SAMPLES)
+		__array(u32, status, HWS_LATE_TOGGLE_SAMPLES)
+	),
+	TP_fast_assign(
+		__assign_str(device);
+		__entry->channel = channel;
+		__entry->epoch = epoch;
+		__entry->generation = generation;
+		__entry->window = p->window;
+		__entry->count = p->count;
+		__entry->flags = p->flags;
+		__entry->baseline = p->baseline;
+		__entry->irq_ns = p->irq_ns;
+		__entry->started_ns = p->started_ns;
+		__entry->finished_ns = p->finished_ns;
+		memcpy(__entry->start, p->start, sizeof(p->start));
+		memcpy(__entry->end, p->end, sizeof(p->end));
+		memcpy(__entry->toggle, p->toggle, sizeof(p->toggle));
+		memcpy(__entry->status, p->status, sizeof(p->status));
+	),
+	TP_printk("device=%s ch=%u epoch=%llu generation=%llu window=%u count=%u flags=%u baseline=%u irq_ns=%llu started_ns=%llu finished_ns=%llu start=%llu,%llu,%llu,%llu end=%llu,%llu,%llu,%llu toggle=0x%x,0x%x,0x%x,0x%x status=0x%x,0x%x,0x%x,0x%x",
+		__get_str(device), __entry->channel, __entry->epoch, __entry->generation,
+		__entry->window, __entry->count, __entry->flags, __entry->baseline,
+		__entry->irq_ns, __entry->started_ns, __entry->finished_ns,
+		__entry->start[0], __entry->start[1], __entry->start[2], __entry->start[3],
+		__entry->end[0], __entry->end[1], __entry->end[2], __entry->end[3],
+		__entry->toggle[0], __entry->toggle[1], __entry->toggle[2], __entry->toggle[3],
+		__entry->status[0], __entry->status[1], __entry->status[2], __entry->status[3])
+);
+
+TRACE_EVENT(hws_video_diag,
+	TP_PROTO(const char *device, u32 channel, u64 epoch, u64 generation,
+		 u32 action, u32 queued, u32 active, u32 buffer, u64 stamp,
+		 u64 value1, u64 value2),
+	TP_ARGS(device, channel, epoch, generation, action, queued, active,
+		buffer, stamp, value1, value2),
+	TP_STRUCT__entry(
+		__string(device, device)
+		__field(u32, channel)
+		__field(u64, epoch)
+		__field(u64, generation)
+		__field(u32, action)
+		__field(u32, queued)
+		__field(u32, active)
+		__field(u32, buffer)
+		__field(u64, stamp)
+		__field(u64, value1)
+		__field(u64, value2)
+	),
+	TP_fast_assign(
+		__assign_str(device);
+		__entry->channel = channel;
+		__entry->epoch = epoch;
+		__entry->generation = generation;
+		__entry->action = action;
+		__entry->queued = queued;
+		__entry->active = active;
+		__entry->buffer = buffer;
+		__entry->stamp = stamp;
+		__entry->value1 = value1;
+		__entry->value2 = value2;
+	),
+	TP_printk("device=%s ch=%u epoch=%llu generation=%llu action=%u queued=%u active=%u buffer=%u timestamp_ns=%llu value1=%llu value2=%llu",
+		__get_str(device), __entry->channel, __entry->epoch,
+		__entry->generation, __entry->action, __entry->queued,
+		__entry->active, __entry->buffer, __entry->stamp,
+		__entry->value1, __entry->value2)
+);
 
 TRACE_EVENT(hws_vdone_probe,
 	TP_PROTO(const char *device, u32 channel, u64 epoch, u64 generation,

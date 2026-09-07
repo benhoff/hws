@@ -31,6 +31,7 @@
 #include "hws_irq.h"
 #include "hws_v4l2_ioctl.h"
 #include "hws_trace.h"
+#include "hws_diag.h"
 
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
 #define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
@@ -362,6 +363,13 @@ static void hws_video_reset_evidence_locked(struct hws_video *vid)
 	vid->evidence_resync_reports = 0;
 	vid->evidence_queue_failures = 0;
 	vid->evidence_probe_count = 0;
+	vid->late_toggle_windows = 0;
+	vid->late_toggle_samples = 0;
+	vid->late_toggle_suppressed = 0;
+	vid->late_toggle_budget_exits = 0;
+	vid->late_toggle_max_ns = 0;
+	vid->diag_records = 0;
+	vid->diag_suppressed = 0;
 	memset(&vid->evidence_probe, 0, sizeof(vid->evidence_probe));
 	vid->recovery_notice_mask = 0;
 }
@@ -1273,6 +1281,8 @@ static void hws_buffer_queue(struct vb2_buffer *vb)
 	spin_lock_irqsave(&vid->irq_lock, flags);
 	list_add_tail(&buf->list, &vid->capture_queue);
 	vid->queued_count++;
+	hws_diag_locked(vid, HWS_DIAG_QBUF, vb->index,
+			vid->next_completion_generation, 0, 0);
 	spin_unlock_irqrestore(&vid->irq_lock, flags);
 }
 
@@ -1346,6 +1356,7 @@ static int hws_start_streaming(struct vb2_queue *q, unsigned int count)
 	spin_lock_irqsave(&v->irq_lock, flags);
 	hws_video_reset_stream_phase_locked(v);
 	hws_video_reset_evidence_locked(v);
+	hws_diag_locked(v, HWS_DIAG_START, U32_MAX, 0, 0, 0);
 	v->active = NULL;
 	ret = hws_program_video_ring_locked(v);
 	if (!ret) {
@@ -1479,6 +1490,10 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	bool needs_idle;
 
 	hws_log_video_state(v, "streamoff", "begin");
+	spin_lock_irqsave(&v->irq_lock, flags);
+	hws_diag_locked(v, HWS_DIAG_STOP, U32_MAX,
+			v->next_completion_generation, 0, 0);
+	spin_unlock_irqrestore(&v->irq_lock, flags);
 	needs_idle = READ_ONCE(v->dma_needs_idle) ||
 		READ_ONCE(v->cap_active);
 

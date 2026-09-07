@@ -14,6 +14,7 @@
 #include "hws_probe.h"
 
 struct hws_video_evidence_snapshot {
+	u32 diag_records, diag_suppressed;
 	u64 stream_epoch;
 	u64 vdone_observed;
 	u64 vdone_ignored;
@@ -35,6 +36,9 @@ struct hws_video_evidence_snapshot {
 	u64 continuity_gaps;
 	u64 source_check_count, source_check_ns, source_check_max_ns;
 	u64 source_check_failures;
+	u32 late_toggle_windows, late_toggle_samples, late_toggle_suppressed;
+	u32 late_toggle_budget_exits;
+	u64 late_toggle_max_ns;
 	u64 resync_reports;
 	u64 queue_failures;
 	u64 generation;
@@ -67,6 +71,8 @@ static void hws_debugfs_snapshot(struct hws_video *v,
 	memset(s, 0, sizeof(*s));
 	spin_lock_irqsave(&v->irq_lock, flags);
 	s->stream_epoch = v->evidence_stream_epoch;
+	s->diag_records = v->diag_records;
+	s->diag_suppressed = v->diag_suppressed;
 	s->vdone_observed = v->evidence_vdone_observed;
 	s->vdone_ignored = v->evidence_vdone_ignored;
 	s->vdone_accepted = v->evidence_vdone_accepted;
@@ -89,6 +95,11 @@ static void hws_debugfs_snapshot(struct hws_video *v,
 	s->source_check_ns = v->source_check_ns;
 	s->source_check_max_ns = v->source_check_max_ns;
 	s->source_check_failures = v->source_check_failures;
+	s->late_toggle_windows = v->late_toggle_windows;
+	s->late_toggle_samples = v->late_toggle_samples;
+	s->late_toggle_suppressed = v->late_toggle_suppressed;
+	s->late_toggle_budget_exits = v->late_toggle_budget_exits;
+	s->late_toggle_max_ns = v->late_toggle_max_ns;
 	s->resync_reports = v->evidence_resync_reports;
 	s->queue_failures = v->evidence_queue_failures;
 	s->generation = v->next_completion_generation;
@@ -205,6 +216,8 @@ static int hws_debugfs_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "stream_epoch=%llu\n",
 		   (unsigned long long)s.stream_epoch);
 	seq_printf(m, "streaming=%u\n", s.streaming);
+	seq_printf(m, "diag_records=%u\ndiag_suppressed=%u\ndiag_limit=%u\n",
+		   s.diag_records, s.diag_suppressed, HWS_VIDEO_DIAG_LIMIT);
 	seq_printf(m, "cap_active=%u\n", s.cap_active);
 	seq_printf(m, "stop_requested=%u\n", s.stop_requested);
 	seq_printf(m, "phase=%u\n", s.phase);
@@ -269,6 +282,9 @@ static int hws_debugfs_stats_show(struct seq_file *m, void *unused)
 	seq_printf(m, "toggle_sample_errors=%u\n", s.toggle_sample_errors);
 	seq_printf(m, "sync_restarts=%u\n", s.sync_restarts);
 	seq_printf(m, "duplicate_recoveries=%u\n", s.duplicate_recoveries);
+	seq_printf(m, "late_toggle_windows=%u\nlate_toggle_samples=%u\nlate_toggle_suppressed=%u\nlate_toggle_budget_exits=%u\nlate_toggle_max_ns=%llu\n",
+		   s.late_toggle_windows, s.late_toggle_samples, s.late_toggle_suppressed,
+		   s.late_toggle_budget_exits, (unsigned long long)s.late_toggle_max_ns);
 	seq_printf(m, "overlap_recoveries=%u\n", s.overlap_recoveries);
 	seq_printf(m, "phase_errors=%u\n", s.phase_errors);
 	seq_printf(m, "deadline_misses=%u\n", s.deadline_misses);

@@ -256,7 +256,14 @@ struct hws_video {
 	u64 evidence_continuity_reports;
 	u64 evidence_resync_reports;
 	u64 evidence_queue_failures;
+	/* Optional trace-only diagnostics; no effect on completion decisions. */
+#define HWS_VIDEO_DIAG_LIMIT 32768U
+	u32 diag_records;
+	u32 diag_suppressed;
 	u32 evidence_probe_count;
+	u32 late_toggle_windows, late_toggle_samples, late_toggle_suppressed;
+	u32 late_toggle_budget_exits;
+	u64 late_toggle_max_ns;
 	struct hws_dma_probe_state evidence_probe;
 	u32 recovery_notice_mask;
 

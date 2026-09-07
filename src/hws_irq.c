@@ -17,7 +17,9 @@
 #include "hws_fault.h"
 #include "hws_audio.h"
 #include "hws_trace.h"
+#include "hws_diag.h"
 #include "hws_source.h"
+#include "hws_late_toggle.h"
 
 /* Qualification switch: keep extra PCIe reads out of the default path until
  * real worker/deadline overhead is measured. Immutable while loaded.
@@ -27,6 +29,10 @@ module_param(source_transition_checks, bool, 0444);
 MODULE_PARM_DESC(source_transition_checks,
 	"Experimental worker source checks; not DMA containment (default off)");
 
+static bool late_toggle_probe;
+module_param(late_toggle_probe, bool, 0444);
+MODULE_PARM_DESC(late_toggle_probe,
+	"Diagnostic only: capped raw toggle/status reads after duplicates; requires trace event (default off)");
 
 /* Characterized minimum reuse was 7,950 us at 1080p60. */
 #define HWS_VIDEO_COPY_DEADLINE_NS (7500ULL * NSEC_PER_USEC)
@@ -41,6 +47,7 @@ struct hws_vdone_event {
 };
 
 struct hws_vdone_toggle_sample {
+	u64 entry_ns, ack_ns;
 	u8 before_ack;
 	u8 after_ack;
 	bool post_ack_stable;
@@ -209,6 +216,8 @@ static bool hws_irq_recover_phase_locked(struct hws_video *v, u64 generation,
 		list_add(&v->active->list, &v->capture_queue);
 		v->queued_count++;
 		v->evidence_partial_recycles++;
+		hws_diag_locked(v, HWS_DIAG_RECYCLE, v->active->vb.vb2_buf.index,
+				generation, 0, 0);
 	}
 	v->active = NULL;
 	v->frame_generation = 0;
@@ -265,13 +274,18 @@ hws_irq_take_queued_buffer_locked(struct hws_video *v)
 	struct hwsvideo_buffer *buf;
 
 	lockdep_assert_held(&v->irq_lock);
-	if (list_empty(&v->capture_queue))
+	if (list_empty(&v->capture_queue)) {
+		hws_diag_locked(v, HWS_DIAG_EMPTY, U32_MAX,
+				v->completion_generation, 0, 0);
 		return NULL;
+	}
 
 	buf = list_first_entry(&v->capture_queue, struct hwsvideo_buffer, list);
 	list_del_init(&buf->list);
 	if (v->queued_count)
 		v->queued_count--;
+	hws_diag_locked(v, HWS_DIAG_TAKE, buf->vb.vb2_buf.index,
+			v->completion_generation, 0, 0);
 	return buf;
 }
 
@@ -573,6 +587,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			recovered = true;
 		} else {
 			v->completion_state = HWS_VIDEO_COMPLETION_COPYING;
+			hws_diag_locked(v, HWS_DIAG_WORK, U32_MAX,
+					event.generation, event.timestamp_ns, 0);
 		}
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -722,6 +738,8 @@ static void hws_video_handle_vdone(struct hws_video *v)
 			v->evidence_frames_completed++;
 			if (done) {
 				v->evidence_frames_delivered++;
+				hws_diag_locked(v, HWS_DIAG_COMPLETE, done->vb.vb2_buf.index,
+						event.generation, frame_sequence, 0);
 				v->active = NULL;
 				v->frame_generation = 0;
 				hws_video_clear_frame_continuity(v);
@@ -1055,6 +1073,103 @@ remember:
 	state->previous_generation = generation;
 }
 
+/* Observe only AFTER the normal duplicate disposition. No delay, W1C, DMA
+ * access, phase update, or use of a late value to rescue a completion. The
+ * elapsed budget prevents starting more reads; it cannot bound one stalled
+ * MMIO access, NMI, or trace emission. Both parameter and trace gate are needed.
+ */
+static void hws_irq_probe_late_toggle(struct hws_video *v, u64 epoch,
+				      u64 generation, u64 irq_ns, u8 baseline)
+{
+	struct hws_pcie_dev *hws = v->parent;
+	struct hws_late_toggle_observation p = { .irq_ns = irq_ns,
+		.baseline = baseline };
+	unsigned long flags;
+	u64 elapsed;
+	u32 i;
+
+	if (!late_toggle_probe || !trace_hws_vdone_late_toggle_enabled())
+		return;
+	spin_lock_irqsave(&v->irq_lock, flags);
+	if (v->evidence_stream_epoch != epoch || !READ_ONCE(v->cap_active) ||
+	    READ_ONCE(v->stop_requested) || READ_ONCE(hws->suspended) ||
+	    READ_ONCE(hws->pci_lost)) {
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return;
+	}
+	if (v->late_toggle_windows >= HWS_LATE_TOGGLE_WINDOWS) {
+		if (v->late_toggle_suppressed != U32_MAX)
+			v->late_toggle_suppressed++;
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return;
+	}
+	p.window = ++v->late_toggle_windows;
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+	p.started_ns = ktime_get_mono_fast_ns();
+	if (!p.irq_ns || p.started_ns < p.irq_ns)
+		p.flags |= HWS_LATE_TOGGLE_CLOCK;
+	for (i = 0; i < HWS_LATE_TOGGLE_SAMPLES && !p.flags; i++) {
+		if (READ_ONCE(hws->pci_lost) || READ_ONCE(hws->dma_failed)) {
+			p.flags |= HWS_LATE_TOGGLE_FAULT;
+			break;
+		}
+		if (READ_ONCE(hws->suspended) || READ_ONCE(v->stop_requested) ||
+		    !READ_ONCE(v->cap_active)) {
+			p.flags |= HWS_LATE_TOGGLE_STOPPED;
+			break;
+		}
+		p.start[i] = ktime_get_mono_fast_ns();
+		if (p.start[i] < p.started_ns ||
+		    (i && p.start[i] < p.end[i - 1])) {
+			p.flags |= HWS_LATE_TOGGLE_CLOCK;
+			break;
+		}
+		if (p.start[i] - p.started_ns >= HWS_LATE_TOGGLE_BUDGET_NS) {
+			p.flags |= HWS_LATE_TOGGLE_BUDGET;
+			break;
+		}
+		p.toggle[i] = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(v->channel_index));
+		if (p.toggle[i] == U32_MAX) {
+			hws_device_lost(hws, "all-ones late toggle diagnostic");
+			p.flags |= HWS_LATE_TOGGLE_FAULT;
+			break;
+		}
+		if (READ_ONCE(hws->pci_lost)) {
+			p.flags |= HWS_LATE_TOGGLE_FAULT;
+			break;
+		}
+		p.status[i] = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		p.end[i] = ktime_get_mono_fast_ns();
+		p.count++;
+		if (p.status[i] == U32_MAX) {
+			hws_device_lost(hws, "all-ones late IRQ status diagnostic");
+			p.flags |= HWS_LATE_TOGGLE_FAULT;
+			break;
+		}
+		if (p.end[i] < p.start[i]) {
+			p.flags |= HWS_LATE_TOGGLE_CLOCK;
+			break;
+		}
+		if (p.end[i] - p.started_ns >= HWS_LATE_TOGGLE_BUDGET_NS) {
+			p.flags |= HWS_LATE_TOGGLE_BUDGET;
+			break;
+		}
+	}
+	p.finished_ns = ktime_get_mono_fast_ns();
+	if (p.finished_ns < p.started_ns || (p.count && p.finished_ns < p.end[p.count - 1]))
+		p.flags |= HWS_LATE_TOGGLE_CLOCK;
+	elapsed = p.finished_ns >= p.started_ns ? p.finished_ns - p.started_ns : 0;
+	if (elapsed >= HWS_LATE_TOGGLE_BUDGET_NS)
+		p.flags |= HWS_LATE_TOGGLE_BUDGET;
+	spin_lock_irqsave(&v->irq_lock, flags);
+	v->late_toggle_samples += p.count;
+	v->late_toggle_budget_exits += !!(p.flags & HWS_LATE_TOGGLE_BUDGET);
+	v->late_toggle_max_ns = max(v->late_toggle_max_ns, elapsed);
+	spin_unlock_irqrestore(&v->irq_lock, flags);
+	trace_hws_vdone_late_toggle(pci_name(hws->pdev), v->channel_index,
+				   epoch, generation, &p);
+}
+
 static enum hws_vdone_record_result
 hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     const struct hws_vdone_toggle_sample *sample,
@@ -1094,6 +1209,8 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		if (!v->next_completion_generation)
 			v->next_completion_generation++;
 		generation = v->next_completion_generation;
+		hws_diag_locked(v, HWS_DIAG_IRQ, U32_MAX, generation,
+				sample->entry_ns, sample->ack_ns);
 		if (trace_hws_vdone_probe_enabled())
 			hws_irq_probe_ring(v, generation);
 		previous_ns = v->last_vdone_timestamp_ns;
@@ -1253,6 +1370,8 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 				((ambiguity & 0xff) << 8) |
 				((phase & 0xff) << 16) |
 				((u32)completed_half << 24));
+	if (report_recovery && ambiguity == HWS_VDONE_AMBIG_DUPLICATE)
+		hws_irq_probe_late_toggle(v, epoch, generation, timestamp_ns, toggle);
 	if (report_recovery)
 		hws_irq_queue_recovery_work(pdx, ch);
 
@@ -1416,6 +1535,7 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	struct hws_adone_toggle_sample audio_samples[MAX_VID_CHANNELS] = { };
 	struct hws_vdone_toggle_sample video_samples[MAX_VID_CHANNELS] = { };
 	u64 timestamp_ns;
+	u64 entry_ns = trace_hws_video_diag_enabled() ? ktime_get_mono_fast_ns() : 0;
 	u32 status_after_ack;
 	u32 int_state;
 	u32 audio_work;
@@ -1465,6 +1585,15 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 	if (status_after_ack == U32_MAX) {
 		hws_device_lost(pdx, "all-ones IRQ acknowledge readback");
 		return IRQ_HANDLED;
+	}
+	if (trace_hws_video_diag_enabled()) {
+		u64 ack_ns = ktime_get_mono_fast_ns();
+		unsigned int ch;
+
+		for (ch = 0; ch < pdx->cur_max_video_ch; ch++) {
+			video_samples[ch].entry_ns = entry_ns;
+			video_samples[ch].ack_ns = ack_ns;
+		}
 	}
 	audio_work = hws_irq_record_audio(pdx, int_state, status_after_ack,
 					  audio_samples, timestamp_ns);

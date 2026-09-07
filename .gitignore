@@ -59,5 +59,12 @@ tools/hws_frame_id_capture
 tools/hws_vdone_sampler
 tools/hws_frame_id_kms
 tools/test_frame_id_kms
+tools/test_frame_id_render
+tools/test_kms_modes
+tools/hws_drm_timing_probe
+tools/test_drm_timing_probe
+tools/test_hws_irq
+tools/test_hws_irq_sanitize
+tools/.hws_irq_under_test.h
 __pycache__/
 *.py[cod]
