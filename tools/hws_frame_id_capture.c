@@ -45,9 +45,11 @@ struct options {
 	const char *device;
 	const char *output;
 	const char *anomaly_dir;
+	const char *queue_log;
 	uint32_t frames;
 	uint32_t buffers;
 	uint32_t split;
+	uint32_t requeue_delay_ms;
 	int timeout_ms;
 	bool keep_timings;
 	bool self_test;
@@ -57,6 +59,7 @@ struct mapped_buffer {
 	void *addr;
 	size_t length;
 	uint64_t queue_count;
+	uint64_t dequeue_cpu_ns;
 	uint64_t poison_half0_hash;
 	uint64_t poison_half1_hash;
 	uint64_t poison_half0_blocks[POISON_BLOCKS_PER_HALF];
@@ -138,6 +141,21 @@ static uint64_t monotonic_ns(void)
 		return 0;
 	return (uint64_t)now.tv_sec * UINT64_C(1000000000) +
 	       (uint64_t)now.tv_nsec;
+}
+
+static uint64_t thread_cpu_ns(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts))
+		return 0;
+	return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + ts.tv_nsec;
+}
+
+static bool delay_due(uint32_t delay_ms, uint64_t captured, uint64_t submitted,
+		      uint64_t target)
+{
+	return delay_ms && captured && captured % 60 == 0 && submitted < target;
 }
 
 static uint64_t timeval_ns(const struct timeval *timestamp)
@@ -480,6 +498,8 @@ static void usage(FILE *stream, const char *program)
 		"  -d, --device DEV       V4L2 node (default %s)\n"
 		"  -o, --output FILE      JSONL evidence (default %s)\n"
 		"      --anomaly-dir DIR  Save first frame and at most %u anomalous frames\n"
+		"      --queue-log FILE   Bounded queue/IOCTL timing diagnostics (separate JSONL)\n"
+		"      --requeue-delay-ms N  Inject 0..100 ms every 60 frames before replenishment\n"
 		"  -n, --frames N         Frames to capture (default %u)\n"
 		"  -b, --buffers N        MMAP buffers, 2..32 (default %u)\n"
 		"  -s, --split BYTES      Native split; default round_down(size/2, 2048)\n"
@@ -494,11 +514,13 @@ static void usage(FILE *stream, const char *program)
 
 static int parse_options(int argc, char **argv, struct options *options)
 {
-	enum { OPT_KEEP_TIMINGS = 1000, OPT_SELF_TEST, OPT_ANOMALY_DIR };
+	enum { OPT_KEEP_TIMINGS = 1000, OPT_SELF_TEST, OPT_ANOMALY_DIR, OPT_QUEUE_LOG, OPT_REQUEUE_DELAY };
 	static const struct option long_options[] = {
 		{ "device", required_argument, NULL, 'd' },
 		{ "output", required_argument, NULL, 'o' },
 		{ "anomaly-dir", required_argument, NULL, OPT_ANOMALY_DIR },
+		{ "queue-log", required_argument, NULL, OPT_QUEUE_LOG },
+		{ "requeue-delay-ms", required_argument, NULL, OPT_REQUEUE_DELAY },
 		{ "frames", required_argument, NULL, 'n' },
 		{ "buffers", required_argument, NULL, 'b' },
 		{ "split", required_argument, NULL, 's' },
@@ -524,6 +546,11 @@ static int parse_options(int argc, char **argv, struct options *options)
 		case 'd': options->device = optarg; break;
 		case 'o': options->output = optarg; break;
 		case OPT_ANOMALY_DIR: options->anomaly_dir = optarg; break;
+		case OPT_QUEUE_LOG: options->queue_log = optarg; break;
+		case OPT_REQUEUE_DELAY:
+			if (parse_u32(optarg, 0, 100, &options->requeue_delay_ms))
+				return -1;
+			break;
 		case 'n':
 			if (parse_u32(optarg, 1, UINT32_MAX, &options->frames))
 				return -1;
@@ -547,7 +574,51 @@ static int parse_options(int argc, char **argv, struct options *options)
 		default: return -1;
 		}
 	}
-	return optind == argc ? 0 : -1;
+	return optind == argc && (!options->requeue_delay_ms || options->queue_log) ? 0 : -1;
+}
+
+#define QUEUE_LOG_LIMIT 8192U
+static FILE *queue_log;
+static uint64_t queue_records, queue_suppressed, queue_submitted, queue_dequeued;
+static int64_t queue_processing_cpu_ns = -1;
+
+static void queue_event(const char *action, uint32_t index, uint64_t started,
+			uint64_t called, uint64_t ended, int result)
+{
+	if (!queue_log)
+		return;
+	if (!result && !strcmp(action, "qbuf"))
+		queue_submitted++;
+	if (!result && !strcmp(action, "dqbuf"))
+		queue_dequeued++;
+	if (queue_records >= QUEUE_LOG_LIMIT) {
+		queue_suppressed++;
+		return;
+	}
+	queue_records++;
+	fprintf(queue_log, "{\"type\":\"queue\",\"action\":\"%s\",\"buffer\":%u,\"started_ns\":%" PRIu64
+		",\"ioctl_ns\":%" PRIu64 ",\"ended_ns\":%" PRIu64 ",\"result\":%d,\"submitted\":%" PRIu64
+		",\"dequeued\":%" PRIu64 ",\"processing_cpu_ns\":%" PRId64 "}\n",
+		action, index, started, called, ended, result, queue_submitted, queue_dequeued,
+		!strcmp(action, "qbuf") ? queue_processing_cpu_ns : INT64_C(-1));
+}
+
+static int inject_requeue_delay(uint32_t delay_ms, uint32_t index)
+{
+	struct timespec remaining = { .tv_sec = 0, .tv_nsec = (long)delay_ms * 1000000L };
+	uint64_t start = monotonic_ns();
+	int result = 0;
+
+	while (!stop_requested && nanosleep(&remaining, &remaining)) {
+		if (errno != EINTR) {
+			result = -errno;
+			break;
+		}
+	}
+	if (stop_requested)
+		result = -EINTR;
+	queue_event("requeue_delay", index, start, start, monotonic_ns(), result);
+	return result;
 }
 
 static int queue_buffer(int fd, struct mapped_buffer *mapped, uint32_t index,
@@ -558,9 +629,22 @@ static int queue_buffer(int fd, struct mapped_buffer *mapped, uint32_t index,
 		.memory = V4L2_MEMORY_MMAP,
 		.index = index,
 	};
+	uint64_t cpu = queue_log ? thread_cpu_ns() : 0;
+	uint64_t started = queue_log ? monotonic_ns() : 0;
+	uint64_t called;
+	int result, saved_errno;
 
+	queue_processing_cpu_ns = mapped[index].dequeue_cpu_ns && cpu >= mapped[index].dequeue_cpu_ns
+		? (int64_t)(cpu - mapped[index].dequeue_cpu_ns) : -1;
 	poison_buffer(&mapped[index], index, sizeimage, split);
-	return ioctl_retry(fd, VIDIOC_QBUF, &buffer);
+	called = queue_log ? monotonic_ns() : 0;
+	result = ioctl_retry(fd, VIDIOC_QBUF, &buffer);
+	saved_errno = errno;
+	if (queue_log)
+		queue_event("qbuf", index, started, called, monotonic_ns(),
+			    result ? -saved_errno : 0);
+	errno = saved_errno;
+	return result;
 }
 
 int main(int argc, char **argv)
@@ -600,6 +684,17 @@ int main(int argc, char **argv)
 	if (!output) {
 		perror(options.output);
 		goto out;
+	}
+	if (options.queue_log) {
+		queue_log = fopen(options.queue_log, "wx");
+		if (!queue_log) {
+			perror(options.queue_log);
+			goto out;
+		}
+		fprintf(queue_log, "{\"type\":\"config\",\"schema\":1,\"clock\":\"CLOCK_MONOTONIC\","
+			"\"processing_cpu_clock\":\"CLOCK_THREAD_CPUTIME_ID\",\"requeue_delay_ms\":%u,"
+			"\"requeue_delay_every_frames\":60,\"limit\":%u}\n",
+			options.requeue_delay_ms, QUEUE_LOG_LIMIT);
 	}
 	fd = open(options.device, O_RDWR | O_NONBLOCK);
 	if (fd < 0) {
@@ -679,6 +774,10 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	streaming = true;
+	if (queue_log) {
+		uint64_t stamp = monotonic_ns();
+		queue_event("streamon", UINT32_MAX, stamp, stamp, stamp, 0);
+	}
 	fprintf(output,
 		"{\"type\":\"config\",\"capture_source_sha256\":\"" HWS_CAPTURE_SHA256 "\",\"pattern\":\"" HWS_PATTERN_VERSION "\",\"pattern_sha256\":\"" HWS_PATTERN_SHA256 "\",\"device\":\"%s\",\"width\":%u,\"height\":%u,\"fourcc\":%u,\"bytesperline\":%u,\"sizeimage\":%u,\"split\":%u,\"buffers\":%u,\"target_frames\":%u}\n",
 		options.device, format.fmt.pix.width, format.fmt.pix.height,
@@ -709,6 +808,7 @@ int main(int argc, char **argv)
 		bool frame_ok;
 		uint64_t bad_bytes;
 		int ready;
+		uint64_t dequeue_started;
 
 		ready = poll(&pollfd, 1, options.timeout_ms);
 		if (ready <= 0) {
@@ -718,17 +818,22 @@ int main(int argc, char **argv)
 				perror("poll");
 			break;
 		}
+		dequeue_started = queue_log ? monotonic_ns() : 0;
 		if (ioctl_retry(fd, VIDIOC_DQBUF, &buffer)) {
 			if (errno == EAGAIN)
 				continue;
 			perror("VIDIOC_DQBUF");
 			break;
 		}
+		if (queue_log)
+			queue_event("dqbuf", buffer.index, dequeue_started, dequeue_started,
+				    monotonic_ns(), 0);
 		if (buffer.index >= request.count) {
 			fprintf(stderr, "driver returned invalid buffer index %u\n",
 				buffer.index);
 			break;
 		}
+		mapped[buffer.index].dequeue_cpu_ns = queue_log ? thread_cpu_ns() : 0;
 		half0_hash = hash64(mapped[buffer.index].addr, split);
 		half1_hash = hash64((uint8_t *)mapped[buffer.index].addr + split,
 				     format.fmt.pix.sizeimage - split);
@@ -834,6 +939,11 @@ int main(int argc, char **argv)
 			have_previous = true;
 		}
 		if (queue_budget_available(submitted, options.frames)) {
+			if (delay_due(options.requeue_delay_ms, counters.captured, submitted, options.frames) &&
+			    inject_requeue_delay(options.requeue_delay_ms, buffer.index)) {
+				capture_failed = true;
+				break;
+			}
 			if (queue_buffer(fd, mapped, buffer.index,
 					 format.fmt.pix.sizeimage, split)) {
 				perror("VIDIOC_QBUF");
@@ -853,11 +963,20 @@ int main(int argc, char **argv)
 	}
 
 	if (streaming) {
+		if (queue_log) {
+			uint64_t stamp = monotonic_ns();
+			queue_event("streamoff_begin", UINT32_MAX, stamp, stamp, stamp, 0);
+		}
 		if (ioctl_retry(fd, VIDIOC_STREAMOFF, &type)) {
 			perror("VIDIOC_STREAMOFF");
 			capture_failed = true;
 		}
 		streaming = false;
+		if (queue_log) {
+			uint64_t stamp = monotonic_ns();
+			queue_event("streamoff_end", UINT32_MAX, stamp, stamp, stamp,
+				    capture_failed ? -1 : 0);
+		}
 	}
 	if (fflush(output))
 		capture_failed = true;
@@ -883,6 +1002,15 @@ int main(int argc, char **argv)
 		options.output);
 
 out:
+	if (queue_log) {
+		fprintf(queue_log, "{\"type\":\"summary\",\"records\":%" PRIu64 ",\"suppressed\":%" PRIu64 "}\n",
+			queue_records, queue_suppressed);
+		if (ferror(queue_log))
+			result = 2;
+		if (fclose(queue_log))
+			result = 2;
+		queue_log = NULL;
+	}
 	if (streaming)
 		(void)ioctl_retry(fd, VIDIOC_STREAMOFF, &type);
 	if (mapped) {

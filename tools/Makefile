@@ -1,6 +1,8 @@
 CC ?= cc
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
+DRM_CFLAGS ?= $(shell pkg-config --cflags libdrm)
+DRM_LIBS ?= $(shell pkg-config --libs libdrm)
 CFLAGS += -DHWS_PATTERN_SHA256='"$(shell sha256sum hws_frame_pattern.h | cut -c1-64)"'
 
 .PHONY: all clean check
@@ -61,7 +63,22 @@ check-irq-sanitize: test_hws_irq_sanitize
 check-irq-mutations:
 	python3 -m unittest test_hws_irq_mutations -v
 
-check: check-irq check-transitions check-config check-failure check-audio all hws_frame_id_kms test_frame_id_kms
+hws_drm_timing_probe: hws_drm_timing_probe.c Makefile
+	$(CC) $(CFLAGS) $(DRM_CFLAGS) -o $@ $< $(DRM_LIBS) -lm
+
+test_drm_timing_probe: test_drm_timing_probe.c hws_drm_timing_probe.c Makefile
+	$(CC) $(CFLAGS) $(DRM_CFLAGS) -o $@ $< $(DRM_LIBS) -lm
+
+test_frame_id_render: test_frame_id_render.c hws_frame_id_kms.c hws_frame_pattern.h Makefile
+	$(CC) $(CFLAGS) $(DRM_CFLAGS) -o $@ $< $(DRM_LIBS)
+
+test_kms_modes: test_kms_modes.c hws_frame_id_kms.c hws_frame_pattern.h Makefile
+	$(CC) $(CFLAGS) $(DRM_CFLAGS) -o $@ $< $(DRM_LIBS)
+
+check: test_kms_modes test_frame_id_render hws_drm_timing_probe test_drm_timing_probe check-irq check-transitions check-config check-failure check-audio all hws_frame_id_kms test_frame_id_kms
+	./test_kms_modes
+	./test_drm_timing_probe
+	./test_frame_id_render
 	./hws_frame_id_capture --self-test
 	./test_frame_id_kms
 	python3 -m unittest discover -s . -p 'test_vdone*.py' -v
@@ -75,5 +92,6 @@ hws_vdone_sampler: hws_vdone_sampler.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:
+	rm -f test_kms_modes test_frame_id_render hws_drm_timing_probe test_drm_timing_probe
 	rm -f test_hws_irq test_hws_irq_sanitize .hws_irq_under_test.h
 	rm -f hws_frame_id_capture hws_vdone_sampler hws_frame_id_kms test_frame_id_kms

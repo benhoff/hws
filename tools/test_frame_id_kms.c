@@ -56,8 +56,45 @@ static void test_queue_drain(void)
 		}
 	}
 }
+static void test_queue_diagnostics(void)
+{
+	queue_records = queue_suppressed = queue_submitted = queue_dequeued = 0;
+	queue_log = NULL;
+	queue_event("qbuf", 0, 1, 2, 3, 0);
+	assert(queue_records == 0 && queue_submitted == 0);
+	queue_log = tmpfile();
+	assert(queue_log);
+	queue_event("qbuf", 0, 1, 2, 3, -EBADF);
+	assert(queue_records == 1 && queue_submitted == 0);
+	queue_event("qbuf", 0, 4, 5, 6, 0);
+	queue_event("dqbuf", 0, 7, 8, 9, 0);
+	assert(queue_submitted == 1 && queue_dequeued == 1);
+	for (unsigned int i = 3; i < QUEUE_LOG_LIMIT + 1; i++)
+		queue_event("test", 0, i, i, i, 0);
+	assert(queue_records == QUEUE_LOG_LIMIT && queue_suppressed == 1);
+	assert(!fclose(queue_log));
+	queue_log = NULL;
+}
+
 int main(void)
 {
+	assert(!delay_due(0, 60, 64, 1000));
+	assert(!delay_due(80, 0, 4, 1000));
+	assert(!delay_due(80, 59, 63, 1000));
+	assert(delay_due(80, 60, 63, 1000));
+	assert(!delay_due(80, 60, 60, 60));
+	assert(!delay_due(80, 960, 1000, 1000));
+	assert(thread_cpu_ns() > 0);
+	/* Cancellation must not sleep for the injected delay or submit a buffer. */
+	stop_requested = 1;
+	assert(inject_requeue_delay(100, 0) == -EINTR);
+	stop_requested = 0;
+	{
+		uint64_t start = monotonic_ns();
+		assert(!inject_requeue_delay(1, 0));
+		assert(monotonic_ns() - start >= 1000000);
+	}
+	test_queue_diagnostics();
 	static const unsigned int modes[][2] = {
 		{640, 480}, {720, 480}, {720, 576}, {800, 600}, {1024, 768},
 		{1280, 720}, {1280, 768}, {1280, 800}, {1280, 1024},
@@ -74,13 +111,14 @@ int main(void)
 		unsigned int w = modes[mode][0], h = modes[mode][1];
 		struct surface s = { .pitch = w * 4 + 64 };
 		uint8_t *yuyv = malloc((size_t)w * h * 2);
+		uint32_t *scratch = malloc((size_t)w * sizeof(*scratch));
 		s.map = malloc((size_t)s.pitch * h);
-		if (!yuyv || !s.map)
+		if (!yuyv || !s.map || !scratch)
 			return 2;
 		for (id = 0; id < sizeof(ids) / sizeof(ids[0]); id++) {
 			struct barcode_result upper, lower;
 			unsigned int x, y;
-			draw(&s, w, h, ids[id]);
+			draw(&s, w, h, ids[id], scratch);
 			memset(yuyv, 128, (size_t)w * h * 2);
 			for (y = 0; y < h; y++) {
 				uint32_t *row = (uint32_t *)(s.map + (size_t)y * s.pitch);
@@ -126,11 +164,13 @@ int main(void)
 				fprintf(stderr, "KMS raster/decoder mismatch %ux%u id=%u\n", w, h, ids[id]);
 				free(yuyv);
 				free(s.map);
+				free(scratch);
 				return 1;
 			}
 		}
 		free(yuyv);
 		free(s.map);
+		free(scratch);
 	}
 	fprintf(stderr, "KMS raster/capture decoder PASS: 13 modes, 3 IDs each\n");
 	return 0;
