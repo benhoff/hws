@@ -180,12 +180,18 @@ int hws_detect_dv_timings(struct hws_video *vid,
 	if (!pdx || !pdx->bar0_base ||
 	    vid->channel_index < 0 || vid->channel_index >= pdx->max_channels)
 		return -ENODEV;
+	if (READ_ONCE(pdx->pci_lost) || READ_ONCE(pdx->dma_failed))
+		return -ENODEV;
+	if (READ_ONCE(pdx->suspended))
+		return -EBUSY;
 
 	channel_mask = BIT(vid->channel_index) |
 		       BIT(8 + vid->channel_index);
 	active0 = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
-	if (active0 == U32_MAX)
+	if (active0 == U32_MAX) {
+		hws_device_lost(pdx, "all-ones receiver active status");
 		return -ENODEV;
+	}
 	if (!(active0 & BIT(vid->channel_index)))
 		return -ENOLINK;
 
@@ -195,8 +201,10 @@ int hws_detect_dv_timings(struct hws_video *vid,
 	res1 = readl(pdx->bar0_base + HWS_REG_IN_RES(vid->channel_index));
 	active1 = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
 	if (res0 == U32_MAX || res1 == U32_MAX || active1 == U32_MAX ||
-	    live_fps == U32_MAX)
+	    live_fps == U32_MAX) {
+		hws_device_lost(pdx, "all-ones receiver timing snapshot");
 		return -ENODEV;
+	}
 	if (!(active1 & BIT(vid->channel_index)))
 		return -ENOLINK;
 

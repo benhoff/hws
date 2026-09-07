@@ -485,6 +485,32 @@ static void hws_video_collect_done_locked(struct hws_video *vid,
 	hws_video_reset_stream_phase_locked(vid);
 }
 
+/* Called only after IRQ and copy workers have drained; no DMA arena release. */
+void hws_video_device_error(struct hws_pcie_dev *hws)
+{
+	unsigned int ch;
+
+	for (ch = 0; ch < hws->cur_max_video_ch; ch++) {
+		struct hws_video *vid = &hws->video[ch];
+		struct hwsvideo_buffer *b, *tmp;
+		unsigned long flags;
+		LIST_HEAD(done);
+
+		mutex_lock(&vid->state_lock);
+		if (vid->queue_initialized && vb2_is_streaming(&vid->buffer_queue)) {
+			vb2_queue_error(&vid->buffer_queue);
+			spin_lock_irqsave(&vid->irq_lock, flags);
+			hws_video_collect_done_locked(vid, &done);
+			spin_unlock_irqrestore(&vid->irq_lock, flags);
+			list_for_each_entry_safe(b, tmp, &done, list) {
+				list_del_init(&b->list);
+				vb2_buffer_done(&b->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+			}
+		}
+		mutex_unlock(&vid->state_lock);
+	}
+}
+
 void hws_video_fail_queue(struct hws_video *vid, const char *reason)
 {
 	struct hws_pcie_dev *hws;
@@ -621,7 +647,7 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	}
 	status = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	if (status == U32_MAX) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_video.c: register failure");
 		WRITE_ONCE(hws->video[chan].cap_active, false);
 		spin_unlock_irqrestore(&hws->capture_lock, flags);
 		return;
@@ -632,10 +658,10 @@ void hws_enable_video_capture(struct hws_pcie_dev *hws, unsigned int chan,
 	writel(status, hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	readback = readl(hws->bar0_base + HWS_REG_VCAP_ENABLE);
 	if (readback == U32_MAX) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_video.c: register failure");
 		WRITE_ONCE(hws->video[chan].cap_active, false);
 	} else if (!!(readback & BIT(chan)) != on) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_video.c: register failure");
 		WRITE_ONCE(hws->video[chan].cap_active, false);
 	} else {
 		WRITE_ONCE(hws->video[chan].cap_active,
@@ -874,7 +900,7 @@ int hws_check_card_status(struct hws_pcie_dev *hws)
 
 	/* Common device-missing pattern. */
 	if (status == 0xFFFFFFFF) {
-		hws->pci_lost = true;
+		hws_device_lost(hws, "hws_video.c: register failure");
 		dev_err(&hws->pdev->dev, "PCIe device not responding\n");
 		return -ENODEV;
 	}
@@ -955,7 +981,7 @@ int hws_video_set_output_resolution(struct hws_video *vid, u32 width,
 	value = (height << 16) | width;
 	readback = readl(hws->bar0_base + HWS_REG_OUT_RES(vid->channel_index));
 	if (readback == U32_MAX) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_video.c: register failure");
 		return -ENODEV;
 	}
 	if (readback == value)
@@ -964,7 +990,7 @@ int hws_video_set_output_resolution(struct hws_video *vid, u32 width,
 	writel(value, hws->bar0_base + HWS_REG_OUT_RES(vid->channel_index));
 	readback = readl(hws->bar0_base + HWS_REG_OUT_RES(vid->channel_index));
 	if (readback == U32_MAX) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_video.c: register failure");
 		return -ENODEV;
 	}
 	return readback == value ? 0 : -EIO;
@@ -978,6 +1004,8 @@ static void hws_video_update_power_present(struct hws_pcie_dev *pdx,
 
 	if (!pdx || !pdx->bar0_base || ch >= pdx->max_channels)
 		return;
+	if (READ_ONCE(pdx->pci_lost) || READ_ONCE(pdx->suspended))
+		return;
 
 	vid = &pdx->video[ch];
 	if (!vid->ctrl_dv_rx_power_present)
@@ -985,7 +1013,7 @@ static void hws_video_update_power_present(struct hws_pcie_dev *pdx,
 
 	active = readl(pdx->bar0_base + HWS_REG_ACTIVE_STATUS);
 	if (active == U32_MAX) {
-		WRITE_ONCE(pdx->pci_lost, true);
+		hws_device_lost(pdx, "hws_video.c: register failure");
 		return;
 	}
 
@@ -1029,13 +1057,15 @@ static inline void hws_write_if_diff(struct hws_pcie_dev *hws, u32 reg_off,
 
 	if (!hws || !hws->bar0_base)
 		return;
+	if (READ_ONCE(hws->pci_lost))
+		return;
 
 	addr = hws->bar0_base + reg_off;
 
 	old = readl(addr);
 	/* Treat all-ones as device gone; avoid writing garbage. */
 	if (old == 0xFFFFFFFF) {
-		hws->pci_lost = true;
+		hws_device_lost(hws, "hws_video.c: register failure");
 		return;
 	}
 

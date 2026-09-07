@@ -428,8 +428,17 @@ struct hws_pcie_dev {
 
 	/* Error flags */
 	int pci_lost;
+	/* IRQ-safe latch; process-context cleanup must outlive all producers. */
+	spinlock_t failure_lock;
+	struct work_struct failure_work;
+	bool failure_enabled;
+	bool failure_latched;
+	bool failure_scheduled;
+	const char *failure_reason; /* static string, first reporter wins */
 	struct kref lifetime_ref;
 };
+
+void hws_device_lost(struct hws_pcie_dev *hws, const char *reason);
 
 static inline bool hws_dma_fits_remap_window(dma_addr_t dma, size_t size)
 {

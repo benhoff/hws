@@ -194,6 +194,85 @@ static int hws_disable_pci_dma_checked(struct hws_pcie_dev *hws,
 				       const char *owner, int ch,
 				       bool wait_pending);
 
+static void hws_failure_work(struct work_struct *work)
+{
+	struct hws_pcie_dev *hws = container_of(work, struct hws_pcie_dev,
+					      failure_work);
+	unsigned long flags;
+	unsigned int ch;
+	int ret;
+
+	/* Finish any enable transaction which overlapped the fast latch. */
+	spin_lock_irqsave(&hws->capture_lock, flags);
+	hws_publish_stop_flags(hws);
+	spin_unlock_irqrestore(&hws->capture_lock, flags);
+	mutex_lock(&hws->dma_lock);
+	ret = hws_disable_pci_dma_checked(hws, "runtime device failure", -1, true);
+	WRITE_ONCE(hws->dma_quiesced, !ret);
+	mutex_unlock(&hws->dma_lock);
+
+	/* Never hold DMA/state/monitor locks while waiting for a copy worker. */
+	mutex_lock(&hws->irq_lifetime_lock);
+	if (hws->irq_registered)
+		synchronize_irq(hws->irq);
+	mutex_unlock(&hws->irq_lifetime_lock);
+	mutex_lock(&hws->monitor_lock);
+	mutex_unlock(&hws->monitor_lock);
+	hws_video_drain_work(hws);
+	hws_audio_drain_work(hws);
+	hws_video_device_error(hws);
+	hws_audio_dma_fault_all(hws);
+	for (ch = 0; ch < hws->cur_max_audio_ch; ch++)
+		flush_work(&hws->audio[ch].deliver_work);
+
+	/* Only CPU-copy destinations were returned, never the DMA arenas. */
+}
+
+/* May be called with capture/IRQ/ring locks held. Never wait or touch MMIO. */
+void hws_device_lost(struct hws_pcie_dev *hws, const char *reason)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hws->failure_lock, flags);
+	if (!hws->failure_latched) {
+		hws->failure_latched = true;
+		hws->failure_reason = reason;
+	}
+	WRITE_ONCE(hws->pci_lost, true);
+	WRITE_ONCE(hws->dma_failed, true);
+	WRITE_ONCE(hws->start_run, false);
+	hws_publish_stop_flags(hws);
+	if (hws->failure_enabled && !hws->failure_scheduled) {
+		hws->failure_scheduled = true;
+		queue_work(system_long_wq, &hws->failure_work);
+	}
+	spin_unlock_irqrestore(&hws->failure_lock, flags);
+}
+
+static void hws_failure_enable(struct hws_pcie_dev *hws)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&hws->failure_lock, flags);
+	hws->failure_enabled = true;
+	if (hws->failure_latched && !hws->failure_scheduled) {
+		hws->failure_scheduled = true;
+		queue_work(system_long_wq, &hws->failure_work);
+	}
+	spin_unlock_irqrestore(&hws->failure_lock, flags);
+}
+
+static void hws_failure_cancel(struct hws_pcie_dev *hws)
+{
+	unsigned long flags;
+
+	/* Same lock as enqueue: no enqueue can sneak past cancellation. */
+	spin_lock_irqsave(&hws->failure_lock, flags);
+	hws->failure_enabled = false;
+	spin_unlock_irqrestore(&hws->failure_lock, flags);
+	cancel_work_sync(&hws->failure_work);
+}
+
 static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 				       const char *action,
 				       const char *phase)
@@ -205,7 +284,7 @@ static void hws_log_lifecycle_snapshot(struct hws_pcie_dev *hws,
 		return;
 
 	dev = &hws->pdev->dev;
-	if (!hws->bar0_base) {
+	if (!hws->bar0_base || READ_ONCE(hws->pci_lost)) {
 		dev_dbg(dev,
 			"lifecycle:%s:%s bar0-unmapped suspended=%d start_run=%d pci_lost=%d dma_failed=%d irq=%d\n",
 			action, phase, READ_ONCE(hws->suspended), hws->start_run,
@@ -249,7 +328,7 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 
 	reg = readl(hdev->bar0_base + HWS_REG_DEVICE_INFO);
 	if (reg == U32_MAX) {
-		WRITE_ONCE(hdev->pci_lost, true);
+		hws_device_lost(hdev, "all-ones chip identity");
 		dev_err(&hdev->pdev->dev,
 			"PCIe device did not respond while reading chip identity\n");
 		return -ENODEV;
@@ -291,13 +370,13 @@ static int main_ks_thread_handle(void *data)
 			break;
 
 		/* If we're suspending, don't touch hardware; just sleep/freeze. */
-		if (READ_ONCE(pdx->suspended)) {
+		if (READ_ONCE(pdx->suspended) || READ_ONCE(pdx->pci_lost)) {
 			schedule_timeout_interruptible(msecs_to_jiffies(1000));
 			continue;
 		}
 
 		mutex_lock(&pdx->monitor_lock);
-		if (!READ_ONCE(pdx->suspended))
+		if (!READ_ONCE(pdx->suspended) && !READ_ONCE(pdx->pci_lost))
 			check_video_format(pdx);
 		mutex_unlock(&pdx->monitor_lock);
 
@@ -1110,6 +1189,8 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		return ret;
 
 	hws->irq = -1;
+	spin_lock_init(&hws->failure_lock);
+	INIT_WORK(&hws->failure_work, hws_failure_work);
 	mutex_init(&hws->irq_lifetime_lock);
 	hws->suspended = false;
 	mutex_init(&hws->monitor_lock);
@@ -1321,12 +1402,14 @@ static int hws_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 		goto err_stop_private;
 	}
 	hws_debugfs_init(hws);
+	hws_failure_enable(hws);
 
 	/* 13) Final: show the line is armed */
 	dev_info(&pdev->dev, "irq handler installed on irq=%d\n", irq);
 	return 0;
 
 err_stop_private:
+	hws_failure_cancel(hws);
 	(void)hws_block_hotpaths(hws);
 	hws_stop_kthread_action(hws);
 	hws_stop_device(hws);
@@ -1344,6 +1427,7 @@ err_stop_private:
 	hws_destroy_video_workqueue(hws);
 	return ret;
 err_unwind_channels:
+	hws_failure_cancel(hws);
 	hws_free_seed_buffers(hws);
 	while (--i >= 0) {
 		hws_video_cleanup_channel(hws, i);
@@ -1369,8 +1453,10 @@ static int hws_poll_dma_idle(struct hws_pcie_dev *hws,
 		*last_status = val;
 	if (ret)
 		return -ETIMEDOUT;
-	if (val == U32_MAX)
+	if (val == U32_MAX) {
+		hws_device_lost(hws, "all-ones DMA idle status");
 		return -ENODEV;
+	}
 	return 0;
 }
 
@@ -1468,10 +1554,7 @@ static int hws_force_dma_quiesce_locked(struct hws_pcie_dev *hws,
 		owner, ch);
 
 	/* Refuse every subsequent start before globally disabling capture. */
-	WRITE_ONCE(hws->dma_failed, true);
-	WRITE_ONCE(hws->pci_lost, true);
-	WRITE_ONCE(hws->start_run, false);
-	hws_publish_stop_flags(hws);
+	hws_device_lost(hws, "DMA stop timeout");
 	smp_mb(); /* block racing starts before global capture disable */
 	mask_ret = hws_irq_mask_gate(hws);
 	if (mask_ret)
@@ -1557,6 +1640,15 @@ static int __hws_wait_dma_idle(struct hws_pcie_dev *hws, const char *owner,
 	ret = hws_poll_dma_idle(hws, HWS_DMA_IDLE_GRACE_US, &status);
 	if (!ret)
 		goto out_unlock;
+	if (ret == -ENODEV) {
+		/* Never retry BAR idle after a missing-device observation. */
+		if (force) {
+			ret = hws_isolate_pci_dma(hws, owner, ch);
+			if (!ret)
+				WRITE_ONCE(hws->dma_quiesced, true);
+		}
+		goto out_unlock;
+	}
 
 	if (force)
 		ret = hws_force_dma_quiesce_locked(hws, owner, ch);
@@ -1674,11 +1766,12 @@ static int hws_stop_device(struct hws_pcie_dev *hws)
 	if (hws->audio_wq)
 		hws_audio_drain_work(hws);
 
-	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
+	status = READ_ONCE(hws->pci_lost) ? U32_MAX :
+		readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 	live = status != U32_MAX;
 	dev_dbg(&hws->pdev->dev, "%s: status=0x%08x\n", __func__, status);
 	if (!live) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "device stop: MMIO unavailable");
 		dma_ret = hws_disable_pci_dma_checked(hws, "device stop", -1,
 						      true);
 		if (dma_ret) {
@@ -1734,6 +1827,7 @@ static int hws_quiesce_for_transition(struct hws_pcie_dev *hws,
 	int stop_ret;
 	int video_ret;
 
+	hws_failure_cancel(hws);
 	hws_log_lifecycle_snapshot(hws, action, "begin");
 
 	step_ns = ktime_get_mono_fast_ns();
@@ -1885,8 +1979,11 @@ static int hws_enable_pci_dma_checked(struct hws_pcie_dev *hws)
 
 static int hws_restart_quiesced_core(struct hws_pcie_dev *hws)
 {
+	unsigned long flags;
 	int ret;
 
+	if (READ_ONCE(hws->failure_latched) || READ_ONCE(hws->dma_failed))
+		return -EIO;
 	ret = hws_init_video_sys(hws);
 	if (ret)
 		goto err_quarantine;
@@ -1911,11 +2008,18 @@ static int hws_restart_quiesced_core(struct hws_pcie_dev *hws)
 		goto err_quarantine;
 
 	mutex_lock(&hws->dma_lock);
+	spin_lock_irqsave(&hws->failure_lock, flags);
+	if (hws->failure_latched) {
+		spin_unlock_irqrestore(&hws->failure_lock, flags);
+		mutex_unlock(&hws->dma_lock);
+		return -EIO;
+	}
 	WRITE_ONCE(hws->pci_lost, false);
 	WRITE_ONCE(hws->dma_quiesced, false);
+	WRITE_ONCE(hws->suspended, false);
+	spin_unlock_irqrestore(&hws->failure_lock, flags);
 	mutex_unlock(&hws->dma_lock);
 
-	WRITE_ONCE(hws->suspended, false);
 	/* Publish live state and restored arenas after every commit check passed. */
 	smp_mb();
 	return 0;
@@ -2024,6 +2128,7 @@ static int hws_pm_resume(struct device *dev)
 	hws_log_lifecycle_snapshot(hws, "pm_resume", "end");
 	dev_info(dev, "lifecycle:pm_resume done (%lluus)\n",
 		 hws_elapsed_us(start_ns));
+	hws_failure_enable(hws);
 
 	return 0;
 

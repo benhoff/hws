@@ -6,6 +6,7 @@
 #include <sound/pcm.h>
 
 #include "hws.h"
+#include "hws_fault.h"
 #include "hws_audio.h"
 #include "hws_reg.h"
 #include "hws_video.h"
@@ -483,14 +484,20 @@ static void hws_audio_log_telemetry(struct hws_audio *a, const char *event,
 	scratch = &hws->scratch_aud[ch];
 	scratch_dma = scratch->dma;
 	scratch_size = scratch->size;
-	acap = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
-	int_status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
-	live_toggle = readl(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-	audio_dma = readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
-	remap_hi = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
-			 HWS_AUDIO_REMAP_SLOT_OFF(ch));
-	remap_lo = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
-			 HWS_AUDIO_REMAP_SLOT_OFF(ch) + PCIE_BARADDROFSIZE);
+	acap = int_status = audio_dma = remap_hi = remap_lo = U32_MAX;
+	live_toggle = 0xff;
+	if (!READ_ONCE(hws->pci_lost) && !READ_ONCE(hws->suspended)) {
+		live_toggle = hws_read_toggle(hws, HWS_REG_ABUF_TOGGLE(ch));
+		if (live_toggle != 0xff) {
+			acap = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+			int_status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+			audio_dma = readl(hws->bar0_base + HWS_REG_AUD_DMA_ADDR(ch));
+			remap_hi = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
+					 HWS_AUDIO_REMAP_SLOT_OFF(ch));
+			remap_lo = readl(hws->bar0_base + PCI_ADDR_TABLE_BASE +
+					 HWS_AUDIO_REMAP_SLOT_OFF(ch) + PCIE_BARADDROFSIZE);
+		}
+	}
 
 #define HWS_AUDIO_TELEMETRY_FMT \
 	"audio telemetry event=%s ch=%u reason=%s state=%u running=%d cap=%d stop=%d irq=%u generation=%llu cadence_last=%lluus cadence_errors=%u w1c_ambiguities=%u last_toggle=%u live_toggle=%u toggle_errors=%u generation_errors=%u deadline_misses=%u guard_errors=%u dma_extent=%zu dma_capacity=%zu scratch_corrupt=%d primed=%u delivered=%u dropped=%u work_last=%lluus work_max=%lluus ACAP=0x%08x INT_STATUS=0x%08x AUD_DMA=0x%08x REMAP_HI=0x%08x REMAP_LO=0x%08x scratch=%pad/%zu\n"
@@ -988,7 +995,7 @@ static bool hws_audio_stage_one_packet(struct hws_audio *a, u8 cur_toggle,
 		return false;
 	}
 
-	live_toggle = readl(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+	live_toggle = hws_read_toggle(hws, HWS_REG_ABUF_TOGGLE(ch));
 	if (live_toggle != cur_toggle) {
 		if (failure)
 			*failure = HWS_AUDIO_XRUN_POST_COPY_TOGGLE;
@@ -1012,7 +1019,7 @@ static bool hws_audio_stage_one_packet(struct hws_audio *a, u8 cur_toggle,
 	memcpy(staging, (char *)cpu + offset, a->hw_packet_bytes);
 	/* Order the DMA read before observing whether hardware changed halves. */
 	dma_rmb();
-	live_toggle = readl(hws->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+	live_toggle = hws_read_toggle(hws, HWS_REG_ABUF_TOGGLE(ch));
 	if (live_toggle != cur_toggle) {
 		if (failure)
 			*failure = HWS_AUDIO_XRUN_POST_COPY_TOGGLE;
@@ -1371,8 +1378,15 @@ void hws_audio_cleanup_channel(struct hws_pcie_dev *pdev, int ch, bool device_re
 
 static inline bool hws_check_audio_capture(struct hws_pcie_dev *hws, unsigned int ch)
 {
-	u32 reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	u32 reg;
 
+	if (READ_ONCE(hws->pci_lost))
+		return false;
+	reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
+	if (reg == U32_MAX) {
+		hws_device_lost(hws, "all-ones audio capture status");
+		return false;
+	}
 	return !!(reg & BIT(ch));
 }
 
@@ -1389,7 +1403,7 @@ static int hws_audio_hw_ready(struct hws_pcie_dev *hws)
 
 	status = readl(hws->bar0_base + HWS_REG_SYS_STATUS);
 	if (status == 0xFFFFFFFF) {
-		hws->pci_lost = true;
+		hws_device_lost(hws, "hws_audio.c: register failure");
 		dev_err(&hws->pdev->dev, "PCIe device not responding\n");
 		return -ENODEV;
 	}
@@ -1492,13 +1506,20 @@ static inline void hws_audio_ack_pending(struct hws_pcie_dev *hws, unsigned int 
 
 	if (!hws || !hws->bar0_base || ch >= hws->cur_max_audio_ch)
 		return;
+	if (READ_ONCE(hws->pci_lost))
+		return;
 
 	st = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	if (st == U32_MAX) {
+		hws_device_lost(hws, "all-ones audio IRQ status");
+		return;
+	}
 
 	if (st & abit) {
 		writel(abit, hws->bar0_base + HWS_REG_INT_ACK);
 		/* flush posted write */
-		readl(hws->bar0_base + HWS_REG_INT_STATUS);
+		if (readl(hws->bar0_base + HWS_REG_INT_STATUS) == U32_MAX)
+			hws_device_lost(hws, "all-ones audio IRQ readback");
 	}
 }
 
@@ -1515,9 +1536,10 @@ static void hws_audio_disable_capture_and_ack(struct hws_pcie_dev *hws,
 {
 	if (!hws || !hws->bar0_base || ch >= hws->cur_max_audio_ch)
 		return;
+	if (READ_ONCE(hws->pci_lost) || READ_ONCE(hws->suspended))
+		return;
 
 	hws_enable_audio_capture(hws, ch, false);
-	readl(hws->bar0_base + HWS_REG_INT_STATUS);
 	hws_audio_ack_pending(hws, ch);
 }
 
@@ -1536,7 +1558,7 @@ static inline int hws_audio_ack_all(struct hws_pcie_dev *hws)
 		u32 status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
 
 		if (status == U32_MAX) {
-			WRITE_ONCE(hws->pci_lost, true);
+			hws_device_lost(hws, "hws_audio.c: register failure");
 			return -ENODEV;
 		}
 		pending = status & mask;
@@ -1589,7 +1611,7 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 	}
 	reg = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	if (reg == U32_MAX) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_audio.c: register failure");
 		WRITE_ONCE(hws->audio[ch].cap_active, false);
 		spin_unlock_irqrestore(&hws->capture_lock, flags);
 		return;
@@ -1602,10 +1624,10 @@ void hws_enable_audio_capture(struct hws_pcie_dev *hws,
 	writel(reg, hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	readback = readl(hws->bar0_base + HWS_REG_ACAP_ENABLE);
 	if (readback == U32_MAX) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_audio.c: register failure");
 		WRITE_ONCE(hws->audio[ch].cap_active, false);
 	} else if (!!(readback & mask) != enable) {
-		WRITE_ONCE(hws->pci_lost, true);
+		hws_device_lost(hws, "hws_audio.c: register failure");
 		WRITE_ONCE(hws->audio[ch].cap_active, false);
 	} else {
 		WRITE_ONCE(hws->audio[ch].cap_active,

@@ -19,6 +19,7 @@ int hws_video_set_output_resolution(struct hws_video *vid, u32 width,
 int hws_init_video_sys(struct hws_pcie_dev *hws);
 
 void hws_video_fail_queue(struct hws_video *vid, const char *reason);
+void hws_video_device_error(struct hws_pcie_dev *hws);
 void hws_video_drain_channel_work(struct hws_video *vid);
 void hws_video_drain_work(struct hws_pcie_dev *hws);
 

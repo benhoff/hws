@@ -13,6 +13,7 @@
 #include "hws_video.h"
 #include "hws.h"
 #include "hws_timing.h"
+#include "hws_fault.h"
 #include "hws_audio.h"
 #include "hws_trace.h"
 
@@ -297,7 +298,7 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	    v->ring_extent < v->pix.sizeimage)
 		return -ENODEV;
 
-	live_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	live_toggle = hws_read_toggle(hws, HWS_REG_VBUF_TOGGLE(ch));
 	observation->toggle_before = live_toggle;
 	observation->toggle_before_valid = true;
 	if (live_toggle != event->toggle)
@@ -398,8 +399,7 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 	dma_rmb();
 	memcpy((u8 *)dst + offset, (u8 *)ring + offset, length);
 	dma_rmb();
-	toggle_after_copy = readl(hws->bar0_base +
-				  HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	toggle_after_copy = hws_read_toggle(hws, HWS_REG_VBUF_TOGGLE(ch));
 	observation->toggle_after = toggle_after_copy;
 	observation->toggle_after_valid = true;
 	verify_ns = ktime_get_mono_fast_ns();
@@ -411,7 +411,7 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 
 verify_phase:
 	verify_ns = ktime_get_mono_fast_ns();
-	live_toggle = readl(hws->bar0_base + HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+	live_toggle = hws_read_toggle(hws, HWS_REG_VBUF_TOGGLE(ch));
 	observation->toggle_after = live_toggle;
 	observation->toggle_after_valid = true;
 	if (live_toggle != event->toggle)
@@ -620,8 +620,11 @@ static void hws_video_handle_vdone(struct hws_video *v)
 
 			recovery_timestamp_ns = ktime_get_mono_fast_ns();
 			recovery_generation = event.generation;
-			recovery_toggle = readl(hws->bar0_base +
-						     HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+			recovery_toggle = hws_read_toggle(hws, HWS_REG_VBUF_TOGGLE(ch));
+			if (recovery_toggle == 0xff) {
+				spin_unlock_irqrestore(&v->irq_lock, flags);
+				return; /* failure coordinator drains us before returning buffers */
+			}
 			if (recovery_timestamp_ns >= event.timestamp_ns)
 				recovery_interval_us =
 					div_u64(recovery_timestamp_ns -
@@ -938,8 +941,9 @@ static void hws_irq_probe_ring(struct hws_video *v, u64 generation)
 	    p.offset[1] + stride > v->pix.sizeimage)
 		return;
 	p.started_ns = ktime_get_mono_fast_ns();
-	p.before = readl(hws->bar0_base +
-			 HWS_REG_VBUF_TOGGLE(v->channel_index)) & 1;
+	p.before = hws_read_toggle(hws, HWS_REG_VBUF_TOGGLE(v->channel_index));
+	if (p.before == 0xff)
+		return;
 	for (pass = 0; pass < 4; pass++) {
 		u8 low = 255, high = 0, threshold;
 
@@ -958,9 +962,14 @@ static void hws_irq_probe_ring(struct hws_video *v, u64 generation)
 				      (values[cell] > threshold);
 	}
 	dma_rmb();
-	p.after = readl(hws->bar0_base +
-			HWS_REG_VBUF_TOGGLE(v->channel_index)) & 1;
+	p.after = hws_read_toggle(hws, HWS_REG_VBUF_TOGGLE(v->channel_index));
+	if (p.after == 0xff)
+		return;
 	p.status = readl(hws->bar0_base + HWS_REG_INT_STATUS);
+	if (p.status == U32_MAX) {
+		hws_device_lost(hws, "all-ones probe IRQ status");
+		return;
+	}
 	p.duration_ns = ktime_get_mono_fast_ns() - p.started_ns;
 	state->reads++;
 	if (state->reads <= HWS_DMA_PROBE_LIMIT)
@@ -1214,8 +1223,7 @@ hws_irq_sample_video_before_ack(struct hws_pcie_dev *pdx, u32 int_state,
 	for (ch = 0; ch < pdx->cur_max_video_ch; ch++) {
 		if (!(int_state & HWS_INT_VDONE_BIT(ch)))
 			continue;
-		samples[ch].before_ack = readl(pdx->bar0_base +
-					       HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+		samples[ch].before_ack = hws_read_toggle(pdx, HWS_REG_VBUF_TOGGLE(ch));
 		samples[ch].after_ack = samples[ch].before_ack;
 	}
 }
@@ -1238,10 +1246,10 @@ hws_irq_record_video(struct hws_pcie_dev *pdx, u32 int_state,
 
 		if (READ_ONCE(pdx->video[ch].cap_active) &&
 		    !READ_ONCE(pdx->video[ch].stop_requested)) {
-			first = readl(pdx->bar0_base +
-				      HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
-			second = readl(pdx->bar0_base +
-				       HWS_REG_VBUF_TOGGLE(ch)) & 0x01;
+			first = hws_read_toggle(pdx, HWS_REG_VBUF_TOGGLE(ch));
+			second = hws_read_toggle(pdx, HWS_REG_VBUF_TOGGLE(ch));
+			if (first == 0xff || second == 0xff)
+				return 0;
 			samples[ch].after_ack = second;
 			samples[ch].post_ack_stable = first == second;
 			samples[ch].status_reasserted = status_after_ack & vbit;
@@ -1276,8 +1284,7 @@ hws_irq_sample_audio_before_ack(struct hws_pcie_dev *pdx, u32 int_state,
 	for (ch = 0; ch < pdx->cur_max_audio_ch; ch++) {
 		if (!(int_state & HWS_INT_ADONE_BIT(ch)))
 			continue;
-		samples[ch].before_ack = readl(pdx->bar0_base +
-						 HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+		samples[ch].before_ack = hws_read_toggle(pdx, HWS_REG_ABUF_TOGGLE(ch));
 		samples[ch].after_ack = samples[ch].before_ack;
 	}
 }
@@ -1309,8 +1316,10 @@ hws_irq_record_audio(struct hws_pcie_dev *pdx, u32 int_state,
 		 * with ordered reads and fail closed if another completion can have
 		 * crossed the acknowledge window.
 		 */
-		first = readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
-		second = readl(pdx->bar0_base + HWS_REG_ABUF_TOGGLE(ch)) & 0x01;
+		first = hws_read_toggle(pdx, HWS_REG_ABUF_TOGGLE(ch));
+		second = hws_read_toggle(pdx, HWS_REG_ABUF_TOGGLE(ch));
+		if (first == 0xff || second == 0xff)
+			return 0;
 		samples[ch].after_ack = second;
 		samples[ch].post_ack_stable = first == second;
 		samples[ch].status_reasserted = status_after_ack & abit;
@@ -1361,6 +1370,8 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 
 	if (!pdx || !pdx->bar0_base)
 		return IRQ_NONE;
+	if (READ_ONCE(pdx->pci_lost))
+		return IRQ_NONE;
 	if (READ_ONCE(pdx->suspended)) {
 		/*
 		 * A failed device-local mask must not leave a shared level IRQ
@@ -1368,27 +1379,45 @@ irqreturn_t hws_irq_handler(int irq, void *info)
 		 * causes without sampling DMA buffers or queueing any work.
 		 */
 		int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
+		if (int_state == U32_MAX) {
+			hws_device_lost(pdx, "all-ones suspended IRQ status");
+			return IRQ_NONE;
+		}
 		if (int_state != U32_MAX)
 			int_state &= hws_irq_owned_status_mask(pdx);
 		if (!int_state || int_state == U32_MAX)
 			return IRQ_NONE;
-		(void)hws_irq_ack_status(pdx, int_state);
+		if (hws_irq_ack_status(pdx, int_state) == U32_MAX)
+			hws_device_lost(pdx, "all-ones suspended IRQ readback");
 		return IRQ_HANDLED;
 	}
 
 	int_state = readl(pdx->bar0_base + HWS_REG_INT_STATUS);
-	if (!int_state || int_state == 0xFFFFFFFF)
+	if (int_state == U32_MAX) {
+		hws_device_lost(pdx, "all-ones IRQ status");
+		return IRQ_NONE;
+	}
+	int_state &= hws_irq_owned_status_mask(pdx);
+	if (!int_state)
 		return IRQ_NONE;
 	timestamp_ns = ktime_get_mono_fast_ns();
 
 	hws_irq_sample_video_before_ack(pdx, int_state, video_samples);
 	hws_irq_sample_audio_before_ack(pdx, int_state, audio_samples);
+	if (READ_ONCE(pdx->pci_lost))
+		return IRQ_HANDLED;
 	status_after_ack = hws_irq_ack_status(pdx, int_state);
+	if (status_after_ack == U32_MAX) {
+		hws_device_lost(pdx, "all-ones IRQ acknowledge readback");
+		return IRQ_HANDLED;
+	}
 	audio_work = hws_irq_record_audio(pdx, int_state, status_after_ack,
 					  audio_samples, timestamp_ns);
 	video_work = hws_irq_record_video(pdx, int_state, status_after_ack,
 					  video_samples, timestamp_ns);
 	/* No DMA-backed copy may start until the sticky causes are acknowledged. */
+	if (READ_ONCE(pdx->pci_lost))
+		return IRQ_HANDLED;
 	hws_irq_queue_audio_work(pdx, audio_work);
 	hws_irq_queue_video_work(pdx, video_work);
 

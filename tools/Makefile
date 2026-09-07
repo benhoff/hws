@@ -21,7 +21,14 @@ hws_frame_id_kms: hws_frame_id_kms.c hws_frame_pattern.h Makefile
 test_frame_id_kms: test_frame_id_kms.c hws_frame_id_kms.c hws_frame_id_capture.c hws_frame_pattern.h Makefile
 	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< $(shell pkg-config --libs libdrm)
 
-check: check-audio all hws_frame_id_kms test_frame_id_kms
+.PHONY: check-failure check-failure-sanitize
+check-failure:
+	python3 -m unittest test_device_failure -v
+
+check-failure-sanitize:
+	HWS_FAILURE_SANITIZE=1 python3 -m unittest test_device_failure.DeviceFailureTests.test_production_failure_transaction -v
+
+check: check-failure check-audio all hws_frame_id_kms test_frame_id_kms
 	./hws_frame_id_capture --self-test
 	./test_frame_id_kms
 	python3 -m unittest discover -s . -p 'test_vdone*.py' -v
