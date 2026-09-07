@@ -256,6 +256,7 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 	vid->overlap_generation = 0;
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
+	hws_video_clear_frame_continuity(vid);
 	vid->frame_half0_valid = false;
 
 	/* DMA watchdog removed; retain counters for diagnostics */
@@ -329,11 +330,17 @@ int hws_video_init_channel(struct hws_pcie_dev *pdev, int ch)
 
 void hws_video_drain_channel_work(struct hws_video *vid)
 {
+	unsigned long flags;
+
 	if (!vid)
 		return;
 
 	flush_work(&vid->vdone_work);
 	flush_work(&vid->recovery_work);
+	spin_lock_irqsave(&vid->irq_lock, flags);
+	if (READ_ONCE(vid->stop_requested) || READ_ONCE(vid->parent->suspended))
+		hws_video_clear_frame_continuity(vid);
+	spin_unlock_irqrestore(&vid->irq_lock, flags);
 }
 
 void hws_video_drain_work(struct hws_pcie_dev *hws)
@@ -374,6 +381,7 @@ static void hws_video_reset_stream_phase_locked(struct hws_video *vid)
 	vid->overlap_generation = 0;
 	vid->phase_generation = 0;
 	vid->frame_generation = 0;
+	hws_video_clear_frame_continuity(vid);
 	vid->frame_half0_valid = false;
 	WRITE_ONCE(vid->last_buf_half_toggle, 0);
 	WRITE_ONCE(vid->half_seen, false);
@@ -403,6 +411,8 @@ static void hws_video_reset_evidence_locked(struct hws_video *vid)
 	vid->evidence_recovery_reports = 0;
 	vid->evidence_duplicate_reports = 0;
 	vid->evidence_overlap_reports = 0;
+	vid->evidence_continuity_reports = 0;
+	vid->continuity_gaps = 0;
 	vid->evidence_resync_reports = 0;
 	vid->evidence_queue_failures = 0;
 	vid->evidence_probe_count = 0;
@@ -556,6 +566,7 @@ void hws_video_cleanup_channel(struct hws_pcie_dev *pdev, int ch)
 	INIT_LIST_HEAD(&vid->capture_queue);
 	vid->active = NULL;
 	vid->frame_generation = 0;
+	hws_video_clear_frame_continuity(vid);
 	vid->frame_half0_valid = false;
 	vid->stop_requested = false;
 	vid->last_buf_half_toggle = 0;

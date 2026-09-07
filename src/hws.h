@@ -160,6 +160,10 @@ struct hws_video {
 	u64 overlap_generation;
 	u64 phase_generation;
 	u64 frame_generation;
+	/* First-half continuity is independent of observed IRQ generation. */
+	u64 frame_timestamp_ns;
+	u64 frame_half_period_ns;
+	u64 frame_epoch;
 	bool frame_half0_valid;
 	size_t ring_extent;
 	size_t ring_split;
@@ -226,6 +230,7 @@ struct hws_video {
 	bool recovery_report_steady;
 	u32 phase_errors;
 	u32 deadline_misses;
+	u64 continuity_gaps;
 	u32 guard_errors;
 
 	/* Per-stream, self-accounting VDONE evidence (protected by irq_lock). */
@@ -245,6 +250,7 @@ struct hws_video {
 	u64 evidence_recovery_reports;
 	u64 evidence_duplicate_reports;
 	u64 evidence_overlap_reports;
+	u64 evidence_continuity_reports;
 	u64 evidence_resync_reports;
 	u64 evidence_queue_failures;
 	u32 evidence_probe_count;
@@ -260,6 +266,13 @@ struct hws_video {
 	/* Misc counters */
 	int signal_loss_cnt;
 };
+
+static inline void hws_video_clear_frame_continuity(struct hws_video *v)
+{
+	v->frame_timestamp_ns = 0;
+	v->frame_half_period_ns = 0;
+	v->frame_epoch = 0;
+}
 
 enum hws_audio_packet_state {
 	HWS_AUDIO_PACKET_IDLE,

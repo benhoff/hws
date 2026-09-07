@@ -12,6 +12,7 @@
 #include "hws_reg.h"
 #include "hws_video.h"
 #include "hws.h"
+#include "hws_timing.h"
 #include "hws_audio.h"
 #include "hws_trace.h"
 
@@ -73,15 +74,51 @@ enum hws_vdone_ambiguity {
 	HWS_VDONE_AMBIG_TIMESTAMP,
 	HWS_VDONE_AMBIG_TOGGLE_UNSTABLE,
 	HWS_VDONE_AMBIG_STATUS_REASSERTED,
+	HWS_VDONE_AMBIG_CONTINUITY,
 };
+
+/* Configured progressive timing only; never infer precision from integer FPS. */
+static u64 hws_video_continuity_period_ns(const struct hws_video *v)
+{
+	struct v4l2_fract frame;
+	u64 period;
+
+	if (v->cur_dv_timings.bt.width != v->pix.width ||
+	    v->cur_dv_timings.bt.height != v->pix.height ||
+	    hws_dv_frame_period(&v->cur_dv_timings, &frame))
+		return 0;
+	period = div64_u64((u64)frame.numerator * NSEC_PER_SEC,
+			  frame.denominator) / 2;
+	return period >= NSEC_PER_SEC / 480 && period <= NSEC_PER_SEC / 2 ?
+		period : 0;
+}
+
+/*
+ * Allow at most half a phase of differential IRQ-entry jitter (1.5T total).
+ * Two hidden boundaries give 3T with prompt handlers and must not be paired.
+ * Publication additionally permits this event's existing copy budget. This is
+ * a conservative software continuity policy, not a hardware frame-ID proof:
+ * arbitrary interrupt delays can conceal physical DMA cadence.
+ */
+static bool hws_video_frame_contiguous(const struct hws_video *v,
+				       const struct hws_vdone_event *event,
+				       u64 now_ns)
+{
+	u64 period = v->frame_half_period_ns;
+	u64 limit = period + period / 2;
+	u64 first = v->frame_timestamp_ns;
+
+	return first && period && v->frame_epoch == v->evidence_stream_epoch &&
+		period == hws_video_continuity_period_ns(v) &&
+		event->timestamp_ns > first &&
+		event->timestamp_ns - first <= limit &&
+		now_ns >= event->timestamp_ns && event->deadline_ns &&
+		now_ns - first <= limit + event->deadline_ns;
+}
 
 static u64 hws_video_phase_period_ns(const struct hws_video *v)
 {
-	u32 fps = READ_ONCE(v->current_fps);
-
-	if (!fps || fps > 240)
-		return 0;
-	return div_u64(NSEC_PER_SEC, (u64)fps * 2);
+	return hws_video_continuity_period_ns(v);
 }
 
 static u64 hws_video_copy_deadline_ns(const struct hws_video *v)
@@ -116,6 +153,8 @@ hws_vdone_ambiguity_name(enum hws_vdone_ambiguity ambiguity)
 		return "post-W1C toggle sample was unstable";
 	case HWS_VDONE_AMBIG_STATUS_REASSERTED:
 		return "VDONE reasserted during W1C acknowledgment";
+	case HWS_VDONE_AMBIG_CONTINUITY:
+		return "saved first-half continuity lost";
 	case HWS_VDONE_AMBIG_NONE:
 	default:
 		return "none";
@@ -161,6 +200,7 @@ static bool hws_irq_recover_phase_locked(struct hws_video *v, u64 generation,
 	}
 	v->active = NULL;
 	v->frame_generation = 0;
+	hws_video_clear_frame_continuity(v);
 	v->frame_half0_valid = false;
 	/* The next changed toggle completes the half named by this toggle. */
 	v->half_phase = toggle ? HWS_VIDEO_PHASE_EXPECT_HALF1 :
@@ -176,7 +216,8 @@ static bool hws_irq_recover_phase_locked(struct hws_video *v, u64 generation,
 
 static bool hws_video_copy_error_recoverable(int ret)
 {
-	return ret == -ETIME || ret == -EILSEQ || ret == -EOVERFLOW;
+	return ret == -ETIME || ret == -EILSEQ || ret == -EOVERFLOW ||
+	       ret == -ESTALE;
 }
 
 static void
@@ -203,6 +244,7 @@ static void hws_irq_mark_failure_locked(struct hws_video *v, int ret)
 		WRITE_ONCE(v->ring_corrupt, true);
 	}
 	v->completion_state = HWS_VIDEO_COMPLETION_OVERRUN;
+	hws_video_clear_frame_continuity(v);
 }
 
 static struct hwsvideo_buffer *
@@ -302,10 +344,14 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		buf = hws_irq_take_queued_buffer_locked(v);
 		if (!buf) {
 			v->frame_generation = 0;
+			hws_video_clear_frame_continuity(v);
 			skip_copy = true;
 		} else {
 			v->active = buf;
 			v->frame_generation = event->generation;
+			v->frame_timestamp_ns = event->timestamp_ns;
+			v->frame_half_period_ns = hws_video_continuity_period_ns(v);
+			v->frame_epoch = v->evidence_stream_epoch;
 			v->frame_half0_valid = false;
 		}
 	} else {
@@ -326,6 +372,11 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 				return -EILSEQ;
 			}
 			buf = v->active;
+			if (!hws_video_frame_contiguous(v, event,
+						ktime_get_mono_fast_ns())) {
+				spin_unlock_irqrestore(&v->irq_lock, flags);
+				return -ESTALE;
+			}
 		}
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
@@ -489,6 +540,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		    v->completion_generation == event.generation)
 			hws_irq_reset_completion_locked(v);
 		hws_irq_clear_overlap_locked(v);
+		hws_video_clear_frame_continuity(v);
 		spin_unlock_irqrestore(&v->irq_lock, flags);
 		return;
 	}
@@ -525,6 +577,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		hws_irq_reset_completion_locked(v);
 		hws_irq_clear_overlap_locked(v);
 		abort = true;
+		hws_video_clear_frame_continuity(v);
 	} else if (v->overlap_pending &&
 		   (!ret || hws_video_copy_error_recoverable(ret))) {
 		recovery_generation = v->overlap_generation;
@@ -559,7 +612,12 @@ static void hws_video_handle_vdone(struct hws_video *v)
 		    (v->active != done || !v->frame_half0_valid ||
 		     event.generation != v->frame_generation + 1))
 			ret = -EILSEQ;
+		if (!ret && done &&
+		    !hws_video_frame_contiguous(v, &event, ktime_get_mono_fast_ns()))
+			ret = -ESTALE;
 		if (hws_video_copy_error_recoverable(ret)) {
+			enum hws_vdone_ambiguity reason = HWS_VDONE_AMBIG_INFLIGHT;
+
 			recovery_timestamp_ns = ktime_get_mono_fast_ns();
 			recovery_generation = event.generation;
 			recovery_toggle = readl(hws->bar0_base +
@@ -569,7 +627,13 @@ static void hws_video_handle_vdone(struct hws_video *v)
 					div_u64(recovery_timestamp_ns -
 						event.timestamp_ns,
 					NSEC_PER_USEC);
-			if (ret == -ETIME) {
+			if (ret == -ESTALE) {
+				reason = HWS_VDONE_AMBIG_CONTINUITY;
+				v->continuity_gaps++;
+				if (event.timestamp_ns >= v->frame_timestamp_ns)
+					recovery_interval_us = div_u64(event.timestamp_ns -
+						v->frame_timestamp_ns, NSEC_PER_USEC);
+			} else if (ret == -ETIME) {
 				v->deadline_misses++;
 				v->timeout_count++;
 			} else {
@@ -579,11 +643,12 @@ static void hws_video_handle_vdone(struct hws_video *v)
 				hws_irq_recover_phase_locked(v, recovery_generation,
 							     recovery_timestamp_ns,
 							     recovery_toggle);
-			v->overlap_recoveries++;
+			if (ret != -ESTALE)
+				v->overlap_recoveries++;
 			hws_vdone_note_recovery_locked(v, recovery_generation,
 						       recovery_interval_us,
 						       recovery_toggle, 0,
-						       HWS_VDONE_AMBIG_INFLIGHT,
+						       reason,
 						       dropped_partial, true, 1);
 			done = NULL;
 			frame_complete = false;
@@ -601,6 +666,7 @@ static void hws_video_handle_vdone(struct hws_video *v)
 				v->evidence_frames_delivered++;
 				v->active = NULL;
 				v->frame_generation = 0;
+				hws_video_clear_frame_continuity(v);
 				v->frame_half0_valid = false;
 				done->vb.vb2_buf.timestamp = event.timestamp_ns;
 				vb2_set_plane_payload(&done->vb.vb2_buf, 0,
@@ -691,6 +757,11 @@ static void hws_video_recovery_work(struct work_struct *work)
 	reason = v->recovery_report_reason;
 	dropped_partial = v->recovery_report_dropped_partial;
 	steady = v->recovery_report_steady;
+	/* Continuity rejection is accounted in debugfs/trace, not kernel chatter. */
+	if (reason == HWS_VDONE_AMBIG_CONTINUITY) {
+		spin_unlock_irqrestore(&v->irq_lock, flags);
+		return;
+	}
 	if (!steady)
 		notice_bit = HWS_RECOVERY_NOTICE_RESYNC;
 	else if (reason == HWS_VDONE_AMBIG_DUPLICATE)
@@ -809,6 +880,8 @@ hws_vdone_note_recovery_locked(struct hws_video *v, u64 generation,
 		v->evidence_resync_reports += reports;
 	else if (reason == HWS_VDONE_AMBIG_DUPLICATE)
 		v->evidence_duplicate_reports += reports;
+	else if (reason == HWS_VDONE_AMBIG_CONTINUITY)
+		v->evidence_continuity_reports += reports;
 	else
 		v->evidence_overlap_reports += reports;
 	trace_hws_vdone_recovery(pci_name(v->parent->pdev), v->channel_index,

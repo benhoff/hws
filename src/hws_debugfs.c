@@ -30,6 +30,8 @@ struct hws_video_evidence_snapshot {
 	u64 recovery_reports;
 	u64 duplicate_reports;
 	u64 overlap_reports;
+	u64 continuity_reports;
+	u64 continuity_gaps;
 	u64 resync_reports;
 	u64 queue_failures;
 	u64 generation;
@@ -78,6 +80,8 @@ static void hws_debugfs_snapshot(struct hws_video *v,
 	s->recovery_reports = v->evidence_recovery_reports;
 	s->duplicate_reports = v->evidence_duplicate_reports;
 	s->overlap_reports = v->evidence_overlap_reports;
+	s->continuity_reports = v->evidence_continuity_reports;
+	s->continuity_gaps = v->continuity_gaps;
 	s->resync_reports = v->evidence_resync_reports;
 	s->queue_failures = v->evidence_queue_failures;
 	s->generation = v->next_completion_generation;
@@ -231,6 +235,9 @@ static int hws_debugfs_stats_show(struct seq_file *m, void *unused)
 		   (unsigned long long)s.duplicate_reports);
 	seq_printf(m, "overlap_reports=%llu\n",
 		   (unsigned long long)s.overlap_reports);
+	seq_printf(m, "continuity_reports=%llu\ncontinuity_gaps=%llu\n",
+		   (unsigned long long)s.continuity_reports,
+		   (unsigned long long)s.continuity_gaps);
 	seq_printf(m, "resync_reports=%llu\n",
 		   (unsigned long long)s.resync_reports);
 	seq_printf(m, "queue_failures=%llu\n",
