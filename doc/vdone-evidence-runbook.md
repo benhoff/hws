@@ -119,6 +119,13 @@ and per-IRQ/per-frame diagnostics exist only as explicitly enabled trace
 events. The runner also rejects a device node whose advertised HDMI channel
 does not match `--channel`.
 
+The split cache may be zero in the snapshot before the first stream: it is
+populated when the driver arms the DMA window. The validator permits this only
+while both `streaming` and `cap_active` are zero. The final cache must equal the
+native split divided by 16. Hardware split readbacks must still agree before
+and after capture, and both STREAMON and STREAMOFF traces must report that same
+native split. A nonzero incorrect cache or an actual register change still fails.
+
 Capture budgets successful QBUF submissions, not just dequeues: it submits no
 more than the requested frame count, stops replenishing early, drains all
 submitted buffers, and then issues STREAMOFF. The summary must show
@@ -188,6 +195,25 @@ low contrast, or invalid records cannot supply positive mapping evidence.
 Observation latency must be below a quarter half-period and duration below an
 eighth. Lost trace/probe records fail accounting.
 
+At stream startup, an untouched ring region can still contain a valid barcode
+from an earlier source run. Source IDs start randomly, so replacing that old
+barcode can look like a backward ID. If the first stable generation-1 probe
+contains an ID absent from the current source log, the validator tracks that
+initial value per physical region. Its first observed replacement by a recorded
+current-source ID is counted in `startup_replacements`, not as mapping support
+or a backward-ID failure. `startup_out_of_source_regions` records the initial
+number of such regions. This requires matching source boot, clock domain,
+backend, source-build digest, and pattern identity. Without that provenance,
+backward movement remains a failure.
+
+This exception ends on any different stable value or an unstable observation;
+it cannot be reused if old content reappears later. Backward movement between
+current-source IDs still fails even at generation 2. All probe records and
+delivery-to-ring links remain checked, and startup replacements cannot satisfy
+the minimum mapping-transition counts. The source timing and presentation gates
+remain separate requirements; recognizing retained content does not turn a
+bundle with invalid presentation telemetry into a passing result.
+
 Every delivered frame inside the probe window must also match the independent
 upper and lower ring IDs recorded at its two generations; at least 16 such
 deliveries are required. The report records the observed generation range and
@@ -211,6 +237,23 @@ cannot be promoted to `validated` by the current validator. The matrix writer
 records `unproven` when the independent mapping gate fails, and puts probe
 coverage and presentation status in the row's notes.
 
+Newly generated summaries also expose `capture_checks`, `provenance`, and
+`presentation_failures`. `capture_checks` contains all existing validation
+failures except source-presentation checks and committed-input provenance.
+It still requires content, copy/guard checks, queue accounting, native mapping,
+trace completeness, and the applicable anomaly/IRQ checks. A passing diagnostic
+scope does not certify source identity/timing, explain unresolved anomalies,
+extend the bounded probe coverage, or establish universal memory safety.
+The top-level `result` still combines **all** failures, including presentation
+and provenance, so the matrix cannot promote a diagnostic-only run to validated.
+These additive fields are optional when reading older version-3 summaries.
+
+The local `local-tests/hws-test-all.sh --with-pattern` wrapper uses this scope
+to collect a long content run despite unavailable NVIDIA timing. Its explicit
+`--allow-dirty` collection preserves the strict provenance failure and saves
+the working-tree patch. Sealed bundles are not edited. This is a diagnostic
+workflow, not a replacement for the definitive proof above.
+
 Anomaly windows do not expand the continuous mapping-proof window. Their
 classifier reports `consistent_with_missed_or_coalesced_boundary` only for
 stable, source-bounded, one-frame advances across a same-toggle interval with
@@ -229,6 +272,17 @@ guarded diagnostic workflow and its own configuration/evidence row; do not
 change the production split or bypass the native-split gate to obtain a pass.
 
 ## Optional BAR observation
+
+For queue-starvation and recovery investigations, `--queue-diagnostics` adds
+the bounded `hws_video_diag` trace and capture-side `queue-events.jsonl`.
+The sealed `diagnostics.json` report separates recovery-orphan frames,
+midstream empty queues, and deliberate budget draining. Missing/capped data
+cannot provide positive attribution. `--buffers 4` and `--buffers 16` permit
+controlled comparisons; `--probe-mode off` is explicitly non-validating for
+independent mapping and does not weaken that gate. `--irq-latency` requests a
+separate irqsoff measurement when supported, with additional observer overhead.
+See `local-tests/README.md` for the local comparison runner, trace-field
+semantics, caps, module-reload requirement, and interpretation limits.
 
 Use the read-only BAR sampler in a separate diagnostic run. It records only
 toggle/status transitions and scheduling gaps, so a 250 us polling interval
