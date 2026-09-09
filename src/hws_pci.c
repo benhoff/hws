@@ -26,6 +26,7 @@
 #include "hws_debugfs.h"
 #include "hws_reg.h"
 #include "hws_video.h"
+#include "hws_stall.h"
 #include "hws_irq.h"
 #include "hws_v4l2_ioctl.h"
 
@@ -357,10 +358,14 @@ static int read_chip_id(struct hws_pcie_dev *hdev)
 static int main_ks_thread_handle(void *data)
 {
 	struct hws_pcie_dev *pdx = data;
+	u64 next_monitor_ns = 0;
 
 	set_freezable();
 
 	for (;;) {
+		bool observing = false;
+		u64 now;
+
 		/*
 		 * Freezable kthreads must combine the freezer and stop checks.  A
 		 * direct try_to_freeze() can remain refrigerated after
@@ -371,19 +376,28 @@ static int main_ks_thread_handle(void *data)
 
 		/* If we're suspending, don't touch hardware; just sleep/freeze. */
 		if (READ_ONCE(pdx->suspended) || READ_ONCE(pdx->pci_lost)) {
+			hws_irq_observer_stop(pdx, "suspended-or-device-lost");
 			schedule_timeout_interruptible(msecs_to_jiffies(1000));
 			continue;
 		}
 
 		mutex_lock(&pdx->monitor_lock);
-		if (!READ_ONCE(pdx->suspended) && !READ_ONCE(pdx->pci_lost))
-			check_video_format(pdx);
+		if (!READ_ONCE(pdx->suspended) && !READ_ONCE(pdx->pci_lost)) {
+			observing = hws_irq_observer_poll(pdx);
+			now = ktime_get_mono_fast_ns();
+			if (now >= next_monitor_ns) {
+				hws_stall_monitor(pdx);
+				check_video_format(pdx);
+				next_monitor_ns = now + NSEC_PER_SEC;
+			}
+		}
 		mutex_unlock(&pdx->monitor_lock);
 
-		/* Sleep 1s or until signaled to wake/stop */
-		schedule_timeout_interruptible(msecs_to_jiffies(1000));
+		/* Opt-in observer requests ~1 ms; actual gaps are recorded. */
+		schedule_timeout_interruptible(msecs_to_jiffies(observing ? 1 : 1000));
 	}
 
+	hws_irq_observer_stop(pdx, "monitor-stopped");
 	dev_dbg(&pdx->pdev->dev, "%s: exiting\n", __func__);
 	return 0;
 }

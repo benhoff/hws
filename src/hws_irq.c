@@ -34,6 +34,11 @@ module_param(late_toggle_probe, bool, 0444);
 MODULE_PARM_DESC(late_toggle_probe,
 	"Diagnostic only: capped raw toggle/status reads after duplicates; requires trace event (default off)");
 
+static bool completion_diagnostics = true;
+module_param(completion_diagnostics, bool, 0444);
+MODULE_PARM_DESC(completion_diagnostics,
+	"Capture duplicate IRQ context for automatic journal reports (no extra MMIO; default on)");
+
 /* Characterized minimum reuse was 7,950 us at 1080p60. */
 #define HWS_VIDEO_COPY_DEADLINE_NS (7500ULL * NSEC_PER_USEC)
 #define HWS_VIDEO_REUSE_MARGIN_NS  (500ULL * NSEC_PER_USEC)
@@ -275,6 +280,7 @@ hws_irq_take_queued_buffer_locked(struct hws_video *v)
 
 	lockdep_assert_held(&v->irq_lock);
 	if (list_empty(&v->capture_queue)) {
+		v->evidence_queue_empty++;
 		hws_diag_locked(v, HWS_DIAG_EMPTY, U32_MAX,
 				v->completion_generation, 0, 0);
 		return NULL;
@@ -371,6 +377,7 @@ static int hws_video_copy_completed_half(struct hws_video *v,
 		if (!buf) {
 			v->frame_generation = 0;
 			hws_video_clear_frame_continuity(v);
+			v->frame_no_buffer = true;
 			skip_copy = true;
 		} else {
 			v->active = buf;
@@ -751,7 +758,12 @@ static void hws_video_handle_vdone(struct hws_video *v)
 				done->vb.sequence = frame_sequence;
 			} else {
 				v->evidence_frames_no_buffer++;
+				if (v->frame_no_buffer)
+					v->evidence_frames_starved++;
+				else
+					v->evidence_frames_orphaned++;
 			}
+			v->frame_no_buffer = false;
 		}
 		if (!fail && !recovered)
 			hws_irq_reset_completion_locked(v);
@@ -1170,6 +1182,37 @@ static void hws_irq_probe_late_toggle(struct hws_video *v, u64 epoch,
 				   epoch, generation, &p);
 }
 
+/* Keep the first duplicate in each ten-second window, not whichever event
+ * happened last before a slow logger ran. Every duplicate is still counted.
+ * The monitor publishes completed windows; after two seconds it can publish
+ * a partial window if subsequent interrupts never arrive.
+ */
+static void hws_observe_vdone_locked(struct hws_video *v,
+				    const struct hws_irq_observation *o)
+{
+	lockdep_assert_held(&v->irq_lock);
+	if (v->duplicate_window_pending && v->duplicate_window_count < 5)
+		v->duplicate_window[v->duplicate_window_count++] = *o;
+	if (o->ambiguity == HWS_VDONE_AMBIG_DUPLICATE) {
+		if (!v->duplicate_window_pending &&
+		    o->timestamp_ns >= v->duplicate_next_ns) {
+			v->duplicate_window[0] = v->irq_previous[0];
+			v->duplicate_window[1] = v->irq_previous[1];
+			v->duplicate_window[2] = *o;
+			v->duplicate_window_count = 3;
+			v->duplicate_window_ns = o->timestamp_ns;
+			v->duplicate_window_period_ns = hws_video_phase_period_ns(v);
+			v->duplicate_next_ns = o->timestamp_ns + 10ULL * NSEC_PER_SEC;
+			v->duplicate_window_pending = true;
+			v->duplicate_windows++;
+		} else {
+			v->duplicate_suppressed++;
+		}
+	}
+	v->irq_previous[0] = v->irq_previous[1];
+	v->irq_previous[1] = *o;
+}
+
 static enum hws_vdone_record_result
 hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     const struct hws_vdone_toggle_sample *sample,
@@ -1177,6 +1220,7 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 		     u32 status_after_ack)
 {
 	struct hws_video *v;
+	struct hws_irq_observation observation;
 	unsigned long flags;
 	enum hws_vdone_ambiguity ambiguity = HWS_VDONE_AMBIG_NONE;
 	enum hws_vdone_record_result result;
@@ -1202,6 +1246,21 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	epoch = v->evidence_stream_epoch;
 	previous_toggle = v->last_buf_half_toggle;
 	phase = v->half_phase;
+	if (completion_diagnostics) {
+		observation = (struct hws_irq_observation) {
+			.timestamp_ns = timestamp_ns,
+			.pending_ns = v->completion_timestamp_ns,
+			.status = int_status, .ack_status = status_after_ack,
+			.queued = v->queued_count,
+			.active = v->active ? v->active->vb.vb2_buf.index : U32_MAX,
+			.before = sample->before_ack, .after = sample->after_ack,
+			.previous = previous_toggle, .phase = phase,
+			.completion = v->completion_state,
+			.stable = sample->post_ack_stable,
+			.reasserted = sample->status_reasserted,
+			.half_valid = v->frame_half0_valid,
+		};
+	}
 	if (!READ_ONCE(v->cap_active) || READ_ONCE(v->stop_requested)) {
 		result = HWS_VDONE_IGNORED;
 	} else {
@@ -1357,6 +1416,12 @@ hws_irq_record_vdone(struct hws_pcie_dev *pdx, unsigned int ch,
 	case HWS_VDONE_OVERRUN:
 		v->evidence_vdone_fatal++;
 		break;
+	}
+	if (completion_diagnostics && generation) {
+		observation.generation = generation;
+		observation.result = result;
+		observation.ambiguity = ambiguity;
+		hws_observe_vdone_locked(v, &observation);
 	}
 	spin_unlock_irqrestore(&v->irq_lock, flags);
 	trace_hws_vdone_irq(pci_name(pdx->pdev), ch, epoch, timestamp_ns,

@@ -7,6 +7,8 @@ HwsCapture-objs := \
 	 hws_v4l2_ioctl.o \
 	 hws_audio.o \
 	 hws_debugfs.o \
+	 hws_stall.o \
+	 hws_observer.o \
 	 hws_trace.o
 
 src := $(CURDIR)

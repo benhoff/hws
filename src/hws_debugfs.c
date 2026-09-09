@@ -12,6 +12,7 @@
 #include "hws_debugfs.h"
 #include "hws_reg.h"
 #include "hws_probe.h"
+#include "hws_stall.h"
 
 struct hws_video_evidence_snapshot {
 	u32 diag_records, diag_suppressed;
@@ -28,6 +29,8 @@ struct hws_video_evidence_snapshot {
 	u64 frames_completed;
 	u64 frames_delivered;
 	u64 frames_no_buffer;
+	u64 queue_empty, frames_starved, frames_orphaned;
+	u64 duplicate_windows, duplicate_suppressed;
 	u64 partial_recycles;
 	u64 recovery_reports;
 	u64 duplicate_reports;
@@ -85,6 +88,11 @@ static void hws_debugfs_snapshot(struct hws_video *v,
 	s->frames_completed = v->evidence_frames_completed;
 	s->frames_delivered = v->evidence_frames_delivered;
 	s->frames_no_buffer = v->evidence_frames_no_buffer;
+	s->queue_empty = v->evidence_queue_empty;
+	s->frames_starved = v->evidence_frames_starved;
+	s->frames_orphaned = v->evidence_frames_orphaned;
+	s->duplicate_windows = v->duplicate_windows;
+	s->duplicate_suppressed = v->duplicate_suppressed;
 	s->partial_recycles = v->evidence_partial_recycles;
 	s->recovery_reports = v->evidence_recovery_reports;
 	s->duplicate_reports = v->evidence_duplicate_reports;
@@ -256,6 +264,12 @@ static int hws_debugfs_stats_show(struct seq_file *m, void *unused)
 		   (unsigned long long)s.frames_delivered);
 	seq_printf(m, "frames_no_buffer=%llu\n",
 		   (unsigned long long)s.frames_no_buffer);
+	seq_printf(m, "queue_empty=%llu\nframes_starved=%llu\nframes_orphaned=%llu\nduplicate_windows=%llu\nduplicate_suppressed=%llu\n",
+		   (unsigned long long)s.queue_empty,
+		   (unsigned long long)s.frames_starved,
+		   (unsigned long long)s.frames_orphaned,
+		   (unsigned long long)s.duplicate_windows,
+		   (unsigned long long)s.duplicate_suppressed);
 	seq_printf(m, "partial_recycles=%llu\n",
 		   (unsigned long long)s.partial_recycles);
 	seq_printf(m, "recovery_reports=%llu\n",
@@ -321,6 +335,11 @@ static int hws_debugfs_stats_open(struct inode *inode, struct file *file)
 	return hws_debugfs_open(inode, file, hws_debugfs_stats_show);
 }
 
+static int hws_debugfs_stall_open(struct inode *inode, struct file *file)
+{
+	return hws_debugfs_open(inode, file, hws_stall_show);
+}
+
 static int hws_debugfs_release(struct inode *inode, struct file *file)
 {
 	struct seq_file *m = file->private_data;
@@ -346,6 +365,14 @@ static const struct file_operations hws_debugfs_config_fops = {
 static const struct file_operations hws_debugfs_stats_fops = {
 	.owner = THIS_MODULE,
 	.open = hws_debugfs_stats_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = hws_debugfs_release,
+};
+
+static const struct file_operations hws_debugfs_stall_fops = {
+	.owner = THIS_MODULE,
+	.open = hws_debugfs_stall_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
 	.release = hws_debugfs_release,
@@ -377,6 +404,8 @@ void hws_debugfs_init(struct hws_pcie_dev *hws)
 				    &hws->video[ch], &hws_debugfs_config_fops);
 		debugfs_create_file("stats", 0444, channel_dir,
 				    &hws->video[ch], &hws_debugfs_stats_fops);
+		debugfs_create_file("stall", 0444, channel_dir,
+				    &hws->video[ch], &hws_debugfs_stall_fops);
 	}
 }
 

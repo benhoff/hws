@@ -25,6 +25,7 @@
 
 #include "hws_reg.h"
 #include "hws_probe.h"
+#include "hws_observer.h"
 
 struct snd_pcm_substream;
 struct dentry;
@@ -132,6 +133,14 @@ enum hws_video_half_phase {
 	HWS_VIDEO_PHASE_EXPECT_HALF1,
 };
 
+/* Existing IRQ reads, captured before the completion decision; no new MMIO. */
+struct hws_irq_observation {
+	u64 generation, timestamp_ns, pending_ns;
+	u32 status, ack_status, queued, active;
+	u8 before, after, previous, phase, completion, result, ambiguity;
+	bool stable, reasserted, half_valid;
+};
+
 struct hws_video {
 	/* Linkage */
 	struct hws_pcie_dev *parent;
@@ -165,6 +174,7 @@ struct hws_video {
 	u64 frame_half_period_ns;
 	u64 frame_epoch;
 	bool frame_half0_valid;
+	bool frame_no_buffer; /* this half pair began with an empty capture queue */
 	size_t ring_extent;
 	size_t ring_split;
 
@@ -249,6 +259,7 @@ struct hws_video {
 	u64 evidence_frames_completed;
 	u64 evidence_frames_delivered;
 	u64 evidence_frames_no_buffer;
+	u64 evidence_queue_empty, evidence_frames_starved, evidence_frames_orphaned;
 	u64 evidence_partial_recycles;
 	u64 evidence_recovery_reports;
 	u64 evidence_duplicate_reports;
@@ -267,6 +278,17 @@ struct hws_video {
 	struct hws_dma_probe_state evidence_probe;
 	u32 recovery_notice_mask;
 
+	/* Diagnostic monitor only, protected by irq_lock; reset each STREAMON. */
+	u64 stall_start_ns, stall_sample_ns, stall_progress_ns, stall_report_ns;
+	u64 stall_observed, stall_delivered, stall_recoveries;
+	bool stall_reported;
+	/* Two preceding IRQs, duplicate trigger, two following IRQs. irq_lock. */
+	struct hws_irq_observation irq_previous[2], duplicate_window[5];
+	u64 duplicate_window_ns, duplicate_window_period_ns, duplicate_next_ns;
+	u64 duplicate_windows, duplicate_suppressed;
+	u8 duplicate_window_count;
+	bool duplicate_window_pending;
+
 	bool window_valid;
 	u32 last_dma_hi;
 	u32 last_dma_page;
@@ -282,6 +304,7 @@ static inline void hws_video_clear_frame_continuity(struct hws_video *v)
 	v->frame_timestamp_ns = 0;
 	v->frame_half_period_ns = 0;
 	v->frame_epoch = 0;
+	v->frame_no_buffer = false;
 }
 
 enum hws_audio_packet_state {
@@ -391,6 +414,7 @@ struct hws_pcie_dev {
 	void __iomem *bar0_base;
 	struct workqueue_struct *video_wq;
 	struct workqueue_struct *audio_wq;
+	struct hws_observer irq_observer; /* owned solely by the monitor thread */
 
 	/* Device identity and capabilities */
 	u16 vendor_id;

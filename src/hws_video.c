@@ -32,6 +32,7 @@
 #include "hws_v4l2_ioctl.h"
 #include "hws_trace.h"
 #include "hws_diag.h"
+#include "hws_stall.h"
 
 #define HWS_BUF_BASE_OFF(ch)     (CVBS_IN_BUF_BASE  + (ch) * PCIE_BARADDROFSIZE)
 #define HWS_HALF_SZ_OFF(ch)      (CVBS_IN_BUF_BASE2 + (ch) * PCIE_BARADDROFSIZE)
@@ -354,6 +355,9 @@ static void hws_video_reset_evidence_locked(struct hws_video *vid)
 	vid->evidence_frames_completed = 0;
 	vid->evidence_frames_delivered = 0;
 	vid->evidence_frames_no_buffer = 0;
+	vid->evidence_queue_empty = 0;
+	vid->evidence_frames_starved = 0;
+	vid->evidence_frames_orphaned = 0;
 	vid->evidence_partial_recycles = 0;
 	vid->evidence_recovery_reports = 0;
 	vid->evidence_duplicate_reports = 0;
@@ -372,6 +376,23 @@ static void hws_video_reset_evidence_locked(struct hws_video *vid)
 	vid->diag_suppressed = 0;
 	memset(&vid->evidence_probe, 0, sizeof(vid->evidence_probe));
 	vid->recovery_notice_mask = 0;
+	vid->stall_start_ns = ktime_get_mono_fast_ns();
+	vid->stall_sample_ns = 0;
+	vid->stall_progress_ns = vid->stall_start_ns;
+	vid->stall_report_ns = vid->stall_start_ns;
+	vid->stall_observed = 0;
+	vid->stall_delivered = 0;
+	vid->stall_recoveries = 0;
+	vid->stall_reported = false;
+	memset(vid->irq_previous, 0, sizeof(vid->irq_previous));
+	memset(vid->duplicate_window, 0, sizeof(vid->duplicate_window));
+	vid->duplicate_window_ns = 0;
+	vid->duplicate_window_period_ns = 0;
+	vid->duplicate_next_ns = 0;
+	vid->duplicate_windows = 0;
+	vid->duplicate_suppressed = 0;
+	vid->duplicate_window_count = 0;
+	vid->duplicate_window_pending = false;
 }
 
 static void hws_video_drain_queue_locked(struct hws_video *vid)
@@ -1490,6 +1511,8 @@ static void hws_stop_streaming(struct vb2_queue *q)
 	bool needs_idle;
 
 	hws_log_video_state(v, "streamoff", "begin");
+	/* Preserve queue/worker state before STREAMOFF drains and resets it. */
+	hws_stall_streamoff(v);
 	spin_lock_irqsave(&v->irq_lock, flags);
 	hws_diag_locked(v, HWS_DIAG_STOP, U32_MAX,
 			v->next_completion_generation, 0, 0);
